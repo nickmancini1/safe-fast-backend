@@ -1,38 +1,36 @@
 import os
-from typing import Optional
+from typing import Any, Dict
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 
-app = FastAPI(title="SAFE-FAST Backend", version="0.3.0")
+app = FastAPI(title="SAFE-FAST Backend", version="0.4.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/0.3"
+USER_AGENT = "safe-fast-backend/0.4.0"
 
-TT_CLIENT_ID = os.getenv("TT_CLIENT_ID")
-TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET")
-TT_REDIRECT_URI = os.getenv("TT_REDIRECT_URI")
-TT_REFRESH_TOKEN = os.getenv("TT_REFRESH_TOKEN")
+TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
+TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
+TT_REDIRECT_URI = os.getenv("TT_REDIRECT_URI", "")
+TT_REFRESH_TOKEN = os.getenv("TT_REFRESH_TOKEN", "")
 
 
-def _required_env() -> None:
-    missing = [
-        name for name, value in {
-            "TT_CLIENT_ID": TT_CLIENT_ID,
-            "TT_CLIENT_SECRET": TT_CLIENT_SECRET,
-            "TT_REDIRECT_URI": TT_REDIRECT_URI,
-            "TT_REFRESH_TOKEN": TT_REFRESH_TOKEN,
-        }.items() if not value
-    ]
-    if missing:
-        raise HTTPException(status_code=500, detail=f"Missing env vars: {', '.join(missing)}")
+def _headers(access_token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    }
 
 
 async def get_access_token() -> str:
-    _required_env()
+    if not all([TT_CLIENT_ID, TT_CLIENT_SECRET, TT_REDIRECT_URI, TT_REFRESH_TOKEN]):
+        raise HTTPException(status_code=500, detail="Missing TT OAuth environment variables")
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             f"{API_BASE}/oauth/token",
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
             data={
                 "grant_type": "refresh_token",
                 "client_id": TT_CLIENT_ID,
@@ -40,59 +38,72 @@ async def get_access_token() -> str:
                 "redirect_uri": TT_REDIRECT_URI,
                 "refresh_token": TT_REFRESH_TOKEN,
             },
-            headers={"User-Agent": USER_AGENT},
         )
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=500, detail={"oauth_error": resp.text})
-    data = resp.json()
-    token = data.get("access_token")
-    if not token:
-        raise HTTPException(status_code=500, detail={"oauth_error": data})
-    return token
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"raw": resp.text}
 
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=payload)
 
-async def tt_get(path: str, params: Optional[dict] = None) -> dict:
-    token = await get_access_token()
-    headers = {
-        "Authorization": token,
-        "User-Agent": USER_AGENT,
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(f"{API_BASE}{path}", headers=headers, params=params)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
+        token = payload.get("access_token")
+        if not token:
+            raise HTTPException(status_code=500, detail=payload)
+        return token
 
 
 @app.get("/")
-def root():
+def root() -> Dict[str, Any]:
     return {"status": "ok", "service": "safe-fast-backend"}
 
 
 @app.get("/health")
-def health():
+def health() -> Dict[str, bool]:
     return {"ok": True}
 
 
 @app.get("/tt/auth-test")
-async def tt_auth_test():
+async def tt_auth_test() -> Dict[str, Any]:
     token = await get_access_token()
-    return {"ok": True, "access_token_present": bool(token), "prefix": token[:8]}
+    return {
+        "ok": True,
+        "access_token_present": bool(token),
+        "prefix": token[:8],
+    }
 
 
 @app.get("/tt/accounts")
-async def tt_accounts():
-    return await tt_get("/customers/me/accounts")
+async def tt_accounts() -> Any:
+    token = await get_access_token()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{API_BASE}/customers/me/accounts",
+            headers=_headers(token),
+        )
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"raw": resp.text}
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=payload)
+        return payload
 
 
-@app.get("/tt/quote")
-async def tt_quote(
-    symbol: str = Query(..., description="Ticker or symbol, e.g. SPY"),
-    instrument_type: str = Query("Equity", alias="type", description="Tastytrade instrument type"),
-):
-    params = {
-        "symbols": symbol,
-        "type": instrument_type,
-    }
-    data = await tt_get("/market-data", params=params)
-    return data
+@app.get("/tt/quote-token")
+async def tt_quote_token() -> Any:
+    token = await get_access_token()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{API_BASE}/api-quote-tokens",
+            headers=_headers(token),
+        )
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"raw": resp.text}
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=payload)
+        return payload
