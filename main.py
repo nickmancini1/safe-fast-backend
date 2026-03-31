@@ -4,10 +4,10 @@ from typing import Any, Dict, List
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="SAFE-FAST Backend", version="0.6.0")
+app = FastAPI(title="SAFE-FAST Backend", version="0.7.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/0.6.0"
+USER_AGENT = "safe-fast-backend/0.7.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -89,6 +89,24 @@ async def get_access_token() -> str:
             raise HTTPException(status_code=500, detail=payload)
 
         return token
+
+
+async def _fetch_option_chain(symbol: str, token: str) -> Any:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{API_BASE}/option-chains/{symbol}",
+            headers=_headers(token),
+        )
+
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"raw": resp.text}
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=payload)
+
+        return payload
 
 
 @app.get("/")
@@ -189,23 +207,61 @@ async def tt_option_chain(
 ) -> Any:
     clean_symbol = _clean_symbol(symbol)
     token = await get_access_token()
+    payload = await _fetch_option_chain(clean_symbol, token)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(
-            f"{API_BASE}/option-chains/{clean_symbol}",
-            headers=_headers(token),
+    return {
+        "ok": True,
+        "symbol": clean_symbol,
+        "payload": payload,
+    }
+
+
+@app.get("/tt/option-expirations")
+async def tt_option_expirations(
+    symbol: str = Query("SPY"),
+    min_dte: int = Query(14),
+    max_dte: int = Query(30),
+) -> Any:
+    clean_symbol = _clean_symbol(symbol)
+
+    if min_dte < 0 or max_dte < 0 or min_dte > max_dte:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid DTE range",
         )
 
-        try:
-            payload = resp.json()
-        except Exception:
-            payload = {"raw": resp.text}
+    token = await get_access_token()
+    payload = await _fetch_option_chain(clean_symbol, token)
 
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=payload)
+    items = payload.get("data", {}).get("items", [])
+    seen = set()
+    expirations = []
 
-        return {
-            "ok": True,
-            "symbol": clean_symbol,
-            "payload": payload,
-        }
+    for item in items:
+        dte = item.get("days-to-expiration")
+        expiration_date = item.get("expiration-date")
+
+        if dte is None or expiration_date is None:
+            continue
+
+        if min_dte <= int(dte) <= max_dte:
+            key = (expiration_date, int(dte))
+            if key not in seen:
+                seen.add(key)
+                expirations.append(
+                    {
+                        "expiration_date": expiration_date,
+                        "days_to_expiration": int(dte),
+                    }
+                )
+
+    expirations.sort(key=lambda x: (x["days_to_expiration"], x["expiration_date"]))
+
+    return {
+        "ok": True,
+        "symbol": clean_symbol,
+        "min_dte": min_dte,
+        "max_dte": max_dte,
+        "count": len(expirations),
+        "expirations": expirations,
+    }
