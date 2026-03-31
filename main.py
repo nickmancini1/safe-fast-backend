@@ -4,10 +4,10 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.1.0")
+app = FastAPI(title="SAFE-FAST Backend", version="1.2.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.1.0"
+USER_AGENT = "safe-fast-backend/1.2.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -546,6 +546,11 @@ async def tt_debit_spread_candidates(
     near_limit: int = Query(16),
     width_min: float = Query(5.0),
     width_max: float = Query(10.0),
+    risk_min_dollars: float = Query(250.0),
+    risk_max_dollars: float = Query(300.0),
+    hard_max_dollars: float = Query(400.0),
+    enforce_hard_max: bool = Query(True),
+    only_preferred: bool = Query(False),
     limit: int = Query(8),
 ) -> Any:
     clean_symbol = _clean_symbol(symbol)
@@ -555,6 +560,10 @@ async def tt_debit_spread_candidates(
         raise HTTPException(status_code=400, detail="near_limit must be between 2 and 40")
     if width_min <= 0 or width_max <= 0 or width_min > width_max:
         raise HTTPException(status_code=400, detail="Invalid width range")
+    if risk_min_dollars < 0 or risk_max_dollars < 0 or risk_min_dollars > risk_max_dollars:
+        raise HTTPException(status_code=400, detail="Invalid preferred risk range")
+    if hard_max_dollars <= 0:
+        raise HTTPException(status_code=400, detail="hard_max_dollars must be greater than 0")
     if limit <= 0 or limit > 20:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 20")
 
@@ -574,6 +583,7 @@ async def tt_debit_spread_candidates(
     )
 
     candidates = []
+    target_risk_mid = (risk_min_dollars + risk_max_dollars) / 2.0
 
     for i in range(len(contracts)):
         for j in range(i + 1, len(contracts)):
@@ -608,7 +618,17 @@ async def tt_debit_spread_candidates(
 
             max_loss = est_debit
             max_profit = round(width - est_debit, 4)
+            max_loss_dollars_1lot = round(max_loss * 100, 2)
+            max_profit_dollars_1lot = round(max_profit * 100, 2)
+
             feasibility_pass = (1.6 * est_debit) <= width
+            within_hard_max = max_loss_dollars_1lot <= hard_max_dollars
+            preferred_risk_band_pass = risk_min_dollars <= max_loss_dollars_1lot <= risk_max_dollars
+
+            if enforce_hard_max and not within_hard_max:
+                continue
+            if only_preferred and not preferred_risk_band_pass:
+                continue
 
             long_strike = _to_float(long_leg.get("strike_price"))
             short_strike = _to_float(short_leg.get("strike_price"))
@@ -629,16 +649,24 @@ async def tt_debit_spread_candidates(
                     "est_debit": est_debit,
                     "max_loss": max_loss,
                     "max_profit": max_profit,
+                    "max_loss_dollars_1lot": max_loss_dollars_1lot,
+                    "max_profit_dollars_1lot": max_profit_dollars_1lot,
                     "risk_reward": round(max_profit / max_loss, 4) if max_loss > 0 else None,
                     "feasibility_pass": feasibility_pass,
+                    "preferred_risk_band_pass": preferred_risk_band_pass,
+                    "within_hard_max": within_hard_max,
+                    "fits_risk_budget": preferred_risk_band_pass and within_hard_max,
                     "long_distance_from_underlying": round(abs(long_strike - underlying_price), 4),
                     "short_distance_from_underlying": round(abs(short_strike - underlying_price), 4),
+                    "distance_from_target_risk_mid": round(abs(max_loss_dollars_1lot - target_risk_mid), 2),
                 }
             )
 
     candidates.sort(
         key=lambda x: (
+            not x["fits_risk_budget"],
             not x["feasibility_pass"],
+            x["distance_from_target_risk_mid"],
             x["long_distance_from_underlying"],
             x["width"],
             x["est_debit"],
@@ -653,6 +681,11 @@ async def tt_debit_spread_candidates(
         "option_type": clean_option_type,
         "width_min": width_min,
         "width_max": width_max,
+        "risk_min_dollars": risk_min_dollars,
+        "risk_max_dollars": risk_max_dollars,
+        "hard_max_dollars": hard_max_dollars,
+        "enforce_hard_max": enforce_hard_max,
+        "only_preferred": only_preferred,
         "near_limit": near_limit,
         "count": len(candidates),
         "pricing_rule": "mid_then_mark_then_last",
