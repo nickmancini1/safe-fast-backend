@@ -1,18 +1,20 @@
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="SAFE-FAST Backend", version="0.4.0")
+app = FastAPI(title="SAFE-FAST Backend", version="0.5.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/0.4.0"
+USER_AGENT = "safe-fast-backend/0.5.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
 TT_REDIRECT_URI = os.getenv("TT_REDIRECT_URI", "")
 TT_REFRESH_TOKEN = os.getenv("TT_REFRESH_TOKEN", "")
+
+ALLOWED_SYMBOLS = {"SPY", "QQQ", "IWM", "GLD"}
 
 
 def _headers(access_token: str) -> Dict[str, str]:
@@ -21,6 +23,26 @@ def _headers(access_token: str) -> Dict[str, str]:
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
     }
+
+
+def _clean_symbols(symbols: str) -> List[str]:
+    items = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+
+    if not items:
+        raise HTTPException(status_code=400, detail="No symbols provided")
+
+    bad = [s for s in items if s not in ALLOWED_SYMBOLS]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Only SAFE-FAST symbols are allowed",
+                "allowed": sorted(ALLOWED_SYMBOLS),
+                "bad_symbols": bad,
+            },
+        )
+
+    return items
 
 
 async def get_access_token() -> str:
@@ -39,6 +61,7 @@ async def get_access_token() -> str:
                 "refresh_token": TT_REFRESH_TOKEN,
             },
         )
+
         try:
             payload = resp.json()
         except Exception:
@@ -50,6 +73,7 @@ async def get_access_token() -> str:
         token = payload.get("access_token")
         if not token:
             raise HTTPException(status_code=500, detail=payload)
+
         return token
 
 
@@ -81,6 +105,7 @@ async def tt_accounts() -> Any:
             f"{API_BASE}/customers/me/accounts",
             headers=_headers(token),
         )
+
         try:
             payload = resp.json()
         except Exception:
@@ -88,6 +113,7 @@ async def tt_accounts() -> Any:
 
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=payload)
+
         return payload
 
 
@@ -99,6 +125,7 @@ async def tt_quote_token() -> Any:
             f"{API_BASE}/api-quote-tokens",
             headers=_headers(token),
         )
+
         try:
             payload = resp.json()
         except Exception:
@@ -106,4 +133,37 @@ async def tt_quote_token() -> Any:
 
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=payload)
+
         return payload
+
+
+@app.get("/tt/quotes")
+async def tt_quotes(
+    symbols: str = Query("SPY,QQQ,IWM,GLD")
+) -> Any:
+    clean_symbols = _clean_symbols(symbols)
+    token = await get_access_token()
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{API_BASE}/market-data",
+            headers=_headers(token),
+            params={
+                "type": "Equity",
+                "symbols": ",".join(clean_symbols),
+            },
+        )
+
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"raw": resp.text}
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=payload)
+
+        return {
+            "ok": True,
+            "symbols": clean_symbols,
+            "payload": payload,
+        }
