@@ -4,10 +4,10 @@ from typing import Any, Dict, List
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="SAFE-FAST Backend", version="0.7.0")
+app = FastAPI(title="SAFE-FAST Backend", version="0.8.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/0.7.0"
+USER_AGENT = "safe-fast-backend/0.8.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -55,6 +55,16 @@ def _clean_symbol(symbol: str) -> str:
                 "allowed": sorted(ALLOWED_SYMBOLS),
                 "bad_symbol": value,
             },
+        )
+    return value
+
+
+def _clean_option_type(option_type: str) -> str:
+    value = option_type.strip().upper()
+    if value not in {"C", "P"}:
+        raise HTTPException(
+            status_code=400,
+            detail="option_type must be C or P",
         )
     return value
 
@@ -225,10 +235,7 @@ async def tt_option_expirations(
     clean_symbol = _clean_symbol(symbol)
 
     if min_dte < 0 or max_dte < 0 or min_dte > max_dte:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid DTE range",
-        )
+        raise HTTPException(status_code=400, detail="Invalid DTE range")
 
     token = await get_access_token()
     payload = await _fetch_option_chain(clean_symbol, token)
@@ -264,4 +271,59 @@ async def tt_option_expirations(
         "max_dte": max_dte,
         "count": len(expirations),
         "expirations": expirations,
+    }
+
+
+@app.get("/tt/option-contracts")
+async def tt_option_contracts(
+    symbol: str = Query("SPY"),
+    expiration_date: str = Query(...),
+    option_type: str = Query("C"),
+    limit: int = Query(10),
+) -> Any:
+    clean_symbol = _clean_symbol(symbol)
+    clean_option_type = _clean_option_type(option_type)
+
+    if limit <= 0 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
+
+    token = await get_access_token()
+    payload = await _fetch_option_chain(clean_symbol, token)
+
+    items = payload.get("data", {}).get("items", [])
+    contracts = []
+
+    for item in items:
+        if item.get("expiration-date") != expiration_date:
+            continue
+        if item.get("option-type") != clean_option_type:
+            continue
+
+        strike = item.get("strike-price")
+        try:
+            strike_value = float(strike)
+        except Exception:
+            strike_value = None
+
+        contracts.append(
+            {
+                "symbol": item.get("symbol"),
+                "streamer_symbol": item.get("streamer-symbol"),
+                "strike_price": strike_value,
+                "expiration_date": item.get("expiration-date"),
+                "days_to_expiration": item.get("days-to-expiration"),
+                "option_type": item.get("option-type"),
+                "active": item.get("active"),
+            }
+        )
+
+    contracts.sort(key=lambda x: (x["strike_price"] is None, x["strike_price"]))
+
+    return {
+        "ok": True,
+        "symbol": clean_symbol,
+        "expiration_date": expiration_date,
+        "option_type": clean_option_type,
+        "count": len(contracts),
+        "contracts": contracts[:limit],
     }
