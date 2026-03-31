@@ -1132,5 +1132,32 @@ async def tt_dxlink_candle_test(
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+        @app.get("/tt/safe-fast-chart-check")
+async def tt_safe_fast_chart_check(
+    symbol: str = Query("SPY"),
+) -> Any:
+    clean_symbol = _clean_symbol(symbol)
+    token = await get_access_token()
+
+    try:
+        snapshot = await get_1h_ema50_snapshot(
+            symbol=clean_symbol,
+            access_token=token,
+            api_base=API_BASE,
+            user_agent=USER_AGENT,
+            days_back=14,
+        )
+
+        return {
+            "ok": True,
+            "symbol": clean_symbol,
+            "latest_close": snapshot["latest_close"],
+            "ema50_1h": snapshot["ema50_1h"],
+            "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
+            "latest_candle_time": snapshot["latest_candle_time"],
+            "candle_count": snapshot["candle_count"],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
