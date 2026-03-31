@@ -1117,7 +1117,7 @@ async def tt_safe_fast_summary_compact(
         "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
         "backup_candidate": _compact_candidate(best_summary["backup_candidate"]) if best_summary else None,
         "ticker_summaries": [_compact_ticker_summary(s) for s in ticker_summaries],
-
+    }
         @app.get("/tt/dxlink-candle-test")
 async def tt_dxlink_candle_test(
     symbol: str = Query("SPY"),
