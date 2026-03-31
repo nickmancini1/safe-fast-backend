@@ -4,10 +4,10 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.2.0")
+app = FastAPI(title="SAFE-FAST Backend", version="1.3.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.2.0"
+USER_AGENT = "safe-fast-backend/1.3.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -272,6 +272,116 @@ async def _get_quoted_near_contracts(
         "underlying_price": underlying_price,
         "contracts": merged,
     }
+
+
+def _generate_debit_spread_candidates(
+    contracts: List[Dict[str, Any]],
+    underlying_price: float,
+    option_type: str,
+    width_min: float,
+    width_max: float,
+    risk_min_dollars: float,
+    risk_max_dollars: float,
+    hard_max_dollars: float,
+    enforce_hard_max: bool,
+    only_preferred: bool,
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    target_risk_mid = (risk_min_dollars + risk_max_dollars) / 2.0
+
+    ordered_contracts = sorted(
+        contracts,
+        key=lambda c: (c["strike_price"] is None, c["strike_price"])
+    )
+
+    for i in range(len(ordered_contracts)):
+        for j in range(i + 1, len(ordered_contracts)):
+            left = ordered_contracts[i]
+            right = ordered_contracts[j]
+
+            left_strike = _to_float(left.get("strike_price"))
+            right_strike = _to_float(right.get("strike_price"))
+            if left_strike is None or right_strike is None:
+                continue
+
+            width = round(abs(right_strike - left_strike), 4)
+            if width < width_min or width > width_max:
+                continue
+
+            if option_type == "C":
+                long_leg = left
+                short_leg = right
+            else:
+                long_leg = right
+                short_leg = left
+
+            long_price = _best_price(long_leg)
+            short_price = _best_price(short_leg)
+
+            if long_price is None or short_price is None:
+                continue
+
+            est_debit = round(long_price - short_price, 4)
+            if est_debit <= 0:
+                continue
+
+            max_loss = est_debit
+            max_profit = round(width - est_debit, 4)
+            max_loss_dollars_1lot = round(max_loss * 100, 2)
+            max_profit_dollars_1lot = round(max_profit * 100, 2)
+
+            feasibility_pass = (1.6 * est_debit) <= width
+            within_hard_max = max_loss_dollars_1lot <= hard_max_dollars
+            preferred_risk_band_pass = risk_min_dollars <= max_loss_dollars_1lot <= risk_max_dollars
+
+            if enforce_hard_max and not within_hard_max:
+                continue
+            if only_preferred and not preferred_risk_band_pass:
+                continue
+
+            long_strike = _to_float(long_leg.get("strike_price"))
+            short_strike = _to_float(short_leg.get("strike_price"))
+            if long_strike is None or short_strike is None:
+                continue
+
+            candidates.append(
+                {
+                    "long_symbol": long_leg.get("symbol"),
+                    "short_symbol": short_leg.get("symbol"),
+                    "long_strike": long_strike,
+                    "short_strike": short_strike,
+                    "width": width,
+                    "long_mid": long_leg.get("mid"),
+                    "short_mid": short_leg.get("mid"),
+                    "long_mark": long_leg.get("mark"),
+                    "short_mark": short_leg.get("mark"),
+                    "est_debit": est_debit,
+                    "max_loss": max_loss,
+                    "max_profit": max_profit,
+                    "max_loss_dollars_1lot": max_loss_dollars_1lot,
+                    "max_profit_dollars_1lot": max_profit_dollars_1lot,
+                    "risk_reward": round(max_profit / max_loss, 4) if max_loss > 0 else None,
+                    "feasibility_pass": feasibility_pass,
+                    "preferred_risk_band_pass": preferred_risk_band_pass,
+                    "within_hard_max": within_hard_max,
+                    "fits_risk_budget": preferred_risk_band_pass and within_hard_max,
+                    "long_distance_from_underlying": round(abs(long_strike - underlying_price), 4),
+                    "short_distance_from_underlying": round(abs(short_strike - underlying_price), 4),
+                    "distance_from_target_risk_mid": round(abs(max_loss_dollars_1lot - target_risk_mid), 2),
+                }
+            )
+
+    candidates.sort(
+        key=lambda x: (
+            not x["fits_risk_budget"],
+            not x["feasibility_pass"],
+            x["distance_from_target_risk_mid"],
+            x["long_distance_from_underlying"],
+            x["width"],
+            x["est_debit"],
+        )
+    )
+    return candidates
 
 
 @app.get("/")
@@ -576,107 +686,23 @@ async def tt_debit_spread_candidates(
         token=token,
     )
 
-    underlying_price = data["underlying_price"]
-    contracts = sorted(
-        data["contracts"],
-        key=lambda c: (c["strike_price"] is None, c["strike_price"])
-    )
-
-    candidates = []
-    target_risk_mid = (risk_min_dollars + risk_max_dollars) / 2.0
-
-    for i in range(len(contracts)):
-        for j in range(i + 1, len(contracts)):
-            left = contracts[i]
-            right = contracts[j]
-
-            left_strike = _to_float(left.get("strike_price"))
-            right_strike = _to_float(right.get("strike_price"))
-            if left_strike is None or right_strike is None:
-                continue
-
-            width = round(abs(right_strike - left_strike), 4)
-            if width < width_min or width > width_max:
-                continue
-
-            if clean_option_type == "C":
-                long_leg = left
-                short_leg = right
-            else:
-                long_leg = right
-                short_leg = left
-
-            long_price = _best_price(long_leg)
-            short_price = _best_price(short_leg)
-
-            if long_price is None or short_price is None:
-                continue
-
-            est_debit = round(long_price - short_price, 4)
-            if est_debit <= 0:
-                continue
-
-            max_loss = est_debit
-            max_profit = round(width - est_debit, 4)
-            max_loss_dollars_1lot = round(max_loss * 100, 2)
-            max_profit_dollars_1lot = round(max_profit * 100, 2)
-
-            feasibility_pass = (1.6 * est_debit) <= width
-            within_hard_max = max_loss_dollars_1lot <= hard_max_dollars
-            preferred_risk_band_pass = risk_min_dollars <= max_loss_dollars_1lot <= risk_max_dollars
-
-            if enforce_hard_max and not within_hard_max:
-                continue
-            if only_preferred and not preferred_risk_band_pass:
-                continue
-
-            long_strike = _to_float(long_leg.get("strike_price"))
-            short_strike = _to_float(short_leg.get("strike_price"))
-            if long_strike is None or short_strike is None:
-                continue
-
-            candidates.append(
-                {
-                    "long_symbol": long_leg.get("symbol"),
-                    "short_symbol": short_leg.get("symbol"),
-                    "long_strike": long_strike,
-                    "short_strike": short_strike,
-                    "width": width,
-                    "long_mid": long_leg.get("mid"),
-                    "short_mid": short_leg.get("mid"),
-                    "long_mark": long_leg.get("mark"),
-                    "short_mark": short_leg.get("mark"),
-                    "est_debit": est_debit,
-                    "max_loss": max_loss,
-                    "max_profit": max_profit,
-                    "max_loss_dollars_1lot": max_loss_dollars_1lot,
-                    "max_profit_dollars_1lot": max_profit_dollars_1lot,
-                    "risk_reward": round(max_profit / max_loss, 4) if max_loss > 0 else None,
-                    "feasibility_pass": feasibility_pass,
-                    "preferred_risk_band_pass": preferred_risk_band_pass,
-                    "within_hard_max": within_hard_max,
-                    "fits_risk_budget": preferred_risk_band_pass and within_hard_max,
-                    "long_distance_from_underlying": round(abs(long_strike - underlying_price), 4),
-                    "short_distance_from_underlying": round(abs(short_strike - underlying_price), 4),
-                    "distance_from_target_risk_mid": round(abs(max_loss_dollars_1lot - target_risk_mid), 2),
-                }
-            )
-
-    candidates.sort(
-        key=lambda x: (
-            not x["fits_risk_budget"],
-            not x["feasibility_pass"],
-            x["distance_from_target_risk_mid"],
-            x["long_distance_from_underlying"],
-            x["width"],
-            x["est_debit"],
-        )
+    candidates = _generate_debit_spread_candidates(
+        contracts=data["contracts"],
+        underlying_price=data["underlying_price"],
+        option_type=clean_option_type,
+        width_min=width_min,
+        width_max=width_max,
+        risk_min_dollars=risk_min_dollars,
+        risk_max_dollars=risk_max_dollars,
+        hard_max_dollars=hard_max_dollars,
+        enforce_hard_max=enforce_hard_max,
+        only_preferred=only_preferred,
     )
 
     return {
         "ok": True,
         "symbol": clean_symbol,
-        "underlying_price": underlying_price,
+        "underlying_price": data["underlying_price"],
         "expiration_date": expiration_date,
         "option_type": clean_option_type,
         "width_min": width_min,
@@ -690,4 +716,99 @@ async def tt_debit_spread_candidates(
         "count": len(candidates),
         "pricing_rule": "mid_then_mark_then_last",
         "candidates": candidates[:limit],
+    }
+
+
+@app.get("/tt/debit-spread-shortlist")
+async def tt_debit_spread_shortlist(
+    symbol: str = Query("SPY"),
+    expiration_date: str = Query(...),
+    option_type: str = Query("C"),
+    near_limit: int = Query(16),
+    width_min: float = Query(5.0),
+    width_max: float = Query(10.0),
+    risk_min_dollars: float = Query(250.0),
+    risk_max_dollars: float = Query(300.0),
+    hard_max_dollars: float = Query(400.0),
+    allow_fallback: bool = Query(True),
+) -> Any:
+    clean_symbol = _clean_symbol(symbol)
+    clean_option_type = _clean_option_type(option_type)
+
+    if near_limit <= 1 or near_limit > 40:
+        raise HTTPException(status_code=400, detail="near_limit must be between 2 and 40")
+    if width_min <= 0 or width_max <= 0 or width_min > width_max:
+        raise HTTPException(status_code=400, detail="Invalid width range")
+    if risk_min_dollars < 0 or risk_max_dollars < 0 or risk_min_dollars > risk_max_dollars:
+        raise HTTPException(status_code=400, detail="Invalid preferred risk range")
+    if hard_max_dollars <= 0:
+        raise HTTPException(status_code=400, detail="hard_max_dollars must be greater than 0")
+
+    token = await get_access_token()
+    data = await _get_quoted_near_contracts(
+        symbol=clean_symbol,
+        expiration_date=expiration_date,
+        option_type=clean_option_type,
+        limit=near_limit,
+        token=token,
+    )
+
+    all_candidates = _generate_debit_spread_candidates(
+        contracts=data["contracts"],
+        underlying_price=data["underlying_price"],
+        option_type=clean_option_type,
+        width_min=width_min,
+        width_max=width_max,
+        risk_min_dollars=risk_min_dollars,
+        risk_max_dollars=risk_max_dollars,
+        hard_max_dollars=hard_max_dollars,
+        enforce_hard_max=True,
+        only_preferred=False,
+    )
+
+    preferred_candidates = [
+        c for c in all_candidates
+        if c["feasibility_pass"] and c["fits_risk_budget"]
+    ]
+
+    fallback_candidates = [
+        c for c in all_candidates
+        if c["feasibility_pass"] and c["within_hard_max"]
+    ]
+
+    if preferred_candidates:
+        selected = preferred_candidates
+        selection_mode = "preferred"
+        reason = "Using candidates that pass feasibility, preferred risk band, and hard max."
+    elif allow_fallback and fallback_candidates:
+        selected = fallback_candidates
+        selection_mode = "fallback"
+        reason = "No preferred candidates found. Using feasible candidates that still stay under hard max."
+    else:
+        selected = []
+        selection_mode = "none"
+        reason = "No feasible candidates found for the current filters."
+
+    primary_candidate = selected[0] if len(selected) >= 1 else None
+    backup_candidate = selected[1] if len(selected) >= 2 else None
+
+    return {
+        "ok": True,
+        "symbol": clean_symbol,
+        "underlying_price": data["underlying_price"],
+        "expiration_date": expiration_date,
+        "option_type": clean_option_type,
+        "width_min": width_min,
+        "width_max": width_max,
+        "risk_min_dollars": risk_min_dollars,
+        "risk_max_dollars": risk_max_dollars,
+        "hard_max_dollars": hard_max_dollars,
+        "near_limit": near_limit,
+        "selection_mode": selection_mode,
+        "reason": reason,
+        "preferred_count": len(preferred_candidates),
+        "fallback_count": len(fallback_candidates),
+        "pricing_rule": "mid_then_mark_then_last",
+        "primary_candidate": primary_candidate,
+        "backup_candidate": backup_candidate,
     }
