@@ -617,6 +617,26 @@ async def _build_ticker_summary(
     }
 
 
+async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
+    snapshot = await get_1h_ema50_snapshot(
+        symbol=symbol,
+        access_token=token,
+        api_base=API_BASE,
+        user_agent=USER_AGENT,
+        days_back=14,
+    )
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "latest_close": snapshot["latest_close"],
+        "ema50_1h": snapshot["ema50_1h"],
+        "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
+        "latest_candle_time": snapshot["latest_candle_time"],
+        "candle_count": snapshot["candle_count"],
+    }
+
+
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {"status": "ok", "service": "safe-fast-backend"}
@@ -1162,22 +1182,6 @@ async def tt_safe_fast_chart_check(
     token = await get_access_token()
 
     try:
-        snapshot = await get_1h_ema50_snapshot(
-            symbol=clean_symbol,
-            access_token=token,
-            api_base=API_BASE,
-            user_agent=USER_AGENT,
-            days_back=14,
-        )
-
-        return {
-            "ok": True,
-            "symbol": clean_symbol,
-            "latest_close": snapshot["latest_close"],
-            "ema50_1h": snapshot["ema50_1h"],
-            "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
-            "latest_candle_time": snapshot["latest_candle_time"],
-            "candle_count": snapshot["candle_count"],
-        }
+        return await _build_chart_check_payload(clean_symbol, token)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
