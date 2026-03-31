@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -16,20 +17,27 @@ def _to_float(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        return float(value)
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            return None
+        return parsed
     except Exception:
         return None
 
 
 def _compute_ema(values: List[float], length: int) -> Optional[float]:
-    if not values:
+    clean_values = [v for v in values if v is not None and math.isfinite(v)]
+    if not clean_values:
         return None
 
     multiplier = 2 / (length + 1)
-    ema = values[0]
+    ema = clean_values[0]
 
-    for value in values[1:]:
+    for value in clean_values[1:]:
         ema = ((value - ema) * multiplier) + ema
+
+    if not math.isfinite(ema):
+        return None
 
     return round(ema, 4)
 
@@ -184,7 +192,6 @@ async def get_1h_ema50_snapshot(
             },
         )
 
-        # Server may send setup/keepalive chatter here.
         for _ in range(2):
             try:
                 await _recv_json(ws, timeout=0.5)
@@ -236,11 +243,9 @@ async def get_1h_ema50_snapshot(
             },
         )
 
-        # Usually FEED_CONFIG arrives here.
         try:
             await _wait_for_message(ws, wanted_type="FEED_CONFIG", channel=1, timeout=5.0)
         except Exception:
-            # Not fatal for this first probe.
             pass
 
         await _send_json(
@@ -294,7 +299,7 @@ async def get_1h_ema50_snapshot(
             f"No candle data returned for {symbol}. Last message: {last_raw_message}"
         )
 
-    closes = [c["close"] for c in candle_list]
+    closes = [c["close"] for c in candle_list if c.get("close") is not None]
     ema50 = _compute_ema(closes, 50)
     latest = candle_list[-1]
     latest_close = latest["close"]
