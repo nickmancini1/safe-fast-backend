@@ -1160,4 +1160,41 @@ async def tt_safe_fast_chart_check(
         }
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+        @app.get("/tt/safe-fast-chart-board")
+async def tt_safe_fast_chart_board() -> Any:
+    token = await get_access_token()
+    results = []
+
+    for symbol in SYMBOL_ORDER:
+        try:
+            snapshot = await get_1h_ema50_snapshot(
+                symbol=symbol,
+                access_token=token,
+                api_base=API_BASE,
+                user_agent=USER_AGENT,
+                days_back=14,
+            )
+
+            results.append(
+                {
+                    "symbol": symbol,
+                    "latest_close": snapshot["latest_close"],
+                    "ema50_1h": snapshot["ema50_1h"],
+                    "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
+                    "latest_candle_time": snapshot["latest_candle_time"],
+                    "candle_count": snapshot["candle_count"],
+                }
+            )
+        except Exception as e:
+            results.append(
+                {
+                    "symbol": symbol,
+                    "error": str(e),
+                }
+            )
+
+    return {
+        "ok": True,
+        "results": results,
+    }
 
