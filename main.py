@@ -1133,4 +1133,4 @@ async def tt_dxlink_candle_test(
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-}
+
