@@ -20,6 +20,23 @@ ALLOWED_SYMBOLS = {"SPY", "QQQ", "IWM", "GLD"}
 SYMBOL_ORDER = ["SPY", "QQQ", "IWM", "GLD"]
 
 
+class OnDemandRequest(BaseModel):
+    option_type: str = "C"
+    min_dte: int = 14
+    max_dte: int = 30
+    near_limit: int = 16
+    width_min: float = 5.0
+    width_max: float = 10.0
+    risk_min_dollars: float = 250.0
+    risk_max_dollars: float = 300.0
+    hard_max_dollars: float = 400.0
+    allow_fallback: bool = True
+    include_chart_checks: bool = True
+    open_positions: int = 0
+    weekly_trade_count: int = 0
+    macro_context_requested: bool = False
+
+
 def _headers(access_token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {access_token}",
