@@ -4,10 +4,10 @@ from typing import Any, Dict, List
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="SAFE-FAST Backend", version="0.5.0")
+app = FastAPI(title="SAFE-FAST Backend", version="0.6.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/0.5.0"
+USER_AGENT = "safe-fast-backend/0.6.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -43,6 +43,20 @@ def _clean_symbols(symbols: str) -> List[str]:
         )
 
     return items
+
+
+def _clean_symbol(symbol: str) -> str:
+    value = symbol.strip().upper()
+    if value not in ALLOWED_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Only SAFE-FAST symbols are allowed",
+                "allowed": sorted(ALLOWED_SYMBOLS),
+                "bad_symbol": value,
+            },
+        )
+    return value
 
 
 async def get_access_token() -> str:
@@ -165,5 +179,33 @@ async def tt_quotes(
         return {
             "ok": True,
             "symbols": clean_symbols,
+            "payload": payload,
+        }
+
+
+@app.get("/tt/option-chain")
+async def tt_option_chain(
+    symbol: str = Query("SPY")
+) -> Any:
+    clean_symbol = _clean_symbol(symbol)
+    token = await get_access_token()
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{API_BASE}/option-chains/{clean_symbol}",
+            headers=_headers(token),
+        )
+
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"raw": resp.text}
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=payload)
+
+        return {
+            "ok": True,
+            "symbol": clean_symbol,
             "payload": payload,
         }
