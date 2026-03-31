@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
-
+from dxlink_candles import get_1h_ema50_snapshot
 app = FastAPI(title="SAFE-FAST Backend", version="1.5.0")
 
 API_BASE = "https://api.tastyworks.com"
