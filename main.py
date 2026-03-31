@@ -4,10 +4,10 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.4.0")
+app = FastAPI(title="SAFE-FAST Backend", version="1.5.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.4.0"
+USER_AGENT = "safe-fast-backend/1.5.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -326,6 +326,56 @@ def _select_shortlist(
     }
 
 
+def _compact_candidate(candidate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not candidate:
+        return None
+
+    return {
+        "long_symbol": candidate.get("long_symbol"),
+        "short_symbol": candidate.get("short_symbol"),
+        "long_strike": candidate.get("long_strike"),
+        "short_strike": candidate.get("short_strike"),
+        "width": candidate.get("width"),
+        "est_debit": candidate.get("est_debit"),
+        "max_loss_dollars_1lot": candidate.get("max_loss_dollars_1lot"),
+        "max_profit_dollars_1lot": candidate.get("max_profit_dollars_1lot"),
+        "risk_reward": candidate.get("risk_reward"),
+        "feasibility_pass": candidate.get("feasibility_pass"),
+        "fits_risk_budget": candidate.get("fits_risk_budget"),
+        "distance_from_target_risk_mid": candidate.get("distance_from_target_risk_mid"),
+    }
+
+
+def _compact_ticker_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "symbol": summary.get("symbol"),
+        "verdict": summary.get("verdict"),
+        "selection_mode": summary.get("selection_mode"),
+        "expiration_date": summary.get("expiration_date"),
+        "days_to_expiration": summary.get("days_to_expiration"),
+        "underlying_price": summary.get("underlying_price"),
+        "preferred_count": summary.get("preferred_count"),
+        "fallback_count": summary.get("fallback_count"),
+        "reason": summary.get("reason"),
+        "primary_candidate": _compact_candidate(summary.get("primary_candidate")),
+        "backup_candidate": _compact_candidate(summary.get("backup_candidate")),
+    }
+
+
+def _rank_ticker_summaries(ticker_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        ticker_summaries,
+        key=lambda x: (
+            {"ACTIVE_NOW": 0, "PENDING": 1, "NO_TRADE": 2}.get(x["verdict"], 3),
+            x["primary_candidate"]["distance_from_target_risk_mid"]
+            if x.get("primary_candidate") else 999999,
+            x["primary_candidate"]["long_distance_from_underlying"]
+            if x.get("primary_candidate") else 999999,
+            SYMBOL_ORDER.index(x["symbol"]) if x["symbol"] in SYMBOL_ORDER else 999999,
+        ),
+    )
+
+
 async def get_access_token() -> str:
     if not all([TT_CLIENT_ID, TT_CLIENT_SECRET, TT_REDIRECT_URI, TT_REFRESH_TOKEN]):
         raise HTTPException(status_code=500, detail="Missing TT OAuth environment variables")
@@ -462,6 +512,89 @@ async def _get_quoted_near_contracts(
     return {
         "underlying_price": underlying_price,
         "contracts": merged,
+    }
+
+
+async def _build_ticker_summary(
+    symbol: str,
+    option_type: str,
+    min_dte: int,
+    max_dte: int,
+    near_limit: int,
+    width_min: float,
+    width_max: float,
+    risk_min_dollars: float,
+    risk_max_dollars: float,
+    hard_max_dollars: float,
+    allow_fallback: bool,
+    token: str,
+) -> Dict[str, Any]:
+    chain_payload = await _fetch_option_chain(symbol, token)
+    expirations = _extract_expirations(chain_payload, min_dte, max_dte)
+
+    if not expirations:
+        return {
+            "symbol": symbol,
+            "verdict": "NO_TRADE",
+            "reason": "No expirations found in requested DTE range.",
+            "selection_mode": "none",
+            "expiration_date": None,
+            "days_to_expiration": None,
+            "underlying_price": None,
+            "preferred_count": 0,
+            "fallback_count": 0,
+            "primary_candidate": None,
+            "backup_candidate": None,
+        }
+
+    chosen_expiration = expirations[0]
+    underlying_price = await _get_underlying_price(symbol, token)
+
+    near_contracts = _build_near_contracts(
+        chain_payload=chain_payload,
+        expiration_date=chosen_expiration["expiration_date"],
+        option_type=option_type,
+        underlying_price=underlying_price,
+    )[:near_limit]
+
+    option_symbols = [c["symbol"] for c in near_contracts if c.get("symbol")]
+    quote_payload = await _fetch_option_quotes(option_symbols, token)
+    merged_contracts = _merge_quotes_into_contracts(near_contracts, quote_payload)
+
+    all_candidates = _generate_debit_spread_candidates(
+        contracts=merged_contracts,
+        underlying_price=underlying_price,
+        option_type=option_type,
+        width_min=width_min,
+        width_max=width_max,
+        risk_min_dollars=risk_min_dollars,
+        risk_max_dollars=risk_max_dollars,
+        hard_max_dollars=hard_max_dollars,
+        enforce_hard_max=True,
+        only_preferred=False,
+    )
+
+    shortlist = _select_shortlist(all_candidates, allow_fallback)
+
+    if shortlist["selection_mode"] == "preferred":
+        verdict = "ACTIVE_NOW"
+    elif shortlist["selection_mode"] == "fallback":
+        verdict = "PENDING"
+    else:
+        verdict = "NO_TRADE"
+
+    return {
+        "symbol": symbol,
+        "verdict": verdict,
+        "reason": shortlist["reason"],
+        "selection_mode": shortlist["selection_mode"],
+        "expiration_date": chosen_expiration["expiration_date"],
+        "days_to_expiration": chosen_expiration["days_to_expiration"],
+        "underlying_price": underlying_price,
+        "preferred_count": shortlist["preferred_count"],
+        "fallback_count": shortlist["fallback_count"],
+        "primary_candidate": shortlist["primary_candidate"],
+        "backup_candidate": shortlist["backup_candidate"],
     }
 
 
@@ -877,90 +1010,23 @@ async def tt_safe_fast_summary(
     ticker_summaries = []
 
     for symbol in SYMBOL_ORDER:
-        chain_payload = await _fetch_option_chain(symbol, token)
-        expirations = _extract_expirations(chain_payload, min_dte, max_dte)
-
-        if not expirations:
-            ticker_summaries.append(
-                {
-                    "symbol": symbol,
-                    "verdict": "NO_TRADE",
-                    "reason": "No expirations found in requested DTE range.",
-                    "selection_mode": "none",
-                    "expiration_date": None,
-                    "days_to_expiration": None,
-                    "preferred_count": 0,
-                    "fallback_count": 0,
-                    "primary_candidate": None,
-                    "backup_candidate": None,
-                }
-            )
-            continue
-
-        chosen_expiration = expirations[0]
-        underlying_price = await _get_underlying_price(symbol, token)
-
-        near_contracts = _build_near_contracts(
-            chain_payload=chain_payload,
-            expiration_date=chosen_expiration["expiration_date"],
+        summary = await _build_ticker_summary(
+            symbol=symbol,
             option_type=clean_option_type,
-            underlying_price=underlying_price,
-        )[:near_limit]
-
-        option_symbols = [c["symbol"] for c in near_contracts if c.get("symbol")]
-        quote_payload = await _fetch_option_quotes(option_symbols, token)
-        merged_contracts = _merge_quotes_into_contracts(near_contracts, quote_payload)
-
-        all_candidates = _generate_debit_spread_candidates(
-            contracts=merged_contracts,
-            underlying_price=underlying_price,
-            option_type=clean_option_type,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            near_limit=near_limit,
             width_min=width_min,
             width_max=width_max,
             risk_min_dollars=risk_min_dollars,
             risk_max_dollars=risk_max_dollars,
             hard_max_dollars=hard_max_dollars,
-            enforce_hard_max=True,
-            only_preferred=False,
+            allow_fallback=allow_fallback,
+            token=token,
         )
+        ticker_summaries.append(summary)
 
-        shortlist = _select_shortlist(all_candidates, allow_fallback)
-
-        if shortlist["selection_mode"] == "preferred":
-            verdict = "ACTIVE_NOW"
-        elif shortlist["selection_mode"] == "fallback":
-            verdict = "PENDING"
-        else:
-            verdict = "NO_TRADE"
-
-        ticker_summaries.append(
-            {
-                "symbol": symbol,
-                "verdict": verdict,
-                "reason": shortlist["reason"],
-                "selection_mode": shortlist["selection_mode"],
-                "expiration_date": chosen_expiration["expiration_date"],
-                "days_to_expiration": chosen_expiration["days_to_expiration"],
-                "underlying_price": underlying_price,
-                "preferred_count": shortlist["preferred_count"],
-                "fallback_count": shortlist["fallback_count"],
-                "primary_candidate": shortlist["primary_candidate"],
-                "backup_candidate": shortlist["backup_candidate"],
-            }
-        )
-
-    ranked = sorted(
-        ticker_summaries,
-        key=lambda x: (
-            {"ACTIVE_NOW": 0, "PENDING": 1, "NO_TRADE": 2}.get(x["verdict"], 3),
-            x["primary_candidate"]["distance_from_target_risk_mid"]
-            if x.get("primary_candidate") else 999999,
-            x["primary_candidate"]["long_distance_from_underlying"]
-            if x.get("primary_candidate") else 999999,
-            SYMBOL_ORDER.index(x["symbol"]) if x["symbol"] in SYMBOL_ORDER else 999999,
-        ),
-    )
-
+    ranked = _rank_ticker_summaries(ticker_summaries)
     best_summary = ranked[0] if ranked else None
     best_ticker = best_summary["symbol"] if best_summary and best_summary["primary_candidate"] else None
     verdict = best_summary["verdict"] if best_summary else "NO_TRADE"
@@ -982,4 +1048,69 @@ async def tt_safe_fast_summary(
         "primary_candidate": best_summary["primary_candidate"] if best_summary else None,
         "backup_candidate": best_summary["backup_candidate"] if best_summary else None,
         "ticker_summaries": ticker_summaries,
+    }
+
+
+@app.get("/tt/safe-fast-summary-compact")
+async def tt_safe_fast_summary_compact(
+    option_type: str = Query("C"),
+    min_dte: int = Query(14),
+    max_dte: int = Query(30),
+    near_limit: int = Query(16),
+    width_min: float = Query(5.0),
+    width_max: float = Query(10.0),
+    risk_min_dollars: float = Query(250.0),
+    risk_max_dollars: float = Query(300.0),
+    hard_max_dollars: float = Query(400.0),
+    allow_fallback: bool = Query(True),
+) -> Any:
+    clean_option_type = _clean_option_type(option_type)
+
+    if min_dte < 0 or max_dte < 0 or min_dte > max_dte:
+        raise HTTPException(status_code=400, detail="Invalid DTE range")
+    if near_limit <= 1 or near_limit > 40:
+        raise HTTPException(status_code=400, detail="near_limit must be between 2 and 40")
+    if width_min <= 0 or width_max <= 0 or width_min > width_max:
+        raise HTTPException(status_code=400, detail="Invalid width range")
+    if risk_min_dollars < 0 or risk_max_dollars < 0 or risk_min_dollars > risk_max_dollars:
+        raise HTTPException(status_code=400, detail="Invalid preferred risk range")
+    if hard_max_dollars <= 0:
+        raise HTTPException(status_code=400, detail="hard_max_dollars must be greater than 0")
+
+    token = await get_access_token()
+    ticker_summaries = []
+
+    for symbol in SYMBOL_ORDER:
+        summary = await _build_ticker_summary(
+            symbol=symbol,
+            option_type=clean_option_type,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            near_limit=near_limit,
+            width_min=width_min,
+            width_max=width_max,
+            risk_min_dollars=risk_min_dollars,
+            risk_max_dollars=risk_max_dollars,
+            hard_max_dollars=hard_max_dollars,
+            allow_fallback=allow_fallback,
+            token=token,
+        )
+        ticker_summaries.append(summary)
+
+    ranked = _rank_ticker_summaries(ticker_summaries)
+    best_summary = ranked[0] if ranked else None
+    best_ticker = best_summary["symbol"] if best_summary and best_summary["primary_candidate"] else None
+    verdict = best_summary["verdict"] if best_summary else "NO_TRADE"
+
+    compact_best = _compact_ticker_summary(best_summary) if best_summary else None
+
+    return {
+        "ok": True,
+        "verdict": verdict,
+        "best_ticker": best_ticker,
+        "selection_mode": compact_best["selection_mode"] if compact_best else "none",
+        "reason": compact_best["reason"] if compact_best else "No summary available.",
+        "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
+        "backup_candidate": _compact_candidate(best_summary["backup_candidate"]) if best_summary else None,
+        "ticker_summaries": [_compact_ticker_summary(s) for s in ticker_summaries],
     }
