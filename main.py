@@ -6,10 +6,10 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.5.0")
+app = FastAPI(title="SAFE-FAST Backend", version="1.6.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.5.0"
+USER_AGENT = "safe-fast-backend/1.6.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -212,7 +212,7 @@ def _generate_debit_spread_candidates(
 
     ordered_contracts = sorted(
         contracts,
-        key=lambda c: (c["strike_price"] is None, c["strike_price"])
+        key=lambda c: (c["strike_price"] is None, c["strike_price"]),
     )
 
     for i in range(len(ordered_contracts)):
@@ -393,6 +393,145 @@ def _rank_ticker_summaries(ticker_summaries: List[Dict[str, Any]]) -> List[Dict[
             SYMBOL_ORDER.index(x["symbol"]) if x["symbol"] in SYMBOL_ORDER else 999999,
         ),
     )
+
+
+def _status_field(value: Any, confirmed: bool) -> Dict[str, Any]:
+    return {
+        "status": "confirmed" if confirmed else "unconfirmed",
+        "value": value,
+    }
+
+
+def _chart_alignment_ok(option_type: str, chart_check: Optional[Dict[str, Any]]) -> Optional[bool]:
+    if not chart_check or not chart_check.get("ok"):
+        return None
+
+    side = chart_check.get("price_vs_ema50_1h")
+    if option_type == "C":
+        return side == "above"
+    return side == "below"
+
+
+def _final_verdict(
+    request: OnDemandRequest,
+    engine_status: str,
+    chart_alignment: Optional[bool],
+) -> str:
+    if request.open_positions > 0:
+        return "NO_TRADE"
+    if request.weekly_trade_count >= 4:
+        return "NO_TRADE"
+    if engine_status == "NO_TRADE":
+        return "NO_TRADE"
+    if chart_alignment is False:
+        return "NO_TRADE"
+    return "PENDING"
+
+
+def _build_chart_confirmation_block(
+    request: OnDemandRequest,
+    chart_check: Optional[Dict[str, Any]],
+    chart_check_error: Optional[str],
+) -> Dict[str, Any]:
+    one_hour_confirmed = bool(chart_check and chart_check.get("ok"))
+
+    if chart_check_error:
+        message = "Candidate engine result only - chart confirmation still required. Chart check failed in this run."
+    else:
+        message = "Candidate engine result only - chart confirmation still required."
+
+    return {
+        "confirmed": False,
+        "message": message,
+        "fields": {
+            "one_hour_50_ema": _status_field(
+                chart_check.get("ema50_1h") if chart_check else None,
+                one_hour_confirmed,
+            ),
+            "one_hour_price_vs_50_ema": _status_field(
+                chart_check.get("price_vs_ema50_1h") if chart_check else None,
+                one_hour_confirmed,
+            ),
+            "latest_close": _status_field(
+                chart_check.get("latest_close") if chart_check else None,
+                one_hour_confirmed,
+            ),
+            "twentyfour_hour_trend": _status_field(None, False),
+            "room_to_first_wall": _status_field(None, False),
+            "next_pocket": _status_field(None, False),
+            "extension_state": _status_field(None, False),
+            "open_positions_state": _status_field(request.open_positions, True),
+            "weekly_trade_count_state": _status_field(request.weekly_trade_count, True),
+        },
+    }
+
+
+def _build_user_facing_block(
+    request: OnDemandRequest,
+    engine_status: str,
+    final_verdict: str,
+    best_ticker: Optional[str],
+    chart_check: Optional[Dict[str, Any]],
+    chart_check_error: Optional[str],
+    engine_reason: str,
+) -> Dict[str, Any]:
+    ticker = best_ticker or "UNKNOWN"
+
+    if request.open_positions > 0:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": "No new entry allowed while open_positions > 0.",
+            "setup_state": "NO TRADE",
+            "why": "You already have 1 open position. SAFE-FAST allows max 1 open trade total.",
+        }
+
+    if request.weekly_trade_count >= 4:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": "No new entry allowed after max weekly trade count is reached.",
+            "setup_state": "NO TRADE",
+            "why": "Weekly trade count is already at or above the SAFE-FAST max.",
+        }
+
+    if engine_status == "NO_TRADE" or not best_ticker:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": "No valid candidate engine setup is available.",
+            "setup_state": "NO TRADE",
+            "why": engine_reason,
+        }
+
+    if final_verdict == "NO_TRADE":
+        why = "Best ticker failed the 1H EMA alignment check."
+        if chart_check_error:
+            why = "Chart check failed in this run."
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": "No valid new entry from the current combined read.",
+            "setup_state": "NO TRADE",
+            "why": why,
+        }
+
+    ema_text = "unconfirmed"
+    if chart_check and chart_check.get("ok"):
+        ema_text = str(chart_check.get("ema50_1h"))
+
+    return {
+        "good_idea_now": "WAIT",
+        "ticker": ticker,
+        "action": "wait for full chart confirmation",
+        "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+        "setup_state": "PENDING",
+        "why": "Candidate engine found a setup, but 24H trend/context and room fields are still unconfirmed.",
+    }
 
 
 async def get_access_token() -> str:
@@ -617,6 +756,70 @@ async def _build_ticker_summary(
     }
 
 
+async def _build_summary_compact_payload(
+    option_type: str,
+    min_dte: int,
+    max_dte: int,
+    near_limit: int,
+    width_min: float,
+    width_max: float,
+    risk_min_dollars: float,
+    risk_max_dollars: float,
+    hard_max_dollars: float,
+    allow_fallback: bool,
+    token: str,
+) -> Dict[str, Any]:
+    clean_option_type = _clean_option_type(option_type)
+
+    if min_dte < 0 or max_dte < 0 or min_dte > max_dte:
+        raise HTTPException(status_code=400, detail="Invalid DTE range")
+    if near_limit <= 1 or near_limit > 40:
+        raise HTTPException(status_code=400, detail="near_limit must be between 2 and 40")
+    if width_min <= 0 or width_max <= 0 or width_min > width_max:
+        raise HTTPException(status_code=400, detail="Invalid width range")
+    if risk_min_dollars < 0 or risk_max_dollars < 0 or risk_min_dollars > risk_max_dollars:
+        raise HTTPException(status_code=400, detail="Invalid preferred risk range")
+    if hard_max_dollars <= 0:
+        raise HTTPException(status_code=400, detail="hard_max_dollars must be greater than 0")
+
+    ticker_summaries = []
+
+    for symbol in SYMBOL_ORDER:
+        summary = await _build_ticker_summary(
+            symbol=symbol,
+            option_type=clean_option_type,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            near_limit=near_limit,
+            width_min=width_min,
+            width_max=width_max,
+            risk_min_dollars=risk_min_dollars,
+            risk_max_dollars=risk_max_dollars,
+            hard_max_dollars=hard_max_dollars,
+            allow_fallback=allow_fallback,
+            token=token,
+        )
+        ticker_summaries.append(summary)
+
+    ranked = _rank_ticker_summaries(ticker_summaries)
+    best_summary = ranked[0] if ranked else None
+    best_ticker = best_summary["symbol"] if best_summary and best_summary["primary_candidate"] else None
+    verdict = best_summary["verdict"] if best_summary else "NO_TRADE"
+
+    compact_best = _compact_ticker_summary(best_summary) if best_summary else None
+
+    return {
+        "ok": True,
+        "verdict": verdict,
+        "best_ticker": best_ticker,
+        "selection_mode": compact_best["selection_mode"] if compact_best else "none",
+        "reason": compact_best["reason"] if compact_best else "No summary available.",
+        "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
+        "backup_candidate": _compact_candidate(best_summary["backup_candidate"]) if best_summary else None,
+        "ticker_summaries": [_compact_ticker_summary(s) for s in ticker_summaries],
+    }
+
+
 async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
     snapshot = await get_1h_ema50_snapshot(
         symbol=symbol,
@@ -634,6 +837,103 @@ async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
         "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
         "latest_candle_time": snapshot["latest_candle_time"],
         "candle_count": snapshot["candle_count"],
+    }
+
+
+async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
+    clean_option_type = _clean_option_type(request.option_type)
+
+    if request.open_positions < 0 or request.open_positions > 1:
+        raise HTTPException(status_code=400, detail="open_positions must be 0 or 1")
+    if request.weekly_trade_count < 0:
+        raise HTTPException(status_code=400, detail="weekly_trade_count must be >= 0")
+
+    token = await get_access_token()
+
+    summary_payload = await _build_summary_compact_payload(
+        option_type=clean_option_type,
+        min_dte=request.min_dte,
+        max_dte=request.max_dte,
+        near_limit=request.near_limit,
+        width_min=request.width_min,
+        width_max=request.width_max,
+        risk_min_dollars=request.risk_min_dollars,
+        risk_max_dollars=request.risk_max_dollars,
+        hard_max_dollars=request.hard_max_dollars,
+        allow_fallback=request.allow_fallback,
+        token=token,
+    )
+
+    best_ticker = summary_payload.get("best_ticker")
+    engine_status = summary_payload.get("verdict", "NO_TRADE")
+    chart_check: Optional[Dict[str, Any]] = None
+    chart_check_error: Optional[str] = None
+
+    if request.include_chart_checks and best_ticker:
+        try:
+            chart_check = await _build_chart_check_payload(best_ticker, token)
+        except Exception as e:
+            chart_check_error = str(e)
+
+    chart_alignment = _chart_alignment_ok(clean_option_type, chart_check)
+    final_verdict = _final_verdict(request, engine_status, chart_alignment)
+
+    if request.include_chart_checks:
+        if chart_check:
+            chart_check_block: Dict[str, Any] = chart_check
+        else:
+            chart_check_block = {
+                "ok": False,
+                "symbol": best_ticker,
+                "error": chart_check_error or "Chart check unavailable in this run.",
+            }
+    else:
+        chart_check_block = {
+            "ok": False,
+            "symbol": best_ticker,
+            "status": "skipped",
+            "message": "Chart checks were not requested.",
+        }
+
+    return {
+        "ok": True,
+        "mode": "on_demand",
+        "source_of_truth": "candidate_engine",
+        "engine_status": engine_status,
+        "final_verdict": final_verdict,
+        "best_ticker": best_ticker,
+        "request": {
+            "option_type": clean_option_type,
+            "min_dte": request.min_dte,
+            "max_dte": request.max_dte,
+            "near_limit": request.near_limit,
+            "width_min": request.width_min,
+            "width_max": request.width_max,
+            "risk_min_dollars": request.risk_min_dollars,
+            "risk_max_dollars": request.risk_max_dollars,
+            "hard_max_dollars": request.hard_max_dollars,
+            "allow_fallback": request.allow_fallback,
+            "include_chart_checks": request.include_chart_checks,
+            "open_positions": request.open_positions,
+            "weekly_trade_count": request.weekly_trade_count,
+            "macro_context_requested": request.macro_context_requested,
+        },
+        "candidate_engine": summary_payload,
+        "chart_check": chart_check_block,
+        "chart_confirmation": _build_chart_confirmation_block(
+            request=request,
+            chart_check=chart_check,
+            chart_check_error=chart_check_error,
+        ),
+        "user_facing": _build_user_facing_block(
+            request=request,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
+            best_ticker=best_ticker,
+            chart_check=chart_check,
+            chart_check_error=chart_check_error,
+            engine_reason=summary_payload.get("reason", "No summary available."),
+        ),
     }
 
 
@@ -1103,56 +1403,20 @@ async def tt_safe_fast_summary_compact(
     hard_max_dollars: float = Query(400.0),
     allow_fallback: bool = Query(True),
 ) -> Any:
-    clean_option_type = _clean_option_type(option_type)
-
-    if min_dte < 0 or max_dte < 0 or min_dte > max_dte:
-        raise HTTPException(status_code=400, detail="Invalid DTE range")
-    if near_limit <= 1 or near_limit > 40:
-        raise HTTPException(status_code=400, detail="near_limit must be between 2 and 40")
-    if width_min <= 0 or width_max <= 0 or width_min > width_max:
-        raise HTTPException(status_code=400, detail="Invalid width range")
-    if risk_min_dollars < 0 or risk_max_dollars < 0 or risk_min_dollars > risk_max_dollars:
-        raise HTTPException(status_code=400, detail="Invalid preferred risk range")
-    if hard_max_dollars <= 0:
-        raise HTTPException(status_code=400, detail="hard_max_dollars must be greater than 0")
-
     token = await get_access_token()
-    ticker_summaries = []
-
-    for symbol in SYMBOL_ORDER:
-        summary = await _build_ticker_summary(
-            symbol=symbol,
-            option_type=clean_option_type,
-            min_dte=min_dte,
-            max_dte=max_dte,
-            near_limit=near_limit,
-            width_min=width_min,
-            width_max=width_max,
-            risk_min_dollars=risk_min_dollars,
-            risk_max_dollars=risk_max_dollars,
-            hard_max_dollars=hard_max_dollars,
-            allow_fallback=allow_fallback,
-            token=token,
-        )
-        ticker_summaries.append(summary)
-
-    ranked = _rank_ticker_summaries(ticker_summaries)
-    best_summary = ranked[0] if ranked else None
-    best_ticker = best_summary["symbol"] if best_summary and best_summary["primary_candidate"] else None
-    verdict = best_summary["verdict"] if best_summary else "NO_TRADE"
-
-    compact_best = _compact_ticker_summary(best_summary) if best_summary else None
-
-    return {
-        "ok": True,
-        "verdict": verdict,
-        "best_ticker": best_ticker,
-        "selection_mode": compact_best["selection_mode"] if compact_best else "none",
-        "reason": compact_best["reason"] if compact_best else "No summary available.",
-        "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
-        "backup_candidate": _compact_candidate(best_summary["backup_candidate"]) if best_summary else None,
-        "ticker_summaries": [_compact_ticker_summary(s) for s in ticker_summaries],
-    }
+    return await _build_summary_compact_payload(
+        option_type=option_type,
+        min_dte=min_dte,
+        max_dte=max_dte,
+        near_limit=near_limit,
+        width_min=width_min,
+        width_max=width_max,
+        risk_min_dollars=risk_min_dollars,
+        risk_max_dollars=risk_max_dollars,
+        hard_max_dollars=hard_max_dollars,
+        allow_fallback=allow_fallback,
+        token=token,
+    )
 
 
 @app.get("/tt/dxlink-candle-test")
@@ -1185,3 +1449,44 @@ async def tt_safe_fast_chart_check(
         return await _build_chart_check_payload(clean_symbol, token)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/tt/safe-fast-on-demand")
+async def tt_safe_fast_on_demand_get(
+    option_type: str = Query("C"),
+    min_dte: int = Query(14),
+    max_dte: int = Query(30),
+    near_limit: int = Query(16),
+    width_min: float = Query(5.0),
+    width_max: float = Query(10.0),
+    risk_min_dollars: float = Query(250.0),
+    risk_max_dollars: float = Query(300.0),
+    hard_max_dollars: float = Query(400.0),
+    allow_fallback: bool = Query(True),
+    include_chart_checks: bool = Query(True),
+    open_positions: int = Query(0),
+    weekly_trade_count: int = Query(0),
+    macro_context_requested: bool = Query(False),
+) -> Any:
+    request = OnDemandRequest(
+        option_type=option_type,
+        min_dte=min_dte,
+        max_dte=max_dte,
+        near_limit=near_limit,
+        width_min=width_min,
+        width_max=width_max,
+        risk_min_dollars=risk_min_dollars,
+        risk_max_dollars=risk_max_dollars,
+        hard_max_dollars=hard_max_dollars,
+        allow_fallback=allow_fallback,
+        include_chart_checks=include_chart_checks,
+        open_positions=open_positions,
+        weekly_trade_count=weekly_trade_count,
+        macro_context_requested=macro_context_requested,
+    )
+    return await _build_on_demand_payload(request)
+
+
+@app.post("/tt/safe-fast-on-demand")
+async def tt_safe_fast_on_demand_post(request: OnDemandRequest) -> Any:
+    return await _build_on_demand_payload(request)
