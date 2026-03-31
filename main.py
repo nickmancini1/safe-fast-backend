@@ -1,13 +1,13 @@
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.0.0")
+app = FastAPI(title="SAFE-FAST Backend", version="1.1.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.0.0"
+USER_AGENT = "safe-fast-backend/1.1.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -62,6 +62,23 @@ def _clean_option_type(option_type: str) -> str:
     if value not in {"C", "P"}:
         raise HTTPException(status_code=400, detail="option_type must be C or P")
     return value
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _best_price(contract: Dict[str, Any]) -> Optional[float]:
+    for field in ["mid", "mark", "last"]:
+        value = _to_float(contract.get(field))
+        if value is not None:
+            return value
+    return None
 
 
 async def get_access_token() -> str:
@@ -169,12 +186,9 @@ async def _get_underlying_price(symbol: str, token: str) -> float:
     item = items[0]
 
     for field in ["mark", "last", "mid", "close"]:
-        value = item.get(field)
+        value = _to_float(item.get(field))
         if value is not None:
-            try:
-                return float(value)
-            except Exception:
-                pass
+            return value
 
     raise HTTPException(status_code=500, detail="Could not determine underlying price")
 
@@ -194,10 +208,8 @@ def _build_near_contracts(
         if item.get("option-type") != option_type:
             continue
 
-        strike = item.get("strike-price")
-        try:
-            strike_value = float(strike)
-        except Exception:
+        strike_value = _to_float(item.get("strike-price"))
+        if strike_value is None:
             continue
 
         contracts.append(
@@ -215,6 +227,51 @@ def _build_near_contracts(
 
     contracts.sort(key=lambda x: (x["distance_from_underlying"], x["strike_price"]))
     return contracts
+
+
+async def _get_quoted_near_contracts(
+    symbol: str,
+    expiration_date: str,
+    option_type: str,
+    limit: int,
+    token: str,
+) -> Dict[str, Any]:
+    underlying_price = await _get_underlying_price(symbol, token)
+    chain_payload = await _fetch_option_chain(symbol, token)
+
+    near_contracts = _build_near_contracts(
+        chain_payload=chain_payload,
+        expiration_date=expiration_date,
+        option_type=option_type,
+        underlying_price=underlying_price,
+    )[:limit]
+
+    option_symbols = [c["symbol"] for c in near_contracts if c.get("symbol")]
+    quote_payload = await _fetch_option_quotes(option_symbols, token)
+    quote_items = quote_payload.get("data", {}).get("items", [])
+    quote_map = {item.get("symbol"): item for item in quote_items}
+
+    merged = []
+    for contract in near_contracts:
+        quote = quote_map.get(contract["symbol"], {})
+        merged.append(
+            {
+                **contract,
+                "bid": quote.get("bid"),
+                "ask": quote.get("ask"),
+                "mid": quote.get("mid"),
+                "mark": quote.get("mark"),
+                "last": quote.get("last"),
+                "bid_size": quote.get("bid-size"),
+                "ask_size": quote.get("ask-size"),
+                "updated_at": quote.get("updated-at"),
+            }
+        )
+
+    return {
+        "underlying_price": underlying_price,
+        "contracts": merged,
+    }
 
 
 @app.get("/")
@@ -328,14 +385,15 @@ async def tt_option_expirations(
         if dte is None or expiration_date is None:
             continue
 
-        if min_dte <= int(dte) <= max_dte:
-            key = (expiration_date, int(dte))
+        dte_int = int(dte)
+        if min_dte <= dte_int <= max_dte:
+            key = (expiration_date, dte_int)
             if key not in seen:
                 seen.add(key)
                 expirations.append(
                     {
                         "expiration_date": expiration_date,
-                        "days_to_expiration": int(dte),
+                        "days_to_expiration": dte_int,
                     }
                 )
 
@@ -376,11 +434,7 @@ async def tt_option_contracts(
         if item.get("option-type") != clean_option_type:
             continue
 
-        strike = item.get("strike-price")
-        try:
-            strike_value = float(strike)
-        except Exception:
-            strike_value = None
+        strike_value = _to_float(item.get("strike-price"))
 
         contracts.append(
             {
@@ -420,24 +474,34 @@ async def tt_option_contracts_near(
         raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
 
     token = await get_access_token()
-    underlying_price = await _get_underlying_price(clean_symbol, token)
-    payload = await _fetch_option_chain(clean_symbol, token)
-
-    contracts = _build_near_contracts(
-        chain_payload=payload,
+    data = await _get_quoted_near_contracts(
+        symbol=clean_symbol,
         expiration_date=expiration_date,
         option_type=clean_option_type,
-        underlying_price=underlying_price,
+        limit=limit,
+        token=token,
     )
 
     return {
         "ok": True,
         "symbol": clean_symbol,
-        "underlying_price": underlying_price,
+        "underlying_price": data["underlying_price"],
         "expiration_date": expiration_date,
         "option_type": clean_option_type,
-        "count": len(contracts),
-        "contracts": contracts[:limit],
+        "count": len(data["contracts"]),
+        "contracts": [
+            {
+                "symbol": c["symbol"],
+                "streamer_symbol": c["streamer_symbol"],
+                "strike_price": c["strike_price"],
+                "distance_from_underlying": c["distance_from_underlying"],
+                "expiration_date": c["expiration_date"],
+                "days_to_expiration": c["days_to_expiration"],
+                "option_type": c["option_type"],
+                "active": c["active"],
+            }
+            for c in data["contracts"]
+        ],
     }
 
 
@@ -455,37 +519,131 @@ async def tt_option_quotes_near(
         raise HTTPException(status_code=400, detail="limit must be between 1 and 20")
 
     token = await get_access_token()
-    underlying_price = await _get_underlying_price(clean_symbol, token)
-    chain_payload = await _fetch_option_chain(clean_symbol, token)
-
-    near_contracts = _build_near_contracts(
-        chain_payload=chain_payload,
+    data = await _get_quoted_near_contracts(
+        symbol=clean_symbol,
         expiration_date=expiration_date,
         option_type=clean_option_type,
-        underlying_price=underlying_price,
-    )[:limit]
+        limit=limit,
+        token=token,
+    )
 
-    option_symbols = [c["symbol"] for c in near_contracts if c.get("symbol")]
-    quote_payload = await _fetch_option_quotes(option_symbols, token)
-    quote_items = quote_payload.get("data", {}).get("items", [])
-    quote_map = {item.get("symbol"): item for item in quote_items}
+    return {
+        "ok": True,
+        "symbol": clean_symbol,
+        "underlying_price": data["underlying_price"],
+        "expiration_date": expiration_date,
+        "option_type": clean_option_type,
+        "count": len(data["contracts"]),
+        "contracts": data["contracts"],
+    }
 
-    merged = []
-    for contract in near_contracts:
-        quote = quote_map.get(contract["symbol"], {})
-        merged.append(
-            {
-                **contract,
-                "bid": quote.get("bid"),
-                "ask": quote.get("ask"),
-                "mid": quote.get("mid"),
-                "mark": quote.get("mark"),
-                "last": quote.get("last"),
-                "bid_size": quote.get("bid-size"),
-                "ask_size": quote.get("ask-size"),
-                "updated_at": quote.get("updated-at"),
-            }
+
+@app.get("/tt/debit-spread-candidates")
+async def tt_debit_spread_candidates(
+    symbol: str = Query("SPY"),
+    expiration_date: str = Query(...),
+    option_type: str = Query("C"),
+    near_limit: int = Query(16),
+    width_min: float = Query(5.0),
+    width_max: float = Query(10.0),
+    limit: int = Query(8),
+) -> Any:
+    clean_symbol = _clean_symbol(symbol)
+    clean_option_type = _clean_option_type(option_type)
+
+    if near_limit <= 1 or near_limit > 40:
+        raise HTTPException(status_code=400, detail="near_limit must be between 2 and 40")
+    if width_min <= 0 or width_max <= 0 or width_min > width_max:
+        raise HTTPException(status_code=400, detail="Invalid width range")
+    if limit <= 0 or limit > 20:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 20")
+
+    token = await get_access_token()
+    data = await _get_quoted_near_contracts(
+        symbol=clean_symbol,
+        expiration_date=expiration_date,
+        option_type=clean_option_type,
+        limit=near_limit,
+        token=token,
+    )
+
+    underlying_price = data["underlying_price"]
+    contracts = sorted(
+        data["contracts"],
+        key=lambda c: (c["strike_price"] is None, c["strike_price"])
+    )
+
+    candidates = []
+
+    for i in range(len(contracts)):
+        for j in range(i + 1, len(contracts)):
+            left = contracts[i]
+            right = contracts[j]
+
+            left_strike = _to_float(left.get("strike_price"))
+            right_strike = _to_float(right.get("strike_price"))
+            if left_strike is None or right_strike is None:
+                continue
+
+            width = round(abs(right_strike - left_strike), 4)
+            if width < width_min or width > width_max:
+                continue
+
+            if clean_option_type == "C":
+                long_leg = left
+                short_leg = right
+            else:
+                long_leg = right
+                short_leg = left
+
+            long_price = _best_price(long_leg)
+            short_price = _best_price(short_leg)
+
+            if long_price is None or short_price is None:
+                continue
+
+            est_debit = round(long_price - short_price, 4)
+            if est_debit <= 0:
+                continue
+
+            max_loss = est_debit
+            max_profit = round(width - est_debit, 4)
+            feasibility_pass = (1.6 * est_debit) <= width
+
+            long_strike = _to_float(long_leg.get("strike_price"))
+            short_strike = _to_float(short_leg.get("strike_price"))
+            if long_strike is None or short_strike is None:
+                continue
+
+            candidates.append(
+                {
+                    "long_symbol": long_leg.get("symbol"),
+                    "short_symbol": short_leg.get("symbol"),
+                    "long_strike": long_strike,
+                    "short_strike": short_strike,
+                    "width": width,
+                    "long_mid": long_leg.get("mid"),
+                    "short_mid": short_leg.get("mid"),
+                    "long_mark": long_leg.get("mark"),
+                    "short_mark": short_leg.get("mark"),
+                    "est_debit": est_debit,
+                    "max_loss": max_loss,
+                    "max_profit": max_profit,
+                    "risk_reward": round(max_profit / max_loss, 4) if max_loss > 0 else None,
+                    "feasibility_pass": feasibility_pass,
+                    "long_distance_from_underlying": round(abs(long_strike - underlying_price), 4),
+                    "short_distance_from_underlying": round(abs(short_strike - underlying_price), 4),
+                }
+            )
+
+    candidates.sort(
+        key=lambda x: (
+            not x["feasibility_pass"],
+            x["long_distance_from_underlying"],
+            x["width"],
+            x["est_debit"],
         )
+    )
 
     return {
         "ok": True,
@@ -493,6 +651,10 @@ async def tt_option_quotes_near(
         "underlying_price": underlying_price,
         "expiration_date": expiration_date,
         "option_type": clean_option_type,
-        "count": len(merged),
-        "contracts": merged,
+        "width_min": width_min,
+        "width_max": width_max,
+        "near_limit": near_limit,
+        "count": len(candidates),
+        "pricing_rule": "mid_then_mark_then_last",
+        "candidates": candidates[:limit],
     }
