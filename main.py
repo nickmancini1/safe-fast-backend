@@ -4,6 +4,10 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
+from fastapi import FastAPI, HTTPException, Query
+
+from dxlink_candles import get_1h_ema50_snapshot
+
 app = FastAPI(title="SAFE-FAST Backend", version="1.5.0")
 
 API_BASE = "https://api.tastyworks.com"
@@ -1113,4 +1117,22 @@ async def tt_safe_fast_summary_compact(
         "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
         "backup_candidate": _compact_candidate(best_summary["backup_candidate"]) if best_summary else None,
         "ticker_summaries": [_compact_ticker_summary(s) for s in ticker_summaries],
+
+        @app.get("/tt/dxlink-candle-test")
+async def tt_dxlink_candle_test(
+    symbol: str = Query("SPY"),
+) -> Any:
+    clean_symbol = _clean_symbol(symbol)
+    token = await get_access_token()
+
+    try:
+        return await get_1h_ema50_snapshot(
+            symbol=clean_symbol,
+            access_token=token,
+            api_base=API_BASE,
+            user_agent=USER_AGENT,
+            days_back=14,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
     }
