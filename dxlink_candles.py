@@ -1,6 +1,6 @@
-
 import asyncio
 import json
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -17,9 +17,12 @@ def _to_float(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        return float(value)
+        out = float(value)
     except Exception:
         return None
+    if not math.isfinite(out):
+        return None
+    return out
 
 
 def _compute_ema(values: List[float], length: int) -> Optional[float]:
