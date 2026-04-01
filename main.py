@@ -1,4 +1,3 @@
-
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -123,6 +122,191 @@ def _other_ticker_candidates(
         )
 
     return out
+
+
+_MACRO_MONTHS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+
+async def _fetch_text(url: str) -> str:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        resp = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
+    resp.raise_for_status()
+    return unescape(resp.text)
+
+
+def _next_trading_days(start_dt: datetime, count: int = 3) -> List[datetime.date]:
+    out: List[datetime.date] = []
+    cur = start_dt.date()
+    while len(out) < count:
+        if cur.weekday() < 5:
+            out.append(cur)
+        cur = cur + timedelta(days=1)
+    return out
+
+
+def _parse_month_day_year(raw: str, fallback_year: int) -> Optional[datetime.date]:
+    cleaned = raw.strip().replace(",", "").replace(".", "")
+    parts = cleaned.split()
+    if len(parts) < 2:
+        return None
+
+    month = _MACRO_MONTHS.get(parts[0].lower())
+    if not month:
+        return None
+
+    day_token = parts[1]
+    if "-" in day_token:
+        day_token = day_token.split("-")[0]
+    if "â" in day_token:
+        day_token = day_token.split("â")[0]
+    day_token = re.sub(r"[^0-9]", "", day_token)
+    if not day_token:
+        return None
+
+    year = fallback_year
+    if len(parts) >= 3 and parts[2].isdigit():
+        year = int(parts[2])
+
+    try:
+        return datetime(year, month, int(day_token), tzinfo=NY_TZ).date()
+    except Exception:
+        return None
+
+
+def _extract_dates_by_patterns(text: str, fallback_year: int) -> List[datetime.date]:
+    pattern = re.compile(
+        r"(January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan\.?|Feb\.?|Mar\.?|Apr\.?|May|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)"
+        r"\s+\d{1,2}(?:\s*[-â]\s*\d{1,2})?(?:,\s*\d{4}|\s+\d{4})?",
+        re.IGNORECASE,
+    )
+    out: List[datetime.date] = []
+    seen = set()
+    for match in pattern.findall(text):
+        # findall with groups only returns group text; use finditer instead
+        pass
+    for match in pattern.finditer(text):
+        parsed = _parse_month_day_year(match.group(0), fallback_year)
+        if parsed and parsed not in seen:
+            seen.add(parsed)
+            out.append(parsed)
+    return out
+
+
+async def _fetch_fomc_events(now_et: datetime) -> List[Dict[str, Any]]:
+    text = await _fetch_text("https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
+    dates = _extract_dates_by_patterns(text, now_et.year)
+    events = []
+    for d in dates:
+        if d >= now_et.date() - timedelta(days=1):
+            events.append({
+                "date": d.isoformat(),
+                "event": "FOMC",
+                "major": True,
+                "source": "federalreserve.gov",
+            })
+    return events
+
+
+async def _fetch_bls_events(now_et: datetime) -> List[Dict[str, Any]]:
+    urls = [
+        ("CPI", "https://www.bls.gov/schedule/news_release/cpi.htm"),
+        ("Employment Situation", "https://www.bls.gov/schedule/news_release/empsit.htm"),
+    ]
+    events: List[Dict[str, Any]] = []
+    for label, url in urls:
+        text = await _fetch_text(url)
+        dates = _extract_dates_by_patterns(text, now_et.year)
+        for d in dates:
+            if d >= now_et.date() - timedelta(days=1):
+                events.append({
+                    "date": d.isoformat(),
+                    "event": label,
+                    "major": True,
+                    "source": "bls.gov",
+                })
+    return events
+
+
+async def _build_macro_context(requested: bool) -> Dict[str, Any]:
+    if not requested:
+        return {
+            "ok": False,
+            "requested": False,
+            "why": "macro not requested",
+            "has_major_event_today": False,
+            "has_major_event_tomorrow": False,
+            "events": [],
+            "risk_level": "skipped",
+            "note": "Macro context not requested.",
+        }
+
+    now_et = datetime.now(NY_TZ)
+    today = now_et.date()
+    tomorrow = today + timedelta(days=1)
+    hold_window = {d.isoformat() for d in _next_trading_days(now_et, 3)}
+
+    events: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    try:
+        events.extend(await _fetch_fomc_events(now_et))
+    except Exception as e:
+        warnings.append(f"FOMC source unavailable: {e}")
+
+    try:
+        events.extend(await _fetch_bls_events(now_et))
+    except Exception as e:
+        warnings.append(f"BLS source unavailable: {e}")
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for ev in sorted(events, key=lambda x: (x["date"], x["event"])):
+        key = (ev["date"], ev["event"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(ev)
+
+    has_today = any(ev["date"] == today.isoformat() and ev["major"] for ev in deduped)
+    has_tomorrow = any(ev["date"] == tomorrow.isoformat() and ev["major"] for ev in deduped)
+    in_hold_window = [ev for ev in deduped if ev["date"] in hold_window and ev["major"]]
+
+    if in_hold_window:
+        risk_level = "high"
+        note = "Major macro event is inside the next 3 trading days."
+    elif deduped:
+        risk_level = "normal"
+        note = "No major macro event found inside the next 3 trading days."
+    else:
+        risk_level = "unconfirmed"
+        note = "Macro sources returned no usable schedule data."
+
+    if warnings:
+        note = f"{note} Warnings: {' | '.join(warnings)}"
+
+    return {
+        "ok": True,
+        "requested": True,
+        "has_major_event_today": has_today,
+        "has_major_event_tomorrow": has_tomorrow,
+        "events": deduped,
+        "risk_level": risk_level,
+        "note": note,
+        "as_of_et": now_et.isoformat(timespec="seconds"),
+    }
 
 
 async def get_access_token() -> str:
