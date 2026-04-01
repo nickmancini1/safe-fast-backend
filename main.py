@@ -103,57 +103,6 @@ def _market_context_now() -> Dict[str, Any]:
     }
 
 
-
-
-def _time_day_gate(market_context: Dict[str, Any]) -> Dict[str, Any]:
-    now_et = datetime.now(NY_TZ)
-    if not market_context.get("is_open"):
-        return {
-            "passes": False,
-            "fresh_entries_allowed": False,
-            "reason": "market closed",
-            "cutoff_et": None,
-            "as_of_et": now_et.isoformat(timespec="seconds"),
-        }
-
-    weekday = now_et.weekday()  # Mon=0 ... Fri=4
-    current_t = now_et.time()
-
-    if weekday <= 3:
-        cutoff = time(14, 0)
-        fresh_allowed = current_t < cutoff
-        return {
-            "passes": fresh_allowed,
-            "fresh_entries_allowed": fresh_allowed,
-            "reason": "regular weekday cutoff" if not fresh_allowed else "within allowed entry window",
-            "cutoff_et": "14:00",
-            "as_of_et": now_et.isoformat(timespec="seconds"),
-        }
-
-    if weekday == 4:
-        cutoff = time(12, 0)
-        hard_manage_only = time(14, 0)
-        fresh_allowed = current_t < cutoff
-        reason = "within allowed Friday entry window"
-        if current_t >= hard_manage_only:
-            reason = "Friday after 14:00 ET manage existing trades only"
-        elif current_t >= cutoff:
-            reason = "Friday after 12:00 ET no fresh setups"
-        return {
-            "passes": fresh_allowed,
-            "fresh_entries_allowed": fresh_allowed,
-            "reason": reason,
-            "cutoff_et": "12:00",
-            "as_of_et": now_et.isoformat(timespec="seconds"),
-        }
-
-    return {
-        "passes": False,
-        "fresh_entries_allowed": False,
-        "reason": "weekend",
-        "cutoff_et": None,
-        "as_of_et": now_et.isoformat(timespec="seconds"),
-    }
 def _other_ticker_candidates(
     summary_payload: Dict[str, Any],
     best_ticker: Optional[str],
@@ -1215,15 +1164,12 @@ def _final_verdict(
     market_context: Dict[str, Any],
     macro_context: Dict[str, Any],
     structure_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
 ) -> str:
     if request.open_positions > 0:
         return "NO_TRADE"
     if request.weekly_trade_count >= 4:
         return "NO_TRADE"
     if not market_context["is_open"]:
-        return "NO_TRADE"
-    if not time_day_gate.get("fresh_entries_allowed", False):
         return "NO_TRADE"
     if macro_context.get("ok") and (
         macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
@@ -1295,7 +1241,6 @@ def _build_user_facing_block(
     market_context: Dict[str, Any],
     macro_context: Dict[str, Any],
     structure_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
@@ -1328,16 +1273,6 @@ def _build_user_facing_block(
             "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
             "setup_state": "WAIT_MARKET_CLOSED",
             "why": f"Candidate exists, but the regular session is closed as of {market_context['as_of_et']}. Re-check next session before entry.",
-        }
-
-    if not time_day_gate.get("fresh_entries_allowed", False):
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-            "setup_state": "NO TRADE",
-            "why": time_day_gate.get("reason", "Time/day filter blocks fresh entries now."),
         }
 
     if macro_context.get("ok") and (
@@ -1460,40 +1395,9 @@ def _build_targets_block(primary_candidate: Optional[Dict[str, Any]]) -> Dict[st
     }
 
 
-def _build_checklist_block(
-    request: OnDemandRequest,
-    market_context: Dict[str, Any],
-    macro_context: Dict[str, Any],
-    structure_context: Dict[str, Any],
-    chart_check: Optional[Dict[str, Any]],
-    time_day_gate: Dict[str, Any],
-) -> Dict[str, str]:
-    setup_type = structure_context.get("setup_type")
-    allowed_setup = structure_context.get("allowed_setup")
-    trend_label = structure_context.get("trend_label")
-    one_hour_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
-    clear_trigger = "YES" if allowed_setup is True and structure_context.get("room_pass") is True and structure_context.get("extension_state") != "extended" else "NO"
-    return {
-        "allowed_setup": "YES" if allowed_setup is True else "NO",
-        "twentyfour_hour_supportive_or_valid_countertrend": "YES" if (structure_context.get("twentyfour_hour_supportive") is True or trend_label == "Countertrend") else "NO",
-        "one_hour_clean_around_50_ema": "YES" if one_hour_side in {"above", "below"} else "NO",
-        "clear_room": "YES" if structure_context.get("room_pass") is True else "NO",
-        "early_enough": "YES" if (structure_context.get("extension_state") != "extended" and time_day_gate.get("fresh_entries_allowed", False)) else "NO",
-        "clear_trigger": clear_trigger,
-        "invalidation_clear": "YES" if chart_check and chart_check.get("ema50_1h") is not None else "NO",
-        "fits_risk": "YES",
-        "open_trade_already": "YES" if request.open_positions > 0 else "NO",
-        "market_open": "YES" if market_context.get("is_open") else "NO",
-        "macro_blocked": "YES" if (macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")) else "NO",
-        "setup_type": setup_type or "unconfirmed",
-        "trend_label": trend_label or "unconfirmed",
-    }
-
-
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
-    time_day_gate = _time_day_gate(market_context)
     macro_context = await _build_macro_context(request.macro_context_requested)
 
     if request.open_positions < 0 or request.open_positions > 1:
@@ -1543,7 +1447,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         market_context=market_context,
         macro_context=macro_context,
         structure_context=structure_context,
-        time_day_gate=time_day_gate,
     )
 
     if request.include_chart_checks:
@@ -1572,7 +1475,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
         "market_context": market_context,
-        "time_day_gate": time_day_gate,
         "macro_context": macro_context,
         "structure_context": structure_context,
         "targets": _build_targets_block(summary_payload.get("primary_candidate")),
@@ -1586,14 +1488,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             chart_check=chart_check,
             chart_check_error=chart_check_error,
             structure_context=structure_context,
-        ),
-        "checklist": _build_checklist_block(
-            request=request,
-            market_context=market_context,
-            macro_context=macro_context,
-            structure_context=structure_context,
-            chart_check=chart_check,
-            time_day_gate=time_day_gate,
         ),
         "user_facing": _build_user_facing_block(
             request=request,
