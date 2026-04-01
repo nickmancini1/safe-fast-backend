@@ -1,7 +1,8 @@
+
 import os
 from datetime import datetime, time
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -9,69 +10,37 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI()
+app = FastAPI(title="SAFE-FAST Backend", version="1.6.2")
+
+API_BASE = "https://api.tastyworks.com"
+USER_AGENT = "safe-fast-backend/1.6.2"
+
+TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
+TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
+TT_REDIRECT_URI = os.getenv("TT_REDIRECT_URI", "")
+TT_REFRESH_TOKEN = os.getenv("TT_REFRESH_TOKEN", "")
 
 ALLOWED_SYMBOLS = {"SPY", "QQQ", "IWM", "GLD"}
 SYMBOL_ORDER = ["SPY", "QQQ", "IWM", "GLD"]
+
 NY_TZ = ZoneInfo("America/New_York")
 
-
-def _market_context_now() -> Dict[str, Any]:
-    now_et = datetime.now(NY_TZ)
-    is_weekday = now_et.weekday() < 5
-    in_regular_session = time(9, 30) <= now_et.time() < time(16, 0)
-    is_open = is_weekday and in_regular_session
-
-    return {
-        "is_open": is_open,
-        "as_of_et": now_et.isoformat(timespec="seconds"),
-        "session": "regular" if is_open else "closed",
-    }
-
-
-def _other_ticker_candidates(
-    summary_payload: Dict[str, Any],
-    best_ticker: Optional[str],
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-
-    for s in summary_payload.get("ticker_summaries", []):
-        if s.get("symbol") == best_ticker:
-            continue
-
-        out.append(
-            {
-                "symbol": s.get("symbol"),
-                "verdict": s.get("verdict"),
-                "reason": s.get("reason"),
-                "primary_candidate": s.get("primary_candidate"),
-            }
-        )
-
-    return out
 
 class OnDemandRequest(BaseModel):
     option_type: str = "C"
     min_dte: int = 14
     max_dte: int = 30
     near_limit: int = 16
-    width_min: float = 5
-    width_max: float = 10
-    risk_min_dollars: float = 250
-    risk_max_dollars: float = 300
-    hard_max_dollars: float = 400
+    width_min: float = 5.0
+    width_max: float = 10.0
+    risk_min_dollars: float = 250.0
+    risk_max_dollars: float = 300.0
+    hard_max_dollars: float = 400.0
     allow_fallback: bool = True
     include_chart_checks: bool = True
     open_positions: int = 0
     weekly_trade_count: int = 0
-    
-API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.6.1"
-
-TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
-TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
-TT_REDIRECT_URI = os.getenv("TT_REDIRECT_URI", "")
-TT_REFRESH_TOKEN = os.getenv("TT_REFRESH_TOKEN", "")
+    macro_context_requested: bool = False
 
 
 def _headers(access_token: str) -> Dict[str, str]:
@@ -80,6 +49,20 @@ def _headers(access_token: str) -> Dict[str, str]:
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
     }
+
+
+def _clean_symbol(symbol: str) -> str:
+    value = symbol.strip().upper()
+    if value not in ALLOWED_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Only SAFE-FAST symbols are allowed",
+                "allowed": sorted(ALLOWED_SYMBOLS),
+                "bad_symbol": value,
+            },
+        )
+    return value
 
 
 def _clean_option_type(option_type: str) -> str:
@@ -104,6 +87,40 @@ def _best_price(contract: Dict[str, Any]) -> Optional[float]:
         if value is not None:
             return value
     return None
+
+
+def _market_context_now() -> Dict[str, Any]:
+    now_et = datetime.now(NY_TZ)
+    is_weekday = now_et.weekday() < 5
+    in_regular_session = time(9, 30) <= now_et.time() < time(16, 0)
+    is_open = is_weekday and in_regular_session
+
+    return {
+        "is_open": is_open,
+        "as_of_et": now_et.isoformat(timespec="seconds"),
+        "session": "regular" if is_open else "closed",
+    }
+
+
+def _other_ticker_candidates(
+    summary_payload: Dict[str, Any],
+    best_ticker: Optional[str],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+
+    for s in summary_payload.get("ticker_summaries", []):
+        if s.get("symbol") == best_ticker:
+            continue
+        out.append(
+            {
+                "symbol": s.get("symbol"),
+                "verdict": s.get("verdict"),
+                "reason": s.get("reason"),
+                "primary_candidate": s.get("primary_candidate"),
+            }
+        )
+
+    return out
 
 
 async def get_access_token() -> str:
@@ -296,6 +313,7 @@ def _merge_quotes_into_contracts(
 
     return merged
 
+
 def _generate_debit_spread_candidates(
     contracts: List[Dict[str, Any]],
     underlying_price: float,
@@ -354,6 +372,8 @@ def _generate_debit_spread_candidates(
             if only_preferred and not preferred_risk_band_pass:
                 continue
 
+            long_strike = _to_float(long_leg.get("strike_price")) or 0.0
+
             candidates.append(
                 {
                     "long_symbol": long_leg.get("symbol"),
@@ -369,7 +389,7 @@ def _generate_debit_spread_candidates(
                     "preferred_risk_band_pass": preferred_risk_band_pass,
                     "within_hard_max": within_hard_max,
                     "fits_risk_budget": preferred_risk_band_pass and within_hard_max,
-                    "long_distance_from_underlying": round(abs((_to_float(long_leg.get("strike_price")) or 0) - underlying_price), 4),
+                    "long_distance_from_underlying": round(abs(long_strike - underlying_price), 4),
                     "distance_from_target_risk_mid": round(abs(max_loss_dollars_1lot - target_risk_mid), 2),
                 }
             )
@@ -745,9 +765,11 @@ def _build_user_facing_block(
         "why": "Candidate engine found a setup, but 24H trend/context and room fields are still unconfirmed.",
     }
 
+
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
-market_context = _market_context_now()
+    market_context = _market_context_now()
+
     if request.open_positions < 0 or request.open_positions > 1:
         raise HTTPException(status_code=400, detail="open_positions must be 0 or 1")
     if request.weekly_trade_count < 0:
@@ -780,11 +802,10 @@ market_context = _market_context_now()
             chart_check_error = str(e)
 
     chart_alignment = _chart_alignment_ok(clean_option_type, chart_check)
-final_verdict = _final_verdict(request, engine_status, chart_alignment, market_context)
+    final_verdict = _final_verdict(request, engine_status, chart_alignment, market_context)
 
-    chart_check_block: Dict[str, Any]
     if request.include_chart_checks:
-        chart_check_block = chart_check if chart_check else {
+        chart_check_block: Dict[str, Any] = chart_check if chart_check else {
             "ok": False,
             "symbol": best_ticker,
             "error": chart_check_error or "Chart check unavailable in this run.",
@@ -803,24 +824,24 @@ final_verdict = _final_verdict(request, engine_status, chart_alignment, market_c
         "source_of_truth": "candidate_engine",
         "engine_status": engine_status,
         "final_verdict": final_verdict,
-       "best_ticker": best_ticker,
-"market_context": market_context,
-"other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
-"request": request.model_dump(),
+        "best_ticker": best_ticker,
+        "market_context": market_context,
+        "other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
+        "request": request.model_dump(),
         "candidate_engine": summary_payload,
         "chart_check": chart_check_block,
         "chart_confirmation": _build_chart_confirmation_block(request, chart_check, chart_check_error),
-        ""user_facing": _build_user_facing_block(
-    request=request,
-    engine_status=engine_status,
-    final_verdict=final_verdict,
-    best_ticker=best_ticker,
-    chart_check=chart_check,
-    chart_check_error=chart_check_error,
-    engine_reason=summary_payload.get("reason", "No summary available."),
-    market_context=market_context,
-),  
-}
+        "user_facing": _build_user_facing_block(
+            request=request,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
+            best_ticker=best_ticker,
+            chart_check=chart_check,
+            chart_check_error=chart_check_error,
+            engine_reason=summary_payload.get("reason", "No summary available."),
+            market_context=market_context,
+        ),
+    }
 
 
 @app.get("/")
@@ -864,10 +885,7 @@ async def tt_safe_fast_summary_compact(
 
 @app.get("/tt/safe-fast-chart-check")
 async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
-    clean_symbol = symbol.strip().upper()
-    if clean_symbol not in ALLOWED_SYMBOLS:
-        raise HTTPException(status_code=400, detail="Only SAFE-FAST symbols are allowed")
-
+    clean_symbol = _clean_symbol(symbol)
     token = await get_access_token()
     try:
         return await _build_chart_check_payload(clean_symbol, token)
@@ -878,4 +896,3 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
 @app.post("/safe-fast/on-demand")
 async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
     return await _build_on_demand_payload(request)
-
