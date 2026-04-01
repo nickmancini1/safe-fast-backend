@@ -2,7 +2,7 @@ import os
 from typing import Dict, Any, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
