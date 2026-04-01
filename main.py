@@ -1359,6 +1359,41 @@ def _build_user_facing_block(
 
 
 
+def _build_targets_block(primary_candidate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not primary_candidate:
+        return {
+            "ok": False,
+            "debit": None,
+            "max_loss_dollars_1lot": None,
+            "target_40_pct_value": None,
+            "target_50_pct_value": None,
+            "target_60_pct_value": None,
+            "target_70_pct_value": None,
+        }
+
+    debit = _to_float(primary_candidate.get("est_debit"))
+    max_loss = _to_float(primary_candidate.get("max_loss_dollars_1lot"))
+    if debit is None:
+        return {
+            "ok": False,
+            "debit": None,
+            "max_loss_dollars_1lot": max_loss,
+            "target_40_pct_value": None,
+            "target_50_pct_value": None,
+            "target_60_pct_value": None,
+            "target_70_pct_value": None,
+        }
+
+    return {
+        "ok": True,
+        "debit": debit,
+        "max_loss_dollars_1lot": max_loss,
+        "target_40_pct_value": round(debit * 1.40, 4),
+        "target_50_pct_value": round(debit * 1.50, 4),
+        "target_60_pct_value": round(debit * 1.60, 4),
+        "target_70_pct_value": round(debit * 1.70, 4),
+    }
+
 
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
@@ -1442,6 +1477,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
+        "targets": _build_targets_block(summary_payload.get("primary_candidate")),
+        "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
         "other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
         "request": request.model_dump(),
         "candidate_engine": summary_payload,
