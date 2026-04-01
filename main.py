@@ -678,8 +678,10 @@ def _build_user_facing_block(
     chart_check: Optional[Dict[str, Any]],
     chart_check_error: Optional[str],
     engine_reason: str,
+    market_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
+    ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
 
     if request.open_positions > 0:
         return {
@@ -699,6 +701,16 @@ def _build_user_facing_block(
             "invalidation": "No new entry allowed after max weekly trade count is reached.",
             "setup_state": "NO TRADE",
             "why": "Weekly trade count is already at or above the SAFE-FAST max.",
+        }
+
+    if not market_context["is_open"]:
+        return {
+            "good_idea_now": "WAIT",
+            "ticker": ticker,
+            "action": "wait for next regular session",
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "WAIT_MARKET_CLOSED",
+            "why": f"Candidate exists, but the regular session is closed as of {market_context['as_of_et']}. Re-check next session before entry.",
         }
 
     if engine_status == "NO_TRADE" or not best_ticker:
@@ -724,7 +736,6 @@ def _build_user_facing_block(
             "why": why,
         }
 
-    ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
     return {
         "good_idea_now": "WAIT",
         "ticker": ticker,
@@ -734,10 +745,9 @@ def _build_user_facing_block(
         "why": "Candidate engine found a setup, but 24H trend/context and room fields are still unconfirmed.",
     }
 
-
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
-
+market_context = _market_context_now()
     if request.open_positions < 0 or request.open_positions > 1:
         raise HTTPException(status_code=400, detail="open_positions must be 0 or 1")
     if request.weekly_trade_count < 0:
@@ -770,7 +780,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             chart_check_error = str(e)
 
     chart_alignment = _chart_alignment_ok(clean_option_type, chart_check)
-    final_verdict = _final_verdict(request, engine_status, chart_alignment)
+final_verdict = _final_verdict(request, engine_status, chart_alignment, market_context)
 
     chart_check_block: Dict[str, Any]
     if request.include_chart_checks:
@@ -793,21 +803,24 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "source_of_truth": "candidate_engine",
         "engine_status": engine_status,
         "final_verdict": final_verdict,
-        "best_ticker": best_ticker,
-        "request": request.model_dump(),
+       "best_ticker": best_ticker,
+"market_context": market_context,
+"other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
+"request": request.model_dump(),
         "candidate_engine": summary_payload,
         "chart_check": chart_check_block,
         "chart_confirmation": _build_chart_confirmation_block(request, chart_check, chart_check_error),
-        "user_facing": _build_user_facing_block(
-            request=request,
-            engine_status=engine_status,
-            final_verdict=final_verdict,
-            best_ticker=best_ticker,
-            chart_check=chart_check,
-            chart_check_error=chart_check_error,
-            engine_reason=summary_payload.get("reason", "No summary available."),
-        ),
-    }
+        ""user_facing": _build_user_facing_block(
+    request=request,
+    engine_status=engine_status,
+    final_verdict=final_verdict,
+    best_ticker=best_ticker,
+    chart_check=chart_check,
+    chart_check_error=chart_check_error,
+    engine_reason=summary_payload.get("reason", "No summary available."),
+    market_context=market_context,
+),  
+}
 
 
 @app.get("/")
