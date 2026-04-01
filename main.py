@@ -316,7 +316,7 @@ async def get_access_token() -> str:
     if not all([TT_CLIENT_ID, TT_CLIENT_SECRET, TT_REDIRECT_URI, TT_REFRESH_TOKEN]):
         raise HTTPException(status_code=500, detail="Missing TT OAuth environment variables")
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             f"{API_BASE}/oauth/token",
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -345,7 +345,7 @@ async def get_access_token() -> str:
 
 
 async def _fetch_option_chain(symbol: str, token: str) -> Any:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             f"{API_BASE}/option-chains/{symbol}",
             headers=_headers(token),
@@ -363,7 +363,7 @@ async def _fetch_option_chain(symbol: str, token: str) -> Any:
 
 
 async def _fetch_quotes(symbols: List[str], token: str) -> Any:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             f"{API_BASE}/market-data",
             headers=_headers(token),
@@ -385,7 +385,7 @@ async def _fetch_option_quotes(option_symbols: List[str], token: str) -> Any:
     if not option_symbols:
         return {"data": {"items": []}}
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             f"{API_BASE}/market-data/by-type",
             headers=_headers(token),
@@ -766,24 +766,28 @@ async def _build_summary_compact_payload(
     token: str,
 ) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(option_type)
-    ticker_summaries = []
 
-    for symbol in SYMBOL_ORDER:
-        summary = await _build_ticker_summary(
-            symbol=symbol,
-            option_type=clean_option_type,
-            min_dte=min_dte,
-            max_dte=max_dte,
-            near_limit=near_limit,
-            width_min=width_min,
-            width_max=width_max,
-            risk_min_dollars=risk_min_dollars,
-            risk_max_dollars=risk_max_dollars,
-            hard_max_dollars=hard_max_dollars,
-            allow_fallback=allow_fallback,
-            token=token,
+    ticker_summaries = list(
+        await asyncio.gather(
+            *[
+                _build_ticker_summary(
+                    symbol=symbol,
+                    option_type=clean_option_type,
+                    min_dte=min_dte,
+                    max_dte=max_dte,
+                    near_limit=near_limit,
+                    width_min=width_min,
+                    width_max=width_max,
+                    risk_min_dollars=risk_min_dollars,
+                    risk_max_dollars=risk_max_dollars,
+                    hard_max_dollars=hard_max_dollars,
+                    allow_fallback=allow_fallback,
+                    token=token,
+                )
+                for symbol in SYMBOL_ORDER
+            ]
         )
-        ticker_summaries.append(summary)
+    )
 
     ranked = _rank_ticker_summaries(ticker_summaries)
     best_summary = ranked[0] if ranked else None
@@ -1418,7 +1422,7 @@ async def _screen_ticker_candidate(
 
     if include_chart_checks and symbol and primary_candidate:
         try:
-            chart_check = await _build_chart_check_payload(symbol, token)
+            chart_check = await asyncio.wait_for(_build_chart_check_payload(symbol, token), timeout=8.0)
         except Exception as e:
             chart_check_error = str(e)
 
@@ -1491,8 +1495,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         token=token,
     )
 
-    screened_candidates = list(
-        await asyncio.gather(
+    screened_raw = await asyncio.wait_for(
+        asyncio.gather(
             *[
                 _screen_ticker_candidate(
                     summary=summary,
@@ -1504,9 +1508,16 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
                     include_chart_checks=request.include_chart_checks,
                 )
                 for summary in summary_payload.get("ticker_summaries", [])
-            ]
-        )
+            ],
+            return_exceptions=True,
+        ),
+        timeout=12.0,
     )
+
+    screened_candidates = [
+        item for item in screened_raw
+        if isinstance(item, dict)
+    ]
 
     screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
     selected = screened_candidates[0] if screened_candidates else None
