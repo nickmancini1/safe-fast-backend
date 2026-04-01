@@ -1,6 +1,6 @@
+
 import asyncio
 import json
-import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -17,27 +17,20 @@ def _to_float(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        parsed = float(value)
-        if not math.isfinite(parsed):
-            return None
-        return parsed
+        return float(value)
     except Exception:
         return None
 
 
 def _compute_ema(values: List[float], length: int) -> Optional[float]:
-    clean_values = [v for v in values if v is not None and math.isfinite(v)]
-    if not clean_values:
+    if not values:
         return None
 
     multiplier = 2 / (length + 1)
-    ema = clean_values[0]
+    ema = values[0]
 
-    for value in clean_values[1:]:
+    for value in values[1:]:
         ema = ((value - ema) * multiplier) + ema
-
-    if not math.isfinite(ema):
-        return None
 
     return round(ema, 4)
 
@@ -188,7 +181,7 @@ async def get_1h_ema50_snapshot(
                 "channel": 0,
                 "keepaliveTimeout": 60,
                 "acceptKeepaliveTimeout": 60,
-                "version": "safe-fast-python-dxlink-test/0.1",
+                "version": "safe-fast-python-dxlink/0.2",
             },
         )
 
@@ -299,7 +292,7 @@ async def get_1h_ema50_snapshot(
             f"No candle data returned for {symbol}. Last message: {last_raw_message}"
         )
 
-    closes = [c["close"] for c in candle_list if c.get("close") is not None]
+    closes = [c["close"] for c in candle_list]
     ema50 = _compute_ema(closes, 50)
     latest = candle_list[-1]
     latest_close = latest["close"]
@@ -319,5 +312,6 @@ async def get_1h_ema50_snapshot(
         "latest_close": latest_close,
         "price_vs_ema50_1h": "above" if latest_close > ema50 else "below" if latest_close < ema50 else "at",
         "latest_candle_time": latest["time_iso"],
-        "recent_candles": candle_list[-5:],
+        "recent_candles": candle_list[-10:],
+        "all_candles": candle_list,
     }
