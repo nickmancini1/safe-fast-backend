@@ -1,6 +1,8 @@
 
 import os
-from datetime import datetime, time
+import re
+from datetime import datetime, time, timedelta
+from html import unescape
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -10,10 +12,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.6.2")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.6.2"
+USER_AGENT = "safe-fast-backend/1.8.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -40,7 +42,7 @@ class OnDemandRequest(BaseModel):
     include_chart_checks: bool = True
     open_positions: int = 0
     weekly_trade_count: int = 0
-    macro_context_requested: bool = False
+    macro_context_requested: bool = True
 
 
 def _headers(access_token: str) -> Dict[str, str]:
@@ -613,6 +615,7 @@ async def _build_summary_compact_payload(
     }
 
 
+
 async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
     snapshot = await get_1h_ema50_snapshot(
         symbol=symbol,
@@ -629,10 +632,329 @@ async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
         "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
         "latest_candle_time": snapshot["latest_candle_time"],
         "candle_count": snapshot["candle_count"],
+        "recent_candles": snapshot.get("recent_candles", []),
+        "_all_candles": snapshot.get("all_candles", []),
+    }
+
+
+def _calc_ema(values: List[float], length: int) -> Optional[float]:
+    if not values:
+        return None
+    multiplier = 2 / (length + 1)
+    ema = values[0]
+    for value in values[1:]:
+        ema = ((value - ema) * multiplier) + ema
+    return round(ema, 4)
+
+
+def _candles_by_day_et(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    ordered_days: List[str] = []
+
+    for candle in candles:
+        ts = datetime.fromisoformat(candle["time_iso"]).astimezone(NY_TZ)
+        day_key = ts.date().isoformat()
+        if day_key not in grouped:
+            grouped[day_key] = {
+                "date": day_key,
+                "open": candle["open"],
+                "high": candle["high"],
+                "low": candle["low"],
+                "close": candle["close"],
+            }
+            ordered_days.append(day_key)
+        else:
+            grouped[day_key]["high"] = max(grouped[day_key]["high"], candle["high"])
+            grouped[day_key]["low"] = min(grouped[day_key]["low"], candle["low"])
+            grouped[day_key]["close"] = candle["close"]
+
+    return [grouped[day] for day in ordered_days]
+
+
+def _condense_levels(levels: List[float], tolerance: float, descending: bool = False) -> List[float]:
+    ordered = sorted(levels, reverse=descending)
+    out: List[float] = []
+    for level in ordered:
+        if not out or abs(level - out[-1]) > tolerance:
+            out.append(level)
+    return out
+
+
+def _find_wall_levels(
+    candles: List[Dict[str, Any]],
+    latest_close: float,
+    option_type: str,
+) -> Dict[str, Any]:
+    if not candles:
+        return {
+            "first_wall": None,
+            "next_pocket": None,
+            "room_distance": None,
+            "room_ratio": None,
+            "room_pass": None,
+        }
+
+    window = candles[-35:] if len(candles) >= 35 else candles
+    tolerance = max(latest_close * 0.0015, 0.10)
+
+    if option_type == "C":
+        candidate_levels = [round(c["high"], 2) for c in window if c["high"] > latest_close]
+        levels = _condense_levels(candidate_levels, tolerance, descending=False)
+        first_wall = levels[0] if levels else None
+        next_pocket = levels[1] if len(levels) > 1 else None
+    else:
+        candidate_levels = [round(c["low"], 2) for c in window if c["low"] < latest_close]
+        levels = _condense_levels(candidate_levels, tolerance, descending=True)
+        first_wall = levels[0] if levels else None
+        next_pocket = levels[1] if len(levels) > 1 else None
+
+    return {
+        "first_wall": first_wall,
+        "next_pocket": next_pocket,
+        "room_distance": round(abs(first_wall - latest_close), 4) if first_wall is not None else None,
+    }
+
+
+def _twentyfour_hour_context(candles: List[Dict[str, Any]], option_type: str) -> Dict[str, Any]:
+    daily_bars = _candles_by_day_et(candles)
+    closes = [bar["close"] for bar in daily_bars if bar.get("close") is not None]
+
+    if len(closes) < 4:
+        return {
+            "label": "unconfirmed",
+            "supportive": None,
+            "source": "1h_aggregated_daily_proxy",
+        }
+
+    ema3 = _calc_ema(closes[-6:], 3)
+    ema5 = _calc_ema(closes[-6:], 5)
+    slope_up = ema3 is not None and ema5 is not None and ema3 > ema5 and closes[-1] > closes[-3]
+    slope_down = ema3 is not None and ema5 is not None and ema3 < ema5 and closes[-1] < closes[-3]
+
+    if slope_up:
+        label = "bullish"
+    elif slope_down:
+        label = "bearish"
+    else:
+        label = "mixed"
+
+    supportive = None
+    if option_type == "C":
+        supportive = True if label == "bullish" else False if label == "bearish" else None
+    else:
+        supportive = True if label == "bearish" else False if label == "bullish" else None
+
+    return {
+        "label": label,
+        "supportive": supportive,
+        "source": "1h_aggregated_daily_proxy",
+    }
+
+
+def _is_chop(candles: List[Dict[str, Any]]) -> bool:
+    if len(candles) < 4:
+        return False
+    recent = candles[-4:]
+    overlap_hits = 0
+    for i in range(1, len(recent)):
+        current = recent[i]
+        prev = recent[i - 1]
+        overlap = max(0.0, min(current["high"], prev["high"]) - max(current["low"], prev["low"]))
+        current_range = max(current["high"] - current["low"], 0.0001)
+        if (overlap / current_range) > 0.5:
+            overlap_hits += 1
+    return overlap_hits >= 3
+
+
+def _extension_state(
+    symbol: str,
+    latest_close: float,
+    ema50_1h: float,
+    first_wall: Optional[float],
+) -> Dict[str, Any]:
+    pct_from_ema = abs(latest_close - ema50_1h) / ema50_1h if ema50_1h else None
+    threshold = 0.008 if symbol == "GLD" else 0.006
+    room_distance = abs(first_wall - latest_close) if first_wall is not None else None
+    move_ratio = (abs(latest_close - ema50_1h) / room_distance) if room_distance not in (None, 0) else None
+    is_extended = bool(
+        (pct_from_ema is not None and pct_from_ema > threshold) or
+        (move_ratio is not None and move_ratio > 0.5)
+    )
+    return {
+        "state": "extended" if is_extended else "acceptable",
+        "pct_from_ema": round(pct_from_ema * 100, 3) if pct_from_ema is not None else None,
+        "move_to_wall_ratio": round(move_ratio, 3) if move_ratio is not None else None,
+        "threshold_pct": round(threshold * 100, 3),
+        "late_move": is_extended,
+    }
+
+
+def _wall_thesis(
+    option_type: str,
+    primary_candidate: Optional[Dict[str, Any]],
+    first_wall: Optional[float],
+    next_pocket: Optional[float],
+    invalidation_distance: Optional[float],
+) -> Dict[str, Any]:
+    if not primary_candidate or first_wall is None:
+        return {
+            "wall_thesis": "unconfirmed",
+            "wall_pass": None,
+        }
+
+    short_strike = _to_float(primary_candidate.get("short_strike"))
+    if short_strike is None:
+        return {
+            "wall_thesis": "unconfirmed",
+            "wall_pass": None,
+        }
+
+    next_pocket_room = None
+    if next_pocket is not None and invalidation_distance not in (None, 0):
+        next_pocket_room = abs(next_pocket - first_wall) / invalidation_distance
+
+    if option_type == "C":
+        if short_strike > first_wall:
+            return {"wall_thesis": "TO_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
+        if next_pocket is not None and (next_pocket_room or 0) >= 1.5:
+            return {"wall_thesis": "THROUGH_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
+    else:
+        if short_strike < first_wall:
+            return {"wall_thesis": "TO_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
+        if next_pocket is not None and (next_pocket_room or 0) >= 1.5:
+            return {"wall_thesis": "THROUGH_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
+
+    return {
+        "wall_thesis": "WALL_MISMATCH",
+        "wall_pass": False,
+        "next_pocket_room_ratio": next_pocket_room,
+    }
+
+
+def _setup_classifier(
+    option_type: str,
+    chart_check: Dict[str, Any],
+    trend_ctx: Dict[str, Any],
+    room_ratio: Optional[float],
+    room_pass: Optional[bool],
+    wall_pass: Optional[bool],
+    extension_state: Dict[str, Any],
+    candles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    latest_close = chart_check.get("latest_close")
+    ema50_1h = chart_check.get("ema50_1h")
+
+    if latest_close is None or ema50_1h is None:
+        return {"setup_type": "UNCONFIRMED", "trend_label": "unconfirmed", "allowed_setup": None}
+
+    near_ema = abs(latest_close - ema50_1h) / ema50_1h <= 0.0025
+    chop = _is_chop(candles)
+    recent_closes = [c["close"] for c in candles[-3:]] if len(candles) >= 3 else []
+    tight_break = False
+    if recent_closes and latest_close:
+        tight_break = (max(recent_closes) - min(recent_closes)) / latest_close <= 0.003
+
+    if room_pass is False or wall_pass is False or extension_state.get("state") == "extended":
+        return {"setup_type": "NOT_ALLOWED", "trend_label": "unconfirmed", "allowed_setup": False}
+
+    trend_supportive = trend_ctx.get("supportive")
+    if trend_supportive is True:
+        if near_ema and (room_ratio or 0) >= 2.5 and not chop:
+            return {"setup_type": "Ideal", "trend_label": "Trend-aligned", "allowed_setup": True}
+        if tight_break and not chop:
+            return {"setup_type": "Clean Fast Break", "trend_label": "Trend-aligned", "allowed_setup": True}
+        if near_ema:
+            return {"setup_type": "Continuation", "trend_label": "Trend-aligned", "allowed_setup": True}
+        return {"setup_type": "PENDING_CONTINUATION", "trend_label": "Trend-aligned", "allowed_setup": False}
+
+    if trend_supportive is False:
+        if tight_break and not chop:
+            return {"setup_type": "Clean Fast Break", "trend_label": "Countertrend", "allowed_setup": True}
+        return {"setup_type": "NOT_ALLOWED", "trend_label": "Countertrend", "allowed_setup": False}
+
+    return {"setup_type": "UNCONFIRMED", "trend_label": "unconfirmed", "allowed_setup": None}
+
+
+def _build_structure_context(
+    symbol: str,
+    option_type: str,
+    chart_check: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "ok": False,
+            "why": "chart check unavailable",
+        }
+
+    candles = chart_check.get("_all_candles", [])
+    if not candles:
+        return {
+            "ok": False,
+            "why": "full candle history unavailable",
+        }
+
+    latest_close = chart_check.get("latest_close")
+    ema50_1h = chart_check.get("ema50_1h")
+    if latest_close is None or ema50_1h is None:
+        return {
+            "ok": False,
+            "why": "missing latest close or ema",
+        }
+
+    trend_ctx = _twentyfour_hour_context(candles, option_type)
+    wall_levels = _find_wall_levels(candles, latest_close, option_type)
+    invalidation_distance = abs(latest_close - ema50_1h) if ema50_1h is not None else None
+    room_ratio = None
+    if wall_levels["room_distance"] is not None and invalidation_distance not in (None, 0):
+        room_ratio = wall_levels["room_distance"] / invalidation_distance
+
+    room_pass = (room_ratio is not None and room_ratio >= 2.0)
+    extension_ctx = _extension_state(symbol, latest_close, ema50_1h, wall_levels.get("first_wall"))
+    wall_ctx = _wall_thesis(
+        option_type=option_type,
+        primary_candidate=primary_candidate,
+        first_wall=wall_levels.get("first_wall"),
+        next_pocket=wall_levels.get("next_pocket"),
+        invalidation_distance=invalidation_distance,
+    )
+    setup_ctx = _setup_classifier(
+        option_type=option_type,
+        chart_check=chart_check,
+        trend_ctx=trend_ctx,
+        room_ratio=room_ratio,
+        room_pass=room_pass,
+        wall_pass=wall_ctx.get("wall_pass"),
+        extension_state=extension_ctx,
+        candles=candles,
+    )
+
+    return {
+        "ok": True,
+        "twentyfour_hour_trend": trend_ctx.get("label"),
+        "twentyfour_hour_supportive": trend_ctx.get("supportive"),
+        "twentyfour_hour_source": trend_ctx.get("source"),
+        "first_wall": wall_levels.get("first_wall"),
+        "next_pocket": wall_levels.get("next_pocket"),
+        "room_to_first_wall": wall_levels.get("room_distance"),
+        "room_ratio": round(room_ratio, 3) if room_ratio is not None else None,
+        "room_pass": room_pass,
+        "wall_thesis": wall_ctx.get("wall_thesis"),
+        "wall_pass": wall_ctx.get("wall_pass"),
+        "next_pocket_room_ratio": wall_ctx.get("next_pocket_room_ratio"),
+        "extension_state": extension_ctx.get("state"),
+        "pct_from_ema": extension_ctx.get("pct_from_ema"),
+        "late_move": extension_ctx.get("late_move"),
+        "iv_state": "unconfirmed",
+        "setup_type": setup_ctx.get("setup_type"),
+        "trend_label": setup_ctx.get("trend_label"),
+        "allowed_setup": setup_ctx.get("allowed_setup"),
+        "chop_risk": _is_chop(candles),
     }
 
 
 def _status_field(value: Any, confirmed: bool) -> Dict[str, Any]:
+
     return {"status": "confirmed" if confirmed else "unconfirmed", "value": value}
 
 
@@ -643,11 +965,14 @@ def _chart_alignment_ok(option_type: str, chart_check: Optional[Dict[str, Any]])
     return side == "above" if option_type == "C" else side == "below"
 
 
+
 def _final_verdict(
     request: OnDemandRequest,
     engine_status: str,
     chart_alignment: Optional[bool],
     market_context: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    structure_context: Dict[str, Any],
 ) -> str:
     if request.open_positions > 0:
         return "NO_TRADE"
@@ -655,19 +980,36 @@ def _final_verdict(
         return "NO_TRADE"
     if not market_context["is_open"]:
         return "NO_TRADE"
+    if macro_context.get("ok") and (
+        macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
+    ):
+        return "NO_TRADE"
     if engine_status == "NO_TRADE":
         return "NO_TRADE"
     if chart_alignment is False:
         return "NO_TRADE"
+    if structure_context.get("ok"):
+        if structure_context.get("room_pass") is False:
+            return "NO_TRADE"
+        if structure_context.get("wall_pass") is False:
+            return "NO_TRADE"
+        if structure_context.get("extension_state") == "extended":
+            return "NO_TRADE"
+        if structure_context.get("allowed_setup") is False:
+            return "NO_TRADE"
     return "PENDING"
+
+
 
 
 def _build_chart_confirmation_block(
     request: OnDemandRequest,
     chart_check: Optional[Dict[str, Any]],
     chart_check_error: Optional[str],
+    structure_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     one_hour_confirmed = bool(chart_check and chart_check.get("ok"))
+    structure_confirmed = bool(structure_context.get("ok"))
     message = (
         "Candidate engine result only - chart confirmation still required. Chart check failed in this run."
         if chart_check_error
@@ -680,14 +1022,21 @@ def _build_chart_confirmation_block(
             "one_hour_50_ema": _status_field(chart_check.get("ema50_1h") if chart_check else None, one_hour_confirmed),
             "one_hour_price_vs_50_ema": _status_field(chart_check.get("price_vs_ema50_1h") if chart_check else None, one_hour_confirmed),
             "latest_close": _status_field(chart_check.get("latest_close") if chart_check else None, one_hour_confirmed),
-            "twentyfour_hour_trend": _status_field(None, False),
-            "room_to_first_wall": _status_field(None, False),
-            "next_pocket": _status_field(None, False),
-            "extension_state": _status_field(None, False),
+            "twentyfour_hour_trend": _status_field(structure_context.get("twentyfour_hour_trend"), structure_confirmed),
+            "room_to_first_wall": _status_field(structure_context.get("room_to_first_wall"), structure_confirmed),
+            "first_wall": _status_field(structure_context.get("first_wall"), structure_confirmed),
+            "next_pocket": _status_field(structure_context.get("next_pocket"), structure_confirmed),
+            "room_ratio": _status_field(structure_context.get("room_ratio"), structure_confirmed),
+            "wall_thesis": _status_field(structure_context.get("wall_thesis"), structure_confirmed),
+            "extension_state": _status_field(structure_context.get("extension_state"), structure_confirmed),
+            "iv_state": _status_field(structure_context.get("iv_state"), False),
+            "setup_type": _status_field(structure_context.get("setup_type"), structure_confirmed),
+            "trend_label": _status_field(structure_context.get("trend_label"), structure_confirmed),
             "open_positions_state": _status_field(request.open_positions, True),
             "weekly_trade_count_state": _status_field(request.weekly_trade_count, True),
         },
     }
+
 
 
 def _build_user_facing_block(
@@ -699,6 +1048,8 @@ def _build_user_facing_block(
     chart_check_error: Optional[str],
     engine_reason: str,
     market_context: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    structure_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
@@ -733,6 +1084,18 @@ def _build_user_facing_block(
             "why": f"Candidate exists, but the regular session is closed as of {market_context['as_of_et']}. Re-check next session before entry.",
         }
 
+    if macro_context.get("ok") and (
+        macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
+    ):
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "NO TRADE",
+            "why": macro_context.get("note") or "Major event risk is inside the expected hold window.",
+        }
+
     if engine_status == "NO_TRADE" or not best_ticker:
         return {
             "good_idea_now": "NO",
@@ -742,6 +1105,44 @@ def _build_user_facing_block(
             "setup_state": "NO TRADE",
             "why": engine_reason,
         }
+
+    if structure_context.get("ok"):
+        if structure_context.get("room_pass") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "Room to first wall is too tight for SAFE-FAST.",
+            }
+        if structure_context.get("wall_pass") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "Wall thesis and strike placement do not match.",
+            }
+        if structure_context.get("extension_state") == "extended":
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
+            }
+        if structure_context.get("allowed_setup") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": f"Setup type is {structure_context.get('setup_type')}, which is not tradable now.",
+            }
 
     if final_verdict == "NO_TRADE":
         why = "Best ticker failed the 1H EMA alignment check."
@@ -762,13 +1163,16 @@ def _build_user_facing_block(
         "action": "wait for full chart confirmation",
         "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
         "setup_state": "PENDING",
-        "why": "Candidate engine found a setup, but 24H trend/context and room fields are still unconfirmed.",
+        "why": "Candidate engine is valid, but trigger/entry-zone timing still needs confirmation.",
     }
+
+
 
 
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
+    macro_context = await _build_macro_context(request.macro_context_requested)
 
     if request.open_positions < 0 or request.open_positions > 1:
         raise HTTPException(status_code=400, detail="open_positions must be 0 or 1")
@@ -792,6 +1196,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     best_ticker = summary_payload.get("best_ticker")
     engine_status = summary_payload.get("verdict", "NO_TRADE")
+    primary_candidate = summary_payload.get("primary_candidate")
     chart_check: Optional[Dict[str, Any]] = None
     chart_check_error: Optional[str] = None
 
@@ -801,8 +1206,22 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         except Exception as e:
             chart_check_error = str(e)
 
+    structure_context = _build_structure_context(
+        symbol=best_ticker or "UNKNOWN",
+        option_type=clean_option_type,
+        chart_check=chart_check,
+        primary_candidate=primary_candidate,
+    ) if best_ticker else {"ok": False, "why": "no best ticker"}
+
     chart_alignment = _chart_alignment_ok(clean_option_type, chart_check)
-    final_verdict = _final_verdict(request, engine_status, chart_alignment, market_context)
+    final_verdict = _final_verdict(
+        request=request,
+        engine_status=engine_status,
+        chart_alignment=chart_alignment,
+        market_context=market_context,
+        macro_context=macro_context,
+        structure_context=structure_context,
+    )
 
     if request.include_chart_checks:
         chart_check_block: Dict[str, Any] = chart_check if chart_check else {
@@ -818,6 +1237,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             "message": "Chart checks were not requested.",
         }
 
+    # remove internal candle payload from external response
+    if chart_check_block.get("_all_candles") is not None:
+        chart_check_block = {k: v for k, v in chart_check_block.items() if k != "_all_candles"}
+
     return {
         "ok": True,
         "mode": "on_demand",
@@ -826,11 +1249,18 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
         "market_context": market_context,
+        "macro_context": macro_context,
+        "structure_context": structure_context,
         "other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
         "request": request.model_dump(),
         "candidate_engine": summary_payload,
         "chart_check": chart_check_block,
-        "chart_confirmation": _build_chart_confirmation_block(request, chart_check, chart_check_error),
+        "chart_confirmation": _build_chart_confirmation_block(
+            request=request,
+            chart_check=chart_check,
+            chart_check_error=chart_check_error,
+            structure_context=structure_context,
+        ),
         "user_facing": _build_user_facing_block(
             request=request,
             engine_status=engine_status,
@@ -840,11 +1270,14 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             chart_check_error=chart_check_error,
             engine_reason=summary_payload.get("reason", "No summary available."),
             market_context=market_context,
+            macro_context=macro_context,
+            structure_context=structure_context,
         ),
     }
 
 
 @app.get("/")
+
 def root() -> Dict[str, Any]:
     return {"status": "ok", "service": "safe-fast-backend"}
 
