@@ -1,4 +1,4 @@
-
+import asyncio
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -819,8 +819,6 @@ async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
         "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
         "latest_candle_time": snapshot["latest_candle_time"],
         "candle_count": snapshot["candle_count"],
-        "recent_candles": snapshot.get("recent_candles", []),
-        "_all_candles": snapshot.get("all_candles", []),
     }
 
 
@@ -1493,19 +1491,22 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         token=token,
     )
 
-    screened_candidates: List[Dict[str, Any]] = []
-    for summary in summary_payload.get("ticker_summaries", []):
-        screened_candidates.append(
-            await _screen_ticker_candidate(
-                summary=summary,
-                option_type=clean_option_type,
-                token=token,
-                request=request,
-                market_context=market_context,
-                macro_context=macro_context,
-                include_chart_checks=request.include_chart_checks,
-            )
+    screened_candidates = list(
+        await asyncio.gather(
+            *[
+                _screen_ticker_candidate(
+                    summary=summary,
+                    option_type=clean_option_type,
+                    token=token,
+                    request=request,
+                    market_context=market_context,
+                    macro_context=macro_context,
+                    include_chart_checks=request.include_chart_checks,
+                )
+                for summary in summary_payload.get("ticker_summaries", [])
+            ]
         )
+    )
 
     screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
     selected = screened_candidates[0] if screened_candidates else None
@@ -1545,7 +1546,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "macro_context": macro_context,
         "structure_context": structure_context,
         "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
-        "screened_candidates": screened_candidates,
         "request": request.model_dump(),
         "candidate_engine": summary_payload,
         "chart_check": chart_check_block,
