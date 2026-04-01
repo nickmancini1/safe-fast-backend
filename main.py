@@ -1,4 +1,3 @@
-
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -283,12 +282,13 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
 
     has_today = any(ev["date"] == today.isoformat() and ev["major"] for ev in deduped)
     has_tomorrow = any(ev["date"] == tomorrow.isoformat() and ev["major"] for ev in deduped)
-    in_hold_window = [ev for ev in deduped if ev["date"] in hold_window and ev["major"]]
+    visible_events = [ev for ev in deduped if ev["date"] in hold_window]
+    in_hold_window = [ev for ev in visible_events if ev["major"]]
 
     if in_hold_window:
         risk_level = "high"
         note = "Major macro event is inside the next 3 trading days."
-    elif deduped:
+    elif visible_events or deduped:
         risk_level = "normal"
         note = "No major macro event found inside the next 3 trading days."
     else:
@@ -303,7 +303,7 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
         "requested": True,
         "has_major_event_today": has_today,
         "has_major_event_tomorrow": has_tomorrow,
-        "events": deduped,
+        "events": visible_events,
         "risk_level": risk_level,
         "note": note,
         "as_of_et": now_et.isoformat(timespec="seconds"),
