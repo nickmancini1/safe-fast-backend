@@ -1029,8 +1029,11 @@ def _setup_classifier(
     latest_close = chart_check.get("latest_close")
     ema50_1h = chart_check.get("ema50_1h")
 
+    trend_supportive = trend_ctx.get("supportive")
+    trend_label = "Trend-aligned" if trend_supportive is True else "Countertrend" if trend_supportive is False else "unconfirmed"
+
     if latest_close is None or ema50_1h is None:
-        return {"setup_type": "UNCONFIRMED", "trend_label": "unconfirmed", "allowed_setup": None}
+        return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None}
 
     near_ema = abs(latest_close - ema50_1h) / ema50_1h <= 0.0025
     chop = _is_chop(candles)
@@ -1040,24 +1043,27 @@ def _setup_classifier(
         tight_break = (max(recent_closes) - min(recent_closes)) / latest_close <= 0.003
 
     if room_pass is False or wall_pass is False or extension_state.get("state") == "extended":
-        return {"setup_type": "NOT_ALLOWED", "trend_label": "unconfirmed", "allowed_setup": False}
+        if trend_supportive is True and near_ema:
+            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": False}
+        if trend_supportive is True and tight_break and not chop:
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": False}
+        return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False}
 
-    trend_supportive = trend_ctx.get("supportive")
     if trend_supportive is True:
         if near_ema and (room_ratio or 0) >= 2.5 and not chop:
-            return {"setup_type": "Ideal", "trend_label": "Trend-aligned", "allowed_setup": True}
+            return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": True}
         if tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": "Trend-aligned", "allowed_setup": True}
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True}
         if near_ema:
-            return {"setup_type": "Continuation", "trend_label": "Trend-aligned", "allowed_setup": True}
-        return {"setup_type": "PENDING_CONTINUATION", "trend_label": "Trend-aligned", "allowed_setup": False}
+            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True}
+        return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": False}
 
     if trend_supportive is False:
         if tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": "Countertrend", "allowed_setup": True}
-        return {"setup_type": "NOT_ALLOWED", "trend_label": "Countertrend", "allowed_setup": False}
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True}
+        return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False}
 
-    return {"setup_type": "UNCONFIRMED", "trend_label": "unconfirmed", "allowed_setup": None}
+    return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None}
 
 
 def _build_structure_context(
