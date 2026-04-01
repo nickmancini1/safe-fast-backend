@@ -27,6 +27,10 @@ SYMBOL_ORDER = ["SPY", "QQQ", "IWM", "GLD"]
 
 NY_TZ = ZoneInfo("America/New_York")
 
+_MACRO_CACHE: Dict[str, Any] = {"ts": None, "payload": None}
+_CHART_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
 
 class OnDemandRequest(BaseModel):
     option_type: str = "C"
@@ -256,22 +260,28 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
         }
 
     now_et = datetime.now(NY_TZ)
+    cached_ts = _MACRO_CACHE.get("ts")
+    cached_payload = _MACRO_CACHE.get("payload")
+    if cached_ts and cached_payload and (now_et - cached_ts).total_seconds() < 300:
+        return cached_payload
+
     today = now_et.date()
     tomorrow = today + timedelta(days=1)
     hold_window = {d.isoformat() for d in _next_trading_days(now_et, 3)}
 
-    events: List[Dict[str, Any]] = []
     warnings: List[str] = []
+    results = await asyncio.gather(
+        _fetch_fomc_events(now_et),
+        _fetch_bls_events(now_et),
+        return_exceptions=True,
+    )
 
-    try:
-        events.extend(await _fetch_fomc_events(now_et))
-    except Exception as e:
-        warnings.append(f"FOMC source unavailable: {e}")
-
-    try:
-        events.extend(await _fetch_bls_events(now_et))
-    except Exception as e:
-        warnings.append(f"BLS source unavailable: {e}")
+    events: List[Dict[str, Any]] = []
+    for label, result in zip(("FOMC", "BLS"), results):
+        if isinstance(result, Exception):
+            warnings.append(f"{label} source unavailable: {result}")
+        else:
+            events.extend(result)
 
     deduped: List[Dict[str, Any]] = []
     seen = set()
@@ -281,14 +291,15 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
             seen.add(key)
             deduped.append(ev)
 
-    has_today = any(ev["date"] == today.isoformat() and ev["major"] for ev in deduped)
-    has_tomorrow = any(ev["date"] == tomorrow.isoformat() and ev["major"] for ev in deduped)
-    in_hold_window = [ev for ev in deduped if ev["date"] in hold_window and ev["major"]]
+    visible_events = [ev for ev in deduped if ev["date"] in hold_window]
+    has_today = any(ev["date"] == today.isoformat() and ev["major"] for ev in visible_events)
+    has_tomorrow = any(ev["date"] == tomorrow.isoformat() and ev["major"] for ev in visible_events)
+    in_hold_window = [ev for ev in visible_events if ev["major"]]
 
     if in_hold_window:
         risk_level = "high"
         note = "Major macro event is inside the next 3 trading days."
-    elif deduped:
+    elif visible_events or deduped:
         risk_level = "normal"
         note = "No major macro event found inside the next 3 trading days."
     else:
@@ -298,9 +309,7 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
     if warnings:
         note = f"{note} Warnings: {' | '.join(warnings)}"
 
-    visible_events = [ev for ev in deduped if ev["date"] in hold_window]
-
-    return {
+    payload = {
         "ok": True,
         "requested": True,
         "has_major_event_today": has_today,
@@ -310,6 +319,9 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
         "note": note,
         "as_of_et": now_et.isoformat(timespec="seconds"),
     }
+    _MACRO_CACHE["ts"] = now_et
+    _MACRO_CACHE["payload"] = payload
+    return payload
 
 
 async def get_access_token() -> str:
@@ -808,6 +820,11 @@ async def _build_summary_compact_payload(
 
 
 async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
+    now_et = datetime.now(NY_TZ)
+    cached = _CHART_CACHE.get(symbol)
+    if cached and (now_et - cached["ts"]).total_seconds() < 60:
+        return cached["payload"]
+
     snapshot = await get_1h_ema50_snapshot(
         symbol=symbol,
         access_token=token,
@@ -815,7 +832,7 @@ async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
         user_agent=USER_AGENT,
         days_back=14,
     )
-    return {
+    payload = {
         "ok": True,
         "symbol": symbol,
         "latest_close": snapshot["latest_close"],
@@ -823,7 +840,10 @@ async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
         "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
         "latest_candle_time": snapshot["latest_candle_time"],
         "candle_count": snapshot["candle_count"],
+        "_all_candles": snapshot.get("all_candles", []),
     }
+    _CHART_CACHE[symbol] = {"ts": now_et, "payload": payload}
+    return payload
 
 
 def _calc_ema(values: List[float], length: int) -> Optional[float]:
@@ -1495,9 +1515,21 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         token=token,
     )
 
-    screened_raw = await asyncio.wait_for(
-        asyncio.gather(
-            *[
+    engine_ranked = sorted(
+        summary_payload.get("ticker_summaries", []),
+        key=lambda s: (
+            {"ACTIVE_NOW": 0, "PENDING": 1, "NO_TRADE": 2}.get(s.get("verdict", "NO_TRADE"), 3),
+            (s.get("primary_candidate") or {}).get("distance_from_target_risk_mid", 999999),
+            SYMBOL_ORDER.index(s.get("symbol")) if s.get("symbol") in SYMBOL_ORDER else 999999,
+        ),
+    )
+
+    screened_candidates: List[Dict[str, Any]] = []
+    selected: Optional[Dict[str, Any]] = None
+
+    for summary in engine_ranked:
+        try:
+            screened = await asyncio.wait_for(
                 _screen_ticker_candidate(
                     summary=summary,
                     option_type=clean_option_type,
@@ -1506,21 +1538,32 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
                     market_context=market_context,
                     macro_context=macro_context,
                     include_chart_checks=request.include_chart_checks,
-                )
-                for summary in summary_payload.get("ticker_summaries", [])
-            ],
-            return_exceptions=True,
-        ),
-        timeout=12.0,
-    )
+                ),
+                timeout=6.0,
+            )
+        except Exception as e:
+            screened = {
+                "symbol": summary.get("symbol"),
+                "engine_verdict": summary.get("verdict"),
+                "final_verdict": "NO_TRADE",
+                "reason": f"screen failed: {e}",
+                "primary_candidate": summary.get("primary_candidate"),
+                "backup_candidate": summary.get("backup_candidate"),
+                "summary": summary,
+                "chart_check": None,
+                "chart_check_error": str(e),
+                "structure_context": {"ok": False, "why": str(e)},
+            }
 
-    screened_candidates = [
-        item for item in screened_raw
-        if isinstance(item, dict)
-    ]
+        screened_candidates.append(screened)
 
-    screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
-    selected = screened_candidates[0] if screened_candidates else None
+        if screened.get("final_verdict") != "NO_TRADE":
+            selected = screened
+            break
+
+    if selected is None and screened_candidates:
+        screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
+        selected = screened_candidates[0]
 
     best_ticker = selected.get("symbol") if selected else None
     engine_status = selected.get("engine_verdict", "NO_TRADE") if selected else "NO_TRADE"
