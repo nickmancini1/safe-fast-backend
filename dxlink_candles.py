@@ -1,1626 +1,320 @@
-
-import os
-import re
-from datetime import datetime, time, timedelta
-from html import unescape
+import asyncio
+import json
+import math
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-
-from dxlink_candles import get_1h_ema50_snapshot
-
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.0")
-
-API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.0"
-
-TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
-TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
-TT_REDIRECT_URI = os.getenv("TT_REDIRECT_URI", "")
-TT_REFRESH_TOKEN = os.getenv("TT_REFRESH_TOKEN", "")
-
-ALLOWED_SYMBOLS = {"SPY", "QQQ", "IWM", "GLD"}
-SYMBOL_ORDER = ["SPY", "QQQ", "IWM", "GLD"]
-
-NY_TZ = ZoneInfo("America/New_York")
+import websockets
 
 
-class OnDemandRequest(BaseModel):
-    option_type: str = "C"
-    min_dte: int = 14
-    max_dte: int = 30
-    near_limit: int = 16
-    width_min: float = 5.0
-    width_max: float = 10.0
-    risk_min_dollars: float = 250.0
-    risk_max_dollars: float = 300.0
-    hard_max_dollars: float = 400.0
-    allow_fallback: bool = True
-    include_chart_checks: bool = True
-    open_positions: int = 0
-    weekly_trade_count: int = 0
-    macro_context_requested: bool = True
-
-
-def _headers(access_token: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {access_token}",
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-    }
-
-
-def _clean_symbol(symbol: str) -> str:
-    value = symbol.strip().upper()
-    if value not in ALLOWED_SYMBOLS:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "Only SAFE-FAST symbols are allowed",
-                "allowed": sorted(ALLOWED_SYMBOLS),
-                "bad_symbol": value,
-            },
-        )
-    return value
-
-
-def _clean_option_type(option_type: str) -> str:
-    value = option_type.strip().upper()
-    if value not in {"C", "P"}:
-        raise HTTPException(status_code=400, detail="option_type must be C or P")
-    return value
+def _iso_from_ms(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
 
 
 def _to_float(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        return float(value)
+        out = float(value)
     except Exception:
         return None
-
-
-def _best_price(contract: Dict[str, Any]) -> Optional[float]:
-    for field in ("mid", "mark", "last", "bid", "ask"):
-        value = _to_float(contract.get(field))
-        if value is not None:
-            return value
-    return None
-
-
-def _market_context_now() -> Dict[str, Any]:
-    now_et = datetime.now(NY_TZ)
-    is_weekday = now_et.weekday() < 5
-    in_regular_session = time(9, 30) <= now_et.time() < time(16, 0)
-    is_open = is_weekday and in_regular_session
-
-    return {
-        "is_open": is_open,
-        "as_of_et": now_et.isoformat(timespec="seconds"),
-        "session": "regular" if is_open else "closed",
-    }
-
-
-def _other_ticker_candidates(
-    summary_payload: Dict[str, Any],
-    best_ticker: Optional[str],
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-
-    for s in summary_payload.get("ticker_summaries", []):
-        if s.get("symbol") == best_ticker:
-            continue
-        out.append(
-            {
-                "symbol": s.get("symbol"),
-                "verdict": s.get("verdict"),
-                "reason": s.get("reason"),
-                "primary_candidate": s.get("primary_candidate"),
-            }
-        )
-
+    if not math.isfinite(out):
+        return None
     return out
 
 
-_MACRO_MONTHS = {
-    "january": 1, "jan": 1,
-    "february": 2, "feb": 2,
-    "march": 3, "mar": 3,
-    "april": 4, "apr": 4,
-    "may": 5,
-    "june": 6, "jun": 6,
-    "july": 7, "jul": 7,
-    "august": 8, "aug": 8,
-    "september": 9, "sep": 9, "sept": 9,
-    "october": 10, "oct": 10,
-    "november": 11, "nov": 11,
-    "december": 12, "dec": 12,
-}
-
-
-async def _fetch_text(url: str) -> str:
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        resp = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
-    resp.raise_for_status()
-    return unescape(resp.text)
-
-
-def _next_trading_days(start_dt: datetime, count: int = 3) -> List[datetime.date]:
-    out: List[datetime.date] = []
-    cur = start_dt.date()
-    while len(out) < count:
-        if cur.weekday() < 5:
-            out.append(cur)
-        cur = cur + timedelta(days=1)
-    return out
-
-
-def _parse_month_day_year(raw: str, fallback_year: int) -> Optional[datetime.date]:
-    cleaned = raw.strip().replace(",", "").replace(".", "")
-    parts = cleaned.split()
-    if len(parts) < 2:
-        return None
-
-    month = _MACRO_MONTHS.get(parts[0].lower())
-    if not month:
-        return None
-
-    day_token = parts[1]
-    if "-" in day_token:
-        day_token = day_token.split("-")[0]
-    if "â" in day_token:
-        day_token = day_token.split("â")[0]
-    day_token = re.sub(r"[^0-9]", "", day_token)
-    if not day_token:
-        return None
-
-    year = fallback_year
-    if len(parts) >= 3 and parts[2].isdigit():
-        year = int(parts[2])
-
-    try:
-        return datetime(year, month, int(day_token), tzinfo=NY_TZ).date()
-    except Exception:
-        return None
-
-
-def _extract_dates_by_patterns(text: str, fallback_year: int) -> List[datetime.date]:
-    pattern = re.compile(
-        r"(January|February|March|April|May|June|July|August|September|October|November|December|"
-        r"Jan\.?|Feb\.?|Mar\.?|Apr\.?|May|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)"
-        r"\s+\d{1,2}(?:\s*[-â]\s*\d{1,2})?(?:,\s*\d{4}|\s+\d{4})?",
-        re.IGNORECASE,
-    )
-    out: List[datetime.date] = []
-    seen = set()
-    for match in pattern.findall(text):
-        # findall with groups only returns group text; use finditer instead
-        pass
-    for match in pattern.finditer(text):
-        parsed = _parse_month_day_year(match.group(0), fallback_year)
-        if parsed and parsed not in seen:
-            seen.add(parsed)
-            out.append(parsed)
-    return out
-
-
-async def _fetch_fomc_events(now_et: datetime) -> List[Dict[str, Any]]:
-    text = await _fetch_text("https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
-    dates = _extract_dates_by_patterns(text, now_et.year)
-    events = []
-    for d in dates:
-        if d >= now_et.date() - timedelta(days=1):
-            events.append({
-                "date": d.isoformat(),
-                "event": "FOMC",
-                "major": True,
-                "source": "federalreserve.gov",
-            })
-    return events
-
-
-async def _fetch_bls_events(now_et: datetime) -> List[Dict[str, Any]]:
-    urls = [
-        ("CPI", "https://www.bls.gov/schedule/news_release/cpi.htm"),
-        ("Employment Situation", "https://www.bls.gov/schedule/news_release/empsit.htm"),
-    ]
-    events: List[Dict[str, Any]] = []
-    for label, url in urls:
-        text = await _fetch_text(url)
-        dates = _extract_dates_by_patterns(text, now_et.year)
-        for d in dates:
-            if d >= now_et.date() - timedelta(days=1):
-                events.append({
-                    "date": d.isoformat(),
-                    "event": label,
-                    "major": True,
-                    "source": "bls.gov",
-                })
-    return events
-
-
-async def _build_macro_context(requested: bool) -> Dict[str, Any]:
-    if not requested:
-        return {
-            "ok": False,
-            "requested": False,
-            "why": "macro not requested",
-            "has_major_event_today": False,
-            "has_major_event_tomorrow": False,
-            "events": [],
-            "risk_level": "skipped",
-            "note": "Macro context not requested.",
-        }
-
-    now_et = datetime.now(NY_TZ)
-    today = now_et.date()
-    tomorrow = today + timedelta(days=1)
-    hold_window = {d.isoformat() for d in _next_trading_days(now_et, 3)}
-
-    events: List[Dict[str, Any]] = []
-    warnings: List[str] = []
-
-    try:
-        events.extend(await _fetch_fomc_events(now_et))
-    except Exception as e:
-        warnings.append(f"FOMC source unavailable: {e}")
-
-    try:
-        events.extend(await _fetch_bls_events(now_et))
-    except Exception as e:
-        warnings.append(f"BLS source unavailable: {e}")
-
-    deduped: List[Dict[str, Any]] = []
-    seen = set()
-    for ev in sorted(events, key=lambda x: (x["date"], x["event"])):
-        key = (ev["date"], ev["event"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(ev)
-
-    has_today = any(ev["date"] == today.isoformat() and ev["major"] for ev in deduped)
-    has_tomorrow = any(ev["date"] == tomorrow.isoformat() and ev["major"] for ev in deduped)
-    in_hold_window = [ev for ev in deduped if ev["date"] in hold_window and ev["major"]]
-
-    if in_hold_window:
-        risk_level = "high"
-        note = "Major macro event is inside the next 3 trading days."
-    elif deduped:
-        risk_level = "normal"
-        note = "No major macro event found inside the next 3 trading days."
-    else:
-        risk_level = "unconfirmed"
-        note = "Macro sources returned no usable schedule data."
-
-    if warnings:
-        note = f"{note} Warnings: {' | '.join(warnings)}"
-
-    return {
-        "ok": True,
-        "requested": True,
-        "has_major_event_today": has_today,
-        "has_major_event_tomorrow": has_tomorrow,
-        "events": deduped,
-        "risk_level": risk_level,
-        "note": note,
-        "as_of_et": now_et.isoformat(timespec="seconds"),
-    }
-
-
-async def get_access_token() -> str:
-    if not all([TT_CLIENT_ID, TT_CLIENT_SECRET, TT_REDIRECT_URI, TT_REFRESH_TOKEN]):
-        raise HTTPException(status_code=500, detail="Missing TT OAuth environment variables")
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            f"{API_BASE}/oauth/token",
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-            data={
-                "grant_type": "refresh_token",
-                "client_id": TT_CLIENT_ID,
-                "client_secret": TT_CLIENT_SECRET,
-                "redirect_uri": TT_REDIRECT_URI,
-                "refresh_token": TT_REFRESH_TOKEN,
-            },
-        )
-
-    try:
-        payload = resp.json()
-    except Exception:
-        payload = {"raw": resp.text}
-
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=payload)
-
-    token = payload.get("access_token")
-    if not token:
-        raise HTTPException(status_code=500, detail=payload)
-
-    return token
-
-
-async def _fetch_option_chain(symbol: str, token: str) -> Any:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(
-            f"{API_BASE}/option-chains/{symbol}",
-            headers=_headers(token),
-        )
-
-    try:
-        payload = resp.json()
-    except Exception:
-        payload = {"raw": resp.text}
-
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=payload)
-
-    return payload
-
-
-async def _fetch_quotes(symbols: List[str], token: str) -> Any:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(
-            f"{API_BASE}/market-data",
-            headers=_headers(token),
-            params={"type": "Equity", "symbols": ",".join(symbols)},
-        )
-
-    try:
-        payload = resp.json()
-    except Exception:
-        payload = {"raw": resp.text}
-
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=payload)
-
-    return payload
-
-
-async def _fetch_option_quotes(option_symbols: List[str], token: str) -> Any:
-    if not option_symbols:
-        return {"data": {"items": []}}
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(
-            f"{API_BASE}/market-data/by-type",
-            headers=_headers(token),
-            params={"equity-option": ",".join(option_symbols)},
-        )
-
-    try:
-        payload = resp.json()
-    except Exception:
-        payload = {"raw": resp.text}
-
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=payload)
-
-    return payload
-
-
-async def _get_underlying_price(symbol: str, token: str) -> float:
-    payload = await _fetch_quotes([symbol], token)
-    items = payload.get("data", {}).get("items", [])
-    if not items:
-        raise HTTPException(status_code=500, detail="No quote data returned")
-
-    item = items[0]
-    for field in ("mark", "last", "mid", "close"):
-        value = _to_float(item.get(field))
-        if value is not None:
-            return value
-
-    raise HTTPException(status_code=500, detail="Could not determine underlying price")
-
-
-def _extract_expirations(chain_payload: Any, min_dte: int, max_dte: int) -> List[Dict[str, Any]]:
-    items = chain_payload.get("data", {}).get("items", [])
-    expirations: List[Dict[str, Any]] = []
-    seen = set()
-
-    for item in items:
-        dte = item.get("days-to-expiration")
-        expiration_date = item.get("expiration-date")
-        if dte is None or expiration_date is None:
-            continue
-
-        dte_int = int(dte)
-        if min_dte <= dte_int <= max_dte:
-            key = (expiration_date, dte_int)
-            if key not in seen:
-                seen.add(key)
-                expirations.append(
-                    {
-                        "expiration_date": expiration_date,
-                        "days_to_expiration": dte_int,
-                    }
-                )
-
-    expirations.sort(key=lambda x: (x["days_to_expiration"], x["expiration_date"]))
-    return expirations
-
-
-def _build_near_contracts(
-    chain_payload: Any,
-    expiration_date: str,
-    option_type: str,
-    underlying_price: float,
-) -> List[Dict[str, Any]]:
-    items = chain_payload.get("data", {}).get("items", [])
-    contracts: List[Dict[str, Any]] = []
-
-    for item in items:
-        if item.get("expiration-date") != expiration_date:
-            continue
-        if item.get("option-type") != option_type:
-            continue
-
-        strike_value = _to_float(item.get("strike-price"))
-        if strike_value is None:
-            continue
-
-        contracts.append(
-            {
-                "symbol": item.get("symbol"),
-                "strike_price": strike_value,
-                "distance_from_underlying": round(abs(strike_value - underlying_price), 4),
-                "expiration_date": item.get("expiration-date"),
-                "days_to_expiration": item.get("days-to-expiration"),
-                "option_type": item.get("option-type"),
-            }
-        )
-
-    contracts.sort(key=lambda x: (x["distance_from_underlying"], x["strike_price"]))
-    return contracts
-
-
-def _merge_quotes_into_contracts(
-    near_contracts: List[Dict[str, Any]],
-    quote_payload: Any,
-) -> List[Dict[str, Any]]:
-    quote_items = quote_payload.get("data", {}).get("items", [])
-    quote_map = {item.get("symbol"): item for item in quote_items}
-
-    merged: List[Dict[str, Any]] = []
-    for contract in near_contracts:
-        quote = quote_map.get(contract["symbol"], {})
-        merged.append(
-            {
-                **contract,
-                "bid": quote.get("bid"),
-                "ask": quote.get("ask"),
-                "mid": quote.get("mid"),
-                "mark": quote.get("mark"),
-                "last": quote.get("last"),
-            }
-        )
-
-    return merged
-
-
-def _generate_debit_spread_candidates(
-    contracts: List[Dict[str, Any]],
-    underlying_price: float,
-    option_type: str,
-    width_min: float,
-    width_max: float,
-    risk_min_dollars: float,
-    risk_max_dollars: float,
-    hard_max_dollars: float,
-    enforce_hard_max: bool,
-    only_preferred: bool,
-) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-    target_risk_mid = (risk_min_dollars + risk_max_dollars) / 2.0
-
-    ordered = sorted(contracts, key=lambda c: (c["strike_price"] is None, c["strike_price"]))
-
-    for i in range(len(ordered)):
-        for j in range(i + 1, len(ordered)):
-            left = ordered[i]
-            right = ordered[j]
-
-            left_strike = _to_float(left.get("strike_price"))
-            right_strike = _to_float(right.get("strike_price"))
-            if left_strike is None or right_strike is None:
-                continue
-
-            width = round(abs(right_strike - left_strike), 4)
-            if width < width_min or width > width_max:
-                continue
-
-            if option_type == "C":
-                long_leg = left
-                short_leg = right
-            else:
-                long_leg = right
-                short_leg = left
-
-            long_price = _best_price(long_leg)
-            short_price = _best_price(short_leg)
-            if long_price is None or short_price is None:
-                continue
-
-            est_debit = round(long_price - short_price, 4)
-            if est_debit <= 0:
-                continue
-
-            max_loss_dollars_1lot = round(est_debit * 100, 2)
-            max_profit_dollars_1lot = round((width - est_debit) * 100, 2)
-            feasibility_pass = (1.6 * est_debit) <= width
-            within_hard_max = max_loss_dollars_1lot <= hard_max_dollars
-            preferred_risk_band_pass = risk_min_dollars <= max_loss_dollars_1lot <= risk_max_dollars
-
-            if enforce_hard_max and not within_hard_max:
-                continue
-            if only_preferred and not preferred_risk_band_pass:
-                continue
-
-            long_strike = _to_float(long_leg.get("strike_price")) or 0.0
-
-            candidates.append(
-                {
-                    "long_symbol": long_leg.get("symbol"),
-                    "short_symbol": short_leg.get("symbol"),
-                    "long_strike": left_strike if option_type == "C" else right_strike,
-                    "short_strike": right_strike if option_type == "C" else left_strike,
-                    "width": width,
-                    "est_debit": est_debit,
-                    "max_loss_dollars_1lot": max_loss_dollars_1lot,
-                    "max_profit_dollars_1lot": max_profit_dollars_1lot,
-                    "risk_reward": round(max_profit_dollars_1lot / max_loss_dollars_1lot, 4) if max_loss_dollars_1lot > 0 else None,
-                    "feasibility_pass": feasibility_pass,
-                    "preferred_risk_band_pass": preferred_risk_band_pass,
-                    "within_hard_max": within_hard_max,
-                    "fits_risk_budget": preferred_risk_band_pass and within_hard_max,
-                    "long_distance_from_underlying": round(abs(long_strike - underlying_price), 4),
-                    "distance_from_target_risk_mid": round(abs(max_loss_dollars_1lot - target_risk_mid), 2),
-                }
-            )
-
-    candidates.sort(
-        key=lambda x: (
-            not x["fits_risk_budget"],
-            not x["feasibility_pass"],
-            x["distance_from_target_risk_mid"],
-            x["long_distance_from_underlying"],
-            x["width"],
-            x["est_debit"],
-        )
-    )
-    return candidates
-
-
-def _select_shortlist(all_candidates: List[Dict[str, Any]], allow_fallback: bool) -> Dict[str, Any]:
-    preferred = [c for c in all_candidates if c["feasibility_pass"] and c["fits_risk_budget"]]
-    fallback = [c for c in all_candidates if c["feasibility_pass"] and c["within_hard_max"]]
-
-    if preferred:
-        selected = preferred
-        selection_mode = "preferred"
-        reason = "Using candidates that pass feasibility, preferred risk band, and hard max."
-    elif allow_fallback and fallback:
-        selected = fallback
-        selection_mode = "fallback"
-        reason = "No preferred candidates found. Using feasible candidates that still stay under hard max."
-    else:
-        selected = []
-        selection_mode = "none"
-        reason = "No feasible candidates found for the current filters."
-
-    return {
-        "selection_mode": selection_mode,
-        "reason": reason,
-        "preferred_count": len(preferred),
-        "fallback_count": len(fallback),
-        "primary_candidate": selected[0] if len(selected) >= 1 else None,
-        "backup_candidate": selected[1] if len(selected) >= 2 else None,
-    }
-
-
-def _compact_candidate(candidate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not candidate:
-        return None
-    return {
-        "long_symbol": candidate.get("long_symbol"),
-        "short_symbol": candidate.get("short_symbol"),
-        "long_strike": candidate.get("long_strike"),
-        "short_strike": candidate.get("short_strike"),
-        "width": candidate.get("width"),
-        "est_debit": candidate.get("est_debit"),
-        "max_loss_dollars_1lot": candidate.get("max_loss_dollars_1lot"),
-        "max_profit_dollars_1lot": candidate.get("max_profit_dollars_1lot"),
-        "risk_reward": candidate.get("risk_reward"),
-        "feasibility_pass": candidate.get("feasibility_pass"),
-        "fits_risk_budget": candidate.get("fits_risk_budget"),
-        "distance_from_target_risk_mid": candidate.get("distance_from_target_risk_mid"),
-    }
-
-
-def _compact_ticker_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "symbol": summary.get("symbol"),
-        "verdict": summary.get("verdict"),
-        "selection_mode": summary.get("selection_mode"),
-        "expiration_date": summary.get("expiration_date"),
-        "days_to_expiration": summary.get("days_to_expiration"),
-        "underlying_price": summary.get("underlying_price"),
-        "preferred_count": summary.get("preferred_count"),
-        "fallback_count": summary.get("fallback_count"),
-        "reason": summary.get("reason"),
-        "primary_candidate": _compact_candidate(summary.get("primary_candidate")),
-        "backup_candidate": _compact_candidate(summary.get("backup_candidate")),
-    }
-
-
-def _rank_ticker_summaries(ticker_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return sorted(
-        ticker_summaries,
-        key=lambda x: (
-            {"ACTIVE_NOW": 0, "PENDING": 1, "NO_TRADE": 2}.get(x["verdict"], 3),
-            x["primary_candidate"]["distance_from_target_risk_mid"] if x.get("primary_candidate") else 999999,
-            SYMBOL_ORDER.index(x["symbol"]) if x["symbol"] in SYMBOL_ORDER else 999999,
-        ),
-    )
-
-
-async def _build_ticker_summary(
-    symbol: str,
-    option_type: str,
-    min_dte: int,
-    max_dte: int,
-    near_limit: int,
-    width_min: float,
-    width_max: float,
-    risk_min_dollars: float,
-    risk_max_dollars: float,
-    hard_max_dollars: float,
-    allow_fallback: bool,
-    token: str,
-) -> Dict[str, Any]:
-    chain_payload = await _fetch_option_chain(symbol, token)
-    expirations = _extract_expirations(chain_payload, min_dte, max_dte)
-
-    if not expirations:
-        return {
-            "symbol": symbol,
-            "verdict": "NO_TRADE",
-            "reason": "No expirations found in requested DTE range.",
-            "selection_mode": "none",
-            "expiration_date": None,
-            "days_to_expiration": None,
-            "underlying_price": None,
-            "preferred_count": 0,
-            "fallback_count": 0,
-            "primary_candidate": None,
-            "backup_candidate": None,
-        }
-
-    chosen_expiration = expirations[0]
-    underlying_price = await _get_underlying_price(symbol, token)
-
-    near_contracts = _build_near_contracts(
-        chain_payload=chain_payload,
-        expiration_date=chosen_expiration["expiration_date"],
-        option_type=option_type,
-        underlying_price=underlying_price,
-    )[:near_limit]
-
-    option_symbols = [c["symbol"] for c in near_contracts if c.get("symbol")]
-    quote_payload = await _fetch_option_quotes(option_symbols, token)
-    merged_contracts = _merge_quotes_into_contracts(near_contracts, quote_payload)
-
-    all_candidates = _generate_debit_spread_candidates(
-        contracts=merged_contracts,
-        underlying_price=underlying_price,
-        option_type=option_type,
-        width_min=width_min,
-        width_max=width_max,
-        risk_min_dollars=risk_min_dollars,
-        risk_max_dollars=risk_max_dollars,
-        hard_max_dollars=hard_max_dollars,
-        enforce_hard_max=True,
-        only_preferred=False,
-    )
-
-    shortlist = _select_shortlist(all_candidates, allow_fallback)
-
-    if shortlist["selection_mode"] == "preferred":
-        verdict = "ACTIVE_NOW"
-    elif shortlist["selection_mode"] == "fallback":
-        verdict = "PENDING"
-    else:
-        verdict = "NO_TRADE"
-
-    return {
-        "symbol": symbol,
-        "verdict": verdict,
-        "reason": shortlist["reason"],
-        "selection_mode": shortlist["selection_mode"],
-        "expiration_date": chosen_expiration["expiration_date"],
-        "days_to_expiration": chosen_expiration["days_to_expiration"],
-        "underlying_price": underlying_price,
-        "preferred_count": shortlist["preferred_count"],
-        "fallback_count": shortlist["fallback_count"],
-        "primary_candidate": shortlist["primary_candidate"],
-        "backup_candidate": shortlist["backup_candidate"],
-    }
-
-
-async def _build_summary_compact_payload(
-    option_type: str,
-    min_dte: int,
-    max_dte: int,
-    near_limit: int,
-    width_min: float,
-    width_max: float,
-    risk_min_dollars: float,
-    risk_max_dollars: float,
-    hard_max_dollars: float,
-    allow_fallback: bool,
-    token: str,
-) -> Dict[str, Any]:
-    clean_option_type = _clean_option_type(option_type)
-    ticker_summaries = []
-
-    for symbol in SYMBOL_ORDER:
-        summary = await _build_ticker_summary(
-            symbol=symbol,
-            option_type=clean_option_type,
-            min_dte=min_dte,
-            max_dte=max_dte,
-            near_limit=near_limit,
-            width_min=width_min,
-            width_max=width_max,
-            risk_min_dollars=risk_min_dollars,
-            risk_max_dollars=risk_max_dollars,
-            hard_max_dollars=hard_max_dollars,
-            allow_fallback=allow_fallback,
-            token=token,
-        )
-        ticker_summaries.append(summary)
-
-    ranked = _rank_ticker_summaries(ticker_summaries)
-    best_summary = ranked[0] if ranked else None
-    best_ticker = best_summary["symbol"] if best_summary and best_summary["primary_candidate"] else None
-    verdict = best_summary["verdict"] if best_summary else "NO_TRADE"
-
-    return {
-        "ok": True,
-        "verdict": verdict,
-        "best_ticker": best_ticker,
-        "selection_mode": best_summary["selection_mode"] if best_summary else "none",
-        "reason": best_summary["reason"] if best_summary else "No summary available.",
-        "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
-        "backup_candidate": _compact_candidate(best_summary["backup_candidate"]) if best_summary else None,
-        "ticker_summaries": [_compact_ticker_summary(s) for s in ticker_summaries],
-    }
-
-
-
-async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
-    snapshot = await get_1h_ema50_snapshot(
-        symbol=symbol,
-        access_token=token,
-        api_base=API_BASE,
-        user_agent=USER_AGENT,
-        days_back=14,
-    )
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "latest_close": snapshot["latest_close"],
-        "ema50_1h": snapshot["ema50_1h"],
-        "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
-        "latest_candle_time": snapshot["latest_candle_time"],
-        "candle_count": snapshot["candle_count"],
-        "recent_candles": snapshot.get("recent_candles", []),
-        "_all_candles": snapshot.get("all_candles", []),
-    }
-
-
-def _calc_ema(values: List[float], length: int) -> Optional[float]:
+def _compute_ema(values: List[float], length: int) -> Optional[float]:
     if not values:
         return None
+
     multiplier = 2 / (length + 1)
     ema = values[0]
+
     for value in values[1:]:
         ema = ((value - ema) * multiplier) + ema
+
     return round(ema, 4)
 
 
-def _candles_by_day_et(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    grouped: Dict[str, Dict[str, Any]] = {}
-    ordered_days: List[str] = []
-
-    for candle in candles:
-        ts = datetime.fromisoformat(candle["time_iso"]).astimezone(NY_TZ)
-        day_key = ts.date().isoformat()
-        if day_key not in grouped:
-            grouped[day_key] = {
-                "date": day_key,
-                "open": candle["open"],
-                "high": candle["high"],
-                "low": candle["low"],
-                "close": candle["close"],
-            }
-            ordered_days.append(day_key)
-        else:
-            grouped[day_key]["high"] = max(grouped[day_key]["high"], candle["high"])
-            grouped[day_key]["low"] = min(grouped[day_key]["low"], candle["low"])
-            grouped[day_key]["close"] = candle["close"]
-
-    return [grouped[day] for day in ordered_days]
+async def _send_json(ws: websockets.WebSocketClientProtocol, payload: Dict[str, Any]) -> None:
+    await ws.send(json.dumps(payload))
 
 
-def _condense_levels(levels: List[float], tolerance: float, descending: bool = False) -> List[float]:
-    ordered = sorted(levels, reverse=descending)
-    out: List[float] = []
-    for level in ordered:
-        if not out or abs(level - out[-1]) > tolerance:
-            out.append(level)
-    return out
+async def _recv_json(ws: websockets.WebSocketClientProtocol, timeout: float = 10.0) -> Dict[str, Any]:
+    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+    return json.loads(raw)
 
 
-def _find_wall_levels(
-    candles: List[Dict[str, Any]],
-    latest_close: float,
-    option_type: str,
+async def _wait_for_message(
+    ws: websockets.WebSocketClientProtocol,
+    wanted_type: str,
+    channel: Optional[int] = None,
+    timeout: float = 10.0,
 ) -> Dict[str, Any]:
-    if not candles:
-        return {
-            "first_wall": None,
-            "next_pocket": None,
-            "room_distance": None,
-            "room_ratio": None,
-            "room_pass": None,
-        }
+    deadline = time.monotonic() + timeout
 
-    window = candles[-35:] if len(candles) >= 35 else candles
-    tolerance = max(latest_close * 0.0015, 0.10)
+    while time.monotonic() < deadline:
+        remaining = max(0.1, deadline - time.monotonic())
+        msg = await _recv_json(ws, timeout=remaining)
 
-    if option_type == "C":
-        candidate_levels = [round(c["high"], 2) for c in window if c["high"] > latest_close]
-        levels = _condense_levels(candidate_levels, tolerance, descending=False)
-        first_wall = levels[0] if levels else None
-        next_pocket = levels[1] if len(levels) > 1 else None
-    else:
-        candidate_levels = [round(c["low"], 2) for c in window if c["low"] < latest_close]
-        levels = _condense_levels(candidate_levels, tolerance, descending=True)
-        first_wall = levels[0] if levels else None
-        next_pocket = levels[1] if len(levels) > 1 else None
+        if msg.get("type") == "ERROR":
+            raise RuntimeError(f"DXLink error: {msg}")
 
-    return {
-        "first_wall": first_wall,
-        "next_pocket": next_pocket,
-        "room_distance": round(abs(first_wall - latest_close), 4) if first_wall is not None else None,
-    }
+        if msg.get("type") == wanted_type:
+            if channel is None or msg.get("channel") == channel:
+                return msg
 
+    raise RuntimeError(f"Timed out waiting for {wanted_type} on channel {channel}")
 
-def _twentyfour_hour_context(candles: List[Dict[str, Any]], option_type: str) -> Dict[str, Any]:
-    daily_bars = _candles_by_day_et(candles)
-    closes = [bar["close"] for bar in daily_bars if bar.get("close") is not None]
 
-    if len(closes) < 4:
-        return {
-            "label": "unconfirmed",
-            "supportive": None,
-            "source": "1h_aggregated_daily_proxy",
-        }
+def _parse_candle_feed_data(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if message.get("type") != "FEED_DATA":
+        return []
 
-    ema3 = _calc_ema(closes[-6:], 3)
-    ema5 = _calc_ema(closes[-6:], 5)
-    slope_up = ema3 is not None and ema5 is not None and ema3 > ema5 and closes[-1] > closes[-3]
-    slope_down = ema3 is not None and ema5 is not None and ema3 < ema5 and closes[-1] < closes[-3]
+    data = message.get("data")
+    if not isinstance(data, list) or len(data) != 2:
+        return []
 
-    if slope_up:
-        label = "bullish"
-    elif slope_down:
-        label = "bearish"
-    else:
-        label = "mixed"
+    event_type, values = data
+    if event_type != "Candle" or not isinstance(values, list):
+        return []
 
-    supportive = None
-    if option_type == "C":
-        supportive = True if label == "bullish" else False if label == "bearish" else None
-    else:
-        supportive = True if label == "bearish" else False if label == "bullish" else None
+    candles: List[Dict[str, Any]] = []
+    fields_per_candle = 6  # eventSymbol, time, open, high, low, close
 
-    return {
-        "label": label,
-        "supportive": supportive,
-        "source": "1h_aggregated_daily_proxy",
-    }
+    for i in range(0, len(values), fields_per_candle):
+        chunk = values[i:i + fields_per_candle]
+        if len(chunk) < fields_per_candle:
+            break
 
+        event_symbol, ts, open_, high, low, close = chunk
 
-def _is_chop(candles: List[Dict[str, Any]]) -> bool:
-    if len(candles) < 4:
-        return False
-    recent = candles[-4:]
-    overlap_hits = 0
-    for i in range(1, len(recent)):
-        current = recent[i]
-        prev = recent[i - 1]
-        overlap = max(0.0, min(current["high"], prev["high"]) - max(current["low"], prev["low"]))
-        current_range = max(current["high"] - current["low"], 0.0001)
-        if (overlap / current_range) > 0.5:
-            overlap_hits += 1
-    return overlap_hits >= 3
+        ts_int = int(ts)
+        open_f = _to_float(open_)
+        high_f = _to_float(high)
+        low_f = _to_float(low)
+        close_f = _to_float(close)
 
-
-def _extension_state(
-    symbol: str,
-    latest_close: float,
-    ema50_1h: float,
-    first_wall: Optional[float],
-) -> Dict[str, Any]:
-    pct_from_ema = abs(latest_close - ema50_1h) / ema50_1h if ema50_1h else None
-    threshold = 0.008 if symbol == "GLD" else 0.006
-    room_distance = abs(first_wall - latest_close) if first_wall is not None else None
-    move_ratio = (abs(latest_close - ema50_1h) / room_distance) if room_distance not in (None, 0) else None
-    is_extended = bool(
-        (pct_from_ema is not None and pct_from_ema > threshold) or
-        (move_ratio is not None and move_ratio > 0.5)
-    )
-    return {
-        "state": "extended" if is_extended else "acceptable",
-        "pct_from_ema": round(pct_from_ema * 100, 3) if pct_from_ema is not None else None,
-        "move_to_wall_ratio": round(move_ratio, 3) if move_ratio is not None else None,
-        "threshold_pct": round(threshold * 100, 3),
-        "late_move": is_extended,
-    }
-
-
-def _wall_thesis(
-    option_type: str,
-    primary_candidate: Optional[Dict[str, Any]],
-    first_wall: Optional[float],
-    next_pocket: Optional[float],
-    invalidation_distance: Optional[float],
-) -> Dict[str, Any]:
-    if not primary_candidate or first_wall is None:
-        return {
-            "wall_thesis": "unconfirmed",
-            "wall_pass": None,
-        }
-
-    short_strike = _to_float(primary_candidate.get("short_strike"))
-    if short_strike is None:
-        return {
-            "wall_thesis": "unconfirmed",
-            "wall_pass": None,
-        }
-
-    next_pocket_room = None
-    if next_pocket is not None and invalidation_distance not in (None, 0):
-        next_pocket_room = abs(next_pocket - first_wall) / invalidation_distance
-
-    if option_type == "C":
-        if short_strike > first_wall:
-            return {"wall_thesis": "TO_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
-        if next_pocket is not None and (next_pocket_room or 0) >= 1.5:
-            return {"wall_thesis": "THROUGH_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
-    else:
-        if short_strike < first_wall:
-            return {"wall_thesis": "TO_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
-        if next_pocket is not None and (next_pocket_room or 0) >= 1.5:
-            return {"wall_thesis": "THROUGH_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
-
-    return {
-        "wall_thesis": "WALL_MISMATCH",
-        "wall_pass": False,
-        "next_pocket_room_ratio": next_pocket_room,
-    }
-
-
-def _setup_classifier(
-    option_type: str,
-    chart_check: Dict[str, Any],
-    trend_ctx: Dict[str, Any],
-    room_ratio: Optional[float],
-    room_pass: Optional[bool],
-    wall_pass: Optional[bool],
-    extension_state: Dict[str, Any],
-    candles: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    latest_close = chart_check.get("latest_close")
-    ema50_1h = chart_check.get("ema50_1h")
-
-    if latest_close is None or ema50_1h is None:
-        return {"setup_type": "UNCONFIRMED", "trend_label": "unconfirmed", "allowed_setup": None}
-
-    near_ema = abs(latest_close - ema50_1h) / ema50_1h <= 0.0025
-    chop = _is_chop(candles)
-    recent_closes = [c["close"] for c in candles[-3:]] if len(candles) >= 3 else []
-    tight_break = False
-    if recent_closes and latest_close:
-        tight_break = (max(recent_closes) - min(recent_closes)) / latest_close <= 0.003
-
-    if room_pass is False or wall_pass is False or extension_state.get("state") == "extended":
-        return {"setup_type": "NOT_ALLOWED", "trend_label": "unconfirmed", "allowed_setup": False}
-
-    trend_supportive = trend_ctx.get("supportive")
-    if trend_supportive is True:
-        if near_ema and (room_ratio or 0) >= 2.5 and not chop:
-            return {"setup_type": "Ideal", "trend_label": "Trend-aligned", "allowed_setup": True}
-        if tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": "Trend-aligned", "allowed_setup": True}
-        if near_ema:
-            return {"setup_type": "Continuation", "trend_label": "Trend-aligned", "allowed_setup": True}
-        return {"setup_type": "PENDING_CONTINUATION", "trend_label": "Trend-aligned", "allowed_setup": False}
-
-    if trend_supportive is False:
-        if tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": "Countertrend", "allowed_setup": True}
-        return {"setup_type": "NOT_ALLOWED", "trend_label": "Countertrend", "allowed_setup": False}
-
-    return {"setup_type": "UNCONFIRMED", "trend_label": "unconfirmed", "allowed_setup": None}
-
-
-def _build_structure_context(
-    symbol: str,
-    option_type: str,
-    chart_check: Optional[Dict[str, Any]],
-    primary_candidate: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    if not chart_check or not chart_check.get("ok"):
-        return {
-            "ok": False,
-            "why": "chart check unavailable",
-        }
-
-    candles = chart_check.get("_all_candles", [])
-    if not candles:
-        return {
-            "ok": False,
-            "why": "full candle history unavailable",
-        }
-
-    latest_close = chart_check.get("latest_close")
-    ema50_1h = chart_check.get("ema50_1h")
-    if latest_close is None or ema50_1h is None:
-        return {
-            "ok": False,
-            "why": "missing latest close or ema",
-        }
-
-    trend_ctx = _twentyfour_hour_context(candles, option_type)
-    wall_levels = _find_wall_levels(candles, latest_close, option_type)
-    invalidation_distance = abs(latest_close - ema50_1h) if ema50_1h is not None else None
-    room_ratio = None
-    if wall_levels["room_distance"] is not None and invalidation_distance not in (None, 0):
-        room_ratio = wall_levels["room_distance"] / invalidation_distance
-
-    room_pass = (room_ratio is not None and room_ratio >= 2.0)
-    extension_ctx = _extension_state(symbol, latest_close, ema50_1h, wall_levels.get("first_wall"))
-    wall_ctx = _wall_thesis(
-        option_type=option_type,
-        primary_candidate=primary_candidate,
-        first_wall=wall_levels.get("first_wall"),
-        next_pocket=wall_levels.get("next_pocket"),
-        invalidation_distance=invalidation_distance,
-    )
-    setup_ctx = _setup_classifier(
-        option_type=option_type,
-        chart_check=chart_check,
-        trend_ctx=trend_ctx,
-        room_ratio=room_ratio,
-        room_pass=room_pass,
-        wall_pass=wall_ctx.get("wall_pass"),
-        extension_state=extension_ctx,
-        candles=candles,
-    )
-
-    return {
-        "ok": True,
-        "twentyfour_hour_trend": trend_ctx.get("label"),
-        "twentyfour_hour_supportive": trend_ctx.get("supportive"),
-        "twentyfour_hour_source": trend_ctx.get("source"),
-        "first_wall": wall_levels.get("first_wall"),
-        "next_pocket": wall_levels.get("next_pocket"),
-        "room_to_first_wall": wall_levels.get("room_distance"),
-        "room_ratio": round(room_ratio, 3) if room_ratio is not None else None,
-        "room_pass": room_pass,
-        "wall_thesis": wall_ctx.get("wall_thesis"),
-        "wall_pass": wall_ctx.get("wall_pass"),
-        "next_pocket_room_ratio": wall_ctx.get("next_pocket_room_ratio"),
-        "extension_state": extension_ctx.get("state"),
-        "pct_from_ema": extension_ctx.get("pct_from_ema"),
-        "late_move": extension_ctx.get("late_move"),
-        "iv_state": "unconfirmed",
-        "setup_type": setup_ctx.get("setup_type"),
-        "trend_label": setup_ctx.get("trend_label"),
-        "allowed_setup": setup_ctx.get("allowed_setup"),
-        "chop_risk": _is_chop(candles),
-    }
-
-
-def _status_field(value: Any, confirmed: bool) -> Dict[str, Any]:
-
-    return {"status": "confirmed" if confirmed else "unconfirmed", "value": value}
-
-
-def _chart_alignment_ok(option_type: str, chart_check: Optional[Dict[str, Any]]) -> Optional[bool]:
-    if not chart_check or not chart_check.get("ok"):
-        return None
-    side = chart_check.get("price_vs_ema50_1h")
-    return side == "above" if option_type == "C" else side == "below"
-
-
-
-def _final_verdict(
-    request: OnDemandRequest,
-    engine_status: str,
-    chart_alignment: Optional[bool],
-    market_context: Dict[str, Any],
-    macro_context: Dict[str, Any],
-    structure_context: Dict[str, Any],
-) -> str:
-    if request.open_positions > 0:
-        return "NO_TRADE"
-    if request.weekly_trade_count >= 4:
-        return "NO_TRADE"
-    if not market_context["is_open"]:
-        return "NO_TRADE"
-    if macro_context.get("ok") and (
-        macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
-    ):
-        return "NO_TRADE"
-    if engine_status == "NO_TRADE":
-        return "NO_TRADE"
-    if chart_alignment is False:
-        return "NO_TRADE"
-    if structure_context.get("ok"):
-        if structure_context.get("room_pass") is False:
-            return "NO_TRADE"
-        if structure_context.get("wall_pass") is False:
-            return "NO_TRADE"
-        if structure_context.get("extension_state") == "extended":
-            return "NO_TRADE"
-        if structure_context.get("allowed_setup") is False:
-            return "NO_TRADE"
-    return "PENDING"
-
-
-
-
-def _build_chart_confirmation_block(
-    request: OnDemandRequest,
-    chart_check: Optional[Dict[str, Any]],
-    chart_check_error: Optional[str],
-    structure_context: Dict[str, Any],
-) -> Dict[str, Any]:
-    one_hour_confirmed = bool(chart_check and chart_check.get("ok"))
-    structure_confirmed = bool(structure_context.get("ok"))
-    message = (
-        "Candidate engine result only - chart confirmation still required. Chart check failed in this run."
-        if chart_check_error
-        else "Candidate engine result only - chart confirmation still required."
-    )
-    return {
-        "confirmed": False,
-        "message": message,
-        "fields": {
-            "one_hour_50_ema": _status_field(chart_check.get("ema50_1h") if chart_check else None, one_hour_confirmed),
-            "one_hour_price_vs_50_ema": _status_field(chart_check.get("price_vs_ema50_1h") if chart_check else None, one_hour_confirmed),
-            "latest_close": _status_field(chart_check.get("latest_close") if chart_check else None, one_hour_confirmed),
-            "twentyfour_hour_trend": _status_field(structure_context.get("twentyfour_hour_trend"), structure_confirmed),
-            "room_to_first_wall": _status_field(structure_context.get("room_to_first_wall"), structure_confirmed),
-            "first_wall": _status_field(structure_context.get("first_wall"), structure_confirmed),
-            "next_pocket": _status_field(structure_context.get("next_pocket"), structure_confirmed),
-            "room_ratio": _status_field(structure_context.get("room_ratio"), structure_confirmed),
-            "wall_thesis": _status_field(structure_context.get("wall_thesis"), structure_confirmed),
-            "extension_state": _status_field(structure_context.get("extension_state"), structure_confirmed),
-            "iv_state": _status_field(structure_context.get("iv_state"), False),
-            "setup_type": _status_field(structure_context.get("setup_type"), structure_confirmed),
-            "trend_label": _status_field(structure_context.get("trend_label"), structure_confirmed),
-            "open_positions_state": _status_field(request.open_positions, True),
-            "weekly_trade_count_state": _status_field(request.weekly_trade_count, True),
-        },
-    }
-
-
-
-def _build_user_facing_block(
-    request: OnDemandRequest,
-    engine_status: str,
-    final_verdict: str,
-    best_ticker: Optional[str],
-    chart_check: Optional[Dict[str, Any]],
-    chart_check_error: Optional[str],
-    engine_reason: str,
-    market_context: Dict[str, Any],
-    macro_context: Dict[str, Any],
-    structure_context: Dict[str, Any],
-) -> Dict[str, Any]:
-    ticker = best_ticker or "UNKNOWN"
-    ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
-
-    if request.open_positions > 0:
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": "No new entry allowed while open_positions > 0.",
-            "setup_state": "NO TRADE",
-            "why": "You already have 1 open position. SAFE-FAST allows max 1 open trade total.",
-        }
-
-    if request.weekly_trade_count >= 4:
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": "No new entry allowed after max weekly trade count is reached.",
-            "setup_state": "NO TRADE",
-            "why": "Weekly trade count is already at or above the SAFE-FAST max.",
-        }
-
-    if not market_context["is_open"]:
-        return {
-            "good_idea_now": "WAIT",
-            "ticker": ticker,
-            "action": "wait for next regular session",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-            "setup_state": "WAIT_MARKET_CLOSED",
-            "why": f"Candidate exists, but the regular session is closed as of {market_context['as_of_et']}. Re-check next session before entry.",
-        }
-
-    if macro_context.get("ok") and (
-        macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
-    ):
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-            "setup_state": "NO TRADE",
-            "why": macro_context.get("note") or "Major event risk is inside the expected hold window.",
-        }
-
-    if engine_status == "NO_TRADE" or not best_ticker:
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": "No valid candidate engine setup is available.",
-            "setup_state": "NO TRADE",
-            "why": engine_reason,
-        }
-
-    if structure_context.get("ok"):
-        if structure_context.get("room_pass") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "Room to first wall is too tight for SAFE-FAST.",
-            }
-        if structure_context.get("wall_pass") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "Wall thesis and strike placement do not match.",
-            }
-        if structure_context.get("extension_state") == "extended":
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
-            }
-        if structure_context.get("allowed_setup") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": f"Setup type is {structure_context.get('setup_type')}, which is not tradable now.",
-            }
-
-    if final_verdict == "NO_TRADE":
-        why = "Best ticker failed the 1H EMA alignment check."
-        if chart_check_error:
-            why = "Chart check failed in this run."
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": "No valid new entry from the current combined read.",
-            "setup_state": "NO TRADE",
-            "why": why,
-        }
-
-    return {
-        "good_idea_now": "WAIT",
-        "ticker": ticker,
-        "action": "wait for full chart confirmation",
-        "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-        "setup_state": "PENDING",
-        "why": "Candidate engine is valid, but trigger/entry-zone timing still needs confirmation.",
-    }
-
-
-
-
-
-
-def _screened_sort_key(item: Dict[str, Any]) -> Any:
-    structure = item.get("structure_context", {})
-    primary = item.get("summary", {}).get("primary_candidate") or {}
-    final_verdict = item.get("final_verdict", "NO_TRADE")
-
-    verdict_rank = {"PENDING": 0, "NO_TRADE": 1}.get(final_verdict, 2)
-    setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
-    trend_rank = 0 if structure.get("trend_label") == "Trend-aligned" else 1 if structure.get("trend_label") == "Countertrend" else 2
-    room_rank = 0 if structure.get("room_pass") is True else 1
-    wall_rank = 0 if structure.get("wall_pass") is True else 1
-    ext_rank = 0 if structure.get("extension_state") == "acceptable" else 1
-    room_ratio = -(structure.get("room_ratio") or -999999)
-    risk_mid = primary.get("distance_from_target_risk_mid", 999999)
-    ticker_rank = SYMBOL_ORDER.index(item["symbol"]) if item.get("symbol") in SYMBOL_ORDER else 999999
-
-    return (
-        verdict_rank,
-        setup_rank,
-        trend_rank,
-        room_rank,
-        wall_rank,
-        ext_rank,
-        room_ratio,
-        risk_mid,
-        ticker_rank,
-    )
-
-
-def _screened_other_candidates(screened: List[Dict[str, Any]], best_ticker: Optional[str]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for item in screened:
-        if item.get("symbol") == best_ticker:
+        if None in (open_f, high_f, low_f, close_f):
             continue
-        summary = item.get("summary", {})
-        structure = item.get("structure_context", {})
-        out.append(
+
+        candles.append(
             {
-                "symbol": item.get("symbol"),
-                "engine_verdict": summary.get("verdict"),
-                "final_verdict": item.get("final_verdict"),
-                "reason": item.get("reason"),
-                "primary_candidate": summary.get("primary_candidate"),
-                "setup_type": structure.get("setup_type"),
-                "trend_label": structure.get("trend_label"),
-                "room_pass": structure.get("room_pass"),
-                "wall_thesis": structure.get("wall_thesis"),
-                "extension_state": structure.get("extension_state"),
+                "event_symbol": str(event_symbol),
+                "time": ts_int,
+                "time_iso": _iso_from_ms(ts_int),
+                "open": open_f,
+                "high": high_f,
+                "low": low_f,
+                "close": close_f,
             }
         )
-    return out
+
+    return candles
 
 
-async def _screen_one_ticker(
-    summary: Dict[str, Any],
-    option_type: str,
-    token: str,
-    request: OnDemandRequest,
-    market_context: Dict[str, Any],
-    macro_context: Dict[str, Any],
+async def _fetch_dxlink_token(
+    api_base: str,
+    access_token: str,
+    user_agent: str,
 ) -> Dict[str, Any]:
-    symbol = summary.get("symbol")
-    chart_check: Optional[Dict[str, Any]] = None
-    chart_check_error: Optional[str] = None
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{api_base}/api-quote-tokens",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "User-Agent": user_agent,
+                "Accept": "application/json",
+            },
+        )
 
-    if request.include_chart_checks and symbol:
         try:
-            chart_check = await asyncio.wait_for(_build_chart_check_payload(symbol, token), timeout=8.0)
-        except Exception as e:
-            chart_check_error = str(e)
+            payload = resp.json()
+        except Exception:
+            payload = {"raw": resp.text}
 
-    structure_context = _build_structure_context(
-        symbol=symbol or "UNKNOWN",
-        option_type=option_type,
-        chart_check=chart_check,
-        primary_candidate=summary.get("primary_candidate"),
-    ) if symbol else {"ok": False, "why": "no symbol"}
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Quote token request failed: {payload}")
 
-    chart_alignment = _chart_alignment_ok(option_type, chart_check)
-    final_verdict = _final_verdict(
-        request=request,
-        engine_status=summary.get("verdict", "NO_TRADE"),
-        chart_alignment=chart_alignment,
-        market_context=market_context,
-        macro_context=macro_context,
-        structure_context=structure_context,
-    )
+        data = payload.get("data", {})
+        token = data.get("token")
+        dxlink_url = data.get("dxlink-url")
 
-    reason = summary.get("reason", "No summary available.")
-    if structure_context.get("ok"):
-        if structure_context.get("room_pass") is False:
-            reason = "Room to first wall is too tight for SAFE-FAST."
-        elif structure_context.get("wall_pass") is False:
-            reason = "Wall thesis and strike placement do not match."
-        elif structure_context.get("extension_state") == "extended":
-            reason = "Move is extended vs the 1H 50 EMA."
-        elif structure_context.get("allowed_setup") is False:
-            reason = f"Setup type is {structure_context.get('setup_type')}, not tradable now."
-        elif chart_alignment is False:
-            reason = "Price is on the wrong side of the 1H 50 EMA."
+        if not token or not dxlink_url:
+            raise RuntimeError(f"Missing DXLink token fields: {payload}")
 
-    return {
-        "symbol": symbol,
-        "summary": summary,
-        "chart_check": chart_check,
-        "chart_check_error": chart_check_error,
-        "structure_context": structure_context,
-        "final_verdict": final_verdict,
-        "reason": reason,
-    }
-
-
-async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
-    clean_option_type = _clean_option_type(request.option_type)
-    market_context = _market_context_now()
-    macro_context = await _build_macro_context(request.macro_context_requested)
-
-    if request.open_positions < 0 or request.open_positions > 1:
-        raise HTTPException(status_code=400, detail="open_positions must be 0 or 1")
-    if request.weekly_trade_count < 0:
-        raise HTTPException(status_code=400, detail="weekly_trade_count must be >= 0")
-
-    token = await get_access_token()
-    summary_payload = await _build_summary_compact_payload(
-        option_type=clean_option_type,
-        min_dte=request.min_dte,
-        max_dte=request.max_dte,
-        near_limit=request.near_limit,
-        width_min=request.width_min,
-        width_max=request.width_max,
-        risk_min_dollars=request.risk_min_dollars,
-        risk_max_dollars=request.risk_max_dollars,
-        hard_max_dollars=request.hard_max_dollars,
-        allow_fallback=request.allow_fallback,
-        token=token,
-    )
-
-    screened_raw = await asyncio.gather(
-        *[
-            _screen_one_ticker(
-                summary=s,
-                option_type=clean_option_type,
-                token=token,
-                request=request,
-                market_context=market_context,
-                macro_context=macro_context,
-            )
-            for s in summary_payload.get("ticker_summaries", [])
-        ],
-        return_exceptions=True,
-    )
-
-    screened = [x for x in screened_raw if isinstance(x, dict)]
-    screened.sort(key=_screened_sort_key)
-
-    selected = screened[0] if screened else None
-    best_ticker = selected.get("symbol") if selected else None
-    engine_status = selected.get("summary", {}).get("verdict", "NO_TRADE") if selected else "NO_TRADE"
-    final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
-    chart_check = selected.get("chart_check") if selected else None
-    chart_check_error = selected.get("chart_check_error") if selected else None
-    structure_context = selected.get("structure_context") if selected else {"ok": False, "why": "no screened candidates"}
-    selected_reason = selected.get("reason", summary_payload.get("reason", "No summary available.")) if selected else summary_payload.get("reason", "No summary available.")
-
-    if request.include_chart_checks:
-        chart_check_block: Dict[str, Any] = chart_check if chart_check else {
-            "ok": False,
-            "symbol": best_ticker,
-            "error": chart_check_error or "Chart check unavailable in this run.",
-        }
-    else:
-        chart_check_block = {
-            "ok": False,
-            "symbol": best_ticker,
-            "status": "skipped",
-            "message": "Chart checks were not requested.",
+        return {
+            "token": token,
+            "dxlink_url": dxlink_url,
+            "payload": payload,
         }
 
-    if isinstance(chart_check_block, dict) and chart_check_block.get("_all_candles") is not None:
-        chart_check_block = {k: v for k, v in chart_check_block.items() if k != "_all_candles"}
+
+async def get_1h_ema50_snapshot(
+    symbol: str,
+    access_token: str,
+    api_base: str,
+    user_agent: str,
+    days_back: int = 14,
+) -> Dict[str, Any]:
+    token_info = await _fetch_dxlink_token(
+        api_base=api_base,
+        access_token=access_token,
+        user_agent=user_agent,
+    )
+
+    candle_symbol = f"{symbol}{{=1h,tho=true}}"
+    from_time_ms = int((time.time() - (days_back * 24 * 60 * 60)) * 1000)
+
+    seen_by_time: Dict[int, Dict[str, Any]] = {}
+    last_raw_message: Optional[Dict[str, Any]] = None
+
+    async with websockets.connect(
+        token_info["dxlink_url"],
+        open_timeout=20,
+        close_timeout=5,
+        max_size=10_000_000,
+    ) as ws:
+        await _send_json(
+            ws,
+            {
+                "type": "SETUP",
+                "channel": 0,
+                "keepaliveTimeout": 60,
+                "acceptKeepaliveTimeout": 60,
+                "version": "safe-fast-python-dxlink/0.2",
+            },
+        )
+
+        for _ in range(2):
+            try:
+                await _recv_json(ws, timeout=0.5)
+            except Exception:
+                break
+
+        await _send_json(
+            ws,
+            {
+                "type": "AUTH",
+                "channel": 0,
+                "token": token_info["token"],
+            },
+        )
+
+        auth_state = await _wait_for_message(ws, wanted_type="AUTH_STATE", channel=0, timeout=10.0)
+        if auth_state.get("state") != "AUTHORIZED":
+            raise RuntimeError(f"DXLink auth failed: {auth_state}")
+
+        await _send_json(
+            ws,
+            {
+                "type": "CHANNEL_REQUEST",
+                "channel": 1,
+                "service": "FEED",
+                "parameters": {"contract": "AUTO"},
+            },
+        )
+
+        await _wait_for_message(ws, wanted_type="CHANNEL_OPENED", channel=1, timeout=10.0)
+
+        await _send_json(
+            ws,
+            {
+                "type": "FEED_SETUP",
+                "channel": 1,
+                "acceptAggregationPeriod": 1,
+                "acceptDataFormat": "COMPACT",
+                "acceptEventFields": {
+                    "Candle": [
+                        "eventSymbol",
+                        "time",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                    ]
+                },
+            },
+        )
+
+        try:
+            await _wait_for_message(ws, wanted_type="FEED_CONFIG", channel=1, timeout=5.0)
+        except Exception:
+            pass
+
+        await _send_json(
+            ws,
+            {
+                "type": "FEED_SUBSCRIPTION",
+                "channel": 1,
+                "add": [
+                    {
+                        "type": "Candle",
+                        "symbol": candle_symbol,
+                        "fromTime": from_time_ms,
+                    }
+                ],
+            },
+        )
+
+        deadline = time.monotonic() + 8.0
+        last_new_data_at: Optional[float] = None
+
+        while time.monotonic() < deadline:
+            try:
+                msg = await _recv_json(ws, timeout=1.0)
+            except asyncio.TimeoutError:
+                if len(seen_by_time) >= 50 and last_new_data_at is not None:
+                    if (time.monotonic() - last_new_data_at) >= 1.0:
+                        break
+                continue
+
+            last_raw_message = msg
+
+            if msg.get("type") == "ERROR":
+                raise RuntimeError(f"DXLink feed error: {msg}")
+
+            if msg.get("type") != "FEED_DATA":
+                continue
+
+            candles = _parse_candle_feed_data(msg)
+            if not candles:
+                continue
+
+            for candle in candles:
+                seen_by_time[candle["time"]] = candle
+
+            last_new_data_at = time.monotonic()
+
+    candle_list = sorted(seen_by_time.values(), key=lambda x: x["time"])
+
+    if not candle_list:
+        raise RuntimeError(
+            f"No candle data returned for {symbol}. Last message: {last_raw_message}"
+        )
+
+    closes = [c["close"] for c in candle_list]
+    ema50 = _compute_ema(closes, 50)
+    latest = candle_list[-1]
+    latest_close = latest["close"]
+
+    if ema50 is None:
+        raise RuntimeError("Could not compute EMA50")
 
     return {
         "ok": True,
-        "mode": "on_demand",
-        "source_of_truth": "candidate_engine",
-        "engine_status": engine_status,
-        "final_verdict": final_verdict,
-        "best_ticker": best_ticker,
-        "engine_best_ticker": summary_payload.get("best_ticker"),
-        "market_context": market_context,
-        "macro_context": macro_context,
-        "structure_context": structure_context,
-        "other_ticker_candidates": _screened_other_candidates(screened, best_ticker),
-        "request": request.model_dump(),
-        "candidate_engine": summary_payload,
-        "chart_check": chart_check_block,
-        "chart_confirmation": _build_chart_confirmation_block(
-            request=request,
-            chart_check=chart_check,
-            chart_check_error=chart_check_error,
-            structure_context=structure_context,
-        ),
-        "user_facing": _build_user_facing_block(
-            request=request,
-            engine_status=engine_status,
-            final_verdict=final_verdict,
-            best_ticker=best_ticker,
-            chart_check=chart_check,
-            chart_check_error=chart_check_error,
-            engine_reason=selected_reason,
-            market_context=market_context,
-            macro_context=macro_context,
-            structure_context=structure_context,
-        ),
+        "source": "dxlink",
+        "symbol": symbol,
+        "candle_symbol": candle_symbol,
+        "history_days_requested": days_back,
+        "candle_count": len(candle_list),
+        "ema_length": 50,
+        "ema50_1h": ema50,
+        "latest_close": latest_close,
+        "price_vs_ema50_1h": "above" if latest_close > ema50 else "below" if latest_close < ema50 else "at",
+        "latest_candle_time": latest["time_iso"],
+        "recent_candles": candle_list[-10:],
+        "all_candles": candle_list,
     }
-
-@app.get("/")
-
-def root() -> Dict[str, Any]:
-    return {"status": "ok", "service": "safe-fast-backend"}
-
-
-@app.get("/health")
-def health() -> Dict[str, bool]:
-    return {"ok": True}
-
-
-@app.get("/tt/safe-fast-summary-compact")
-async def tt_safe_fast_summary_compact(
-    option_type: str = Query("C"),
-    min_dte: int = Query(14),
-    max_dte: int = Query(30),
-    near_limit: int = Query(16),
-    width_min: float = Query(5.0),
-    width_max: float = Query(10.0),
-    risk_min_dollars: float = Query(250.0),
-    risk_max_dollars: float = Query(300.0),
-    hard_max_dollars: float = Query(400.0),
-    allow_fallback: bool = Query(True),
-) -> Any:
-    token = await get_access_token()
-    return await _build_summary_compact_payload(
-        option_type=option_type,
-        min_dte=min_dte,
-        max_dte=max_dte,
-        near_limit=near_limit,
-        width_min=width_min,
-        width_max=width_max,
-        risk_min_dollars=risk_min_dollars,
-        risk_max_dollars=risk_max_dollars,
-        hard_max_dollars=hard_max_dollars,
-        allow_fallback=allow_fallback,
-        token=token,
-    )
-
-
-@app.get("/tt/safe-fast-chart-check")
-async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
-    clean_symbol = _clean_symbol(symbol)
-    token = await get_access_token()
-    try:
-        return await _build_chart_check_payload(clean_symbol, token)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-@app.post("/safe-fast/on-demand")
-async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
-    return await _build_on_demand_payload(request)
