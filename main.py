@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -25,6 +26,10 @@ ALLOWED_SYMBOLS = {"SPY", "QQQ", "IWM", "GLD"}
 SYMBOL_ORDER = ["SPY", "QQQ", "IWM", "GLD"]
 
 NY_TZ = ZoneInfo("America/New_York")
+
+_MACRO_CACHE: Dict[str, Any] = {"ts": None, "payload": None}
+_CHART_CACHE: Dict[str, Dict[str, Any]] = {}
+
 
 
 class OnDemandRequest(BaseModel):
@@ -255,22 +260,28 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
         }
 
     now_et = datetime.now(NY_TZ)
+    cached_ts = _MACRO_CACHE.get("ts")
+    cached_payload = _MACRO_CACHE.get("payload")
+    if cached_ts and cached_payload and (now_et - cached_ts).total_seconds() < 300:
+        return cached_payload
+
     today = now_et.date()
     tomorrow = today + timedelta(days=1)
     hold_window = {d.isoformat() for d in _next_trading_days(now_et, 3)}
 
-    events: List[Dict[str, Any]] = []
     warnings: List[str] = []
+    results = await asyncio.gather(
+        _fetch_fomc_events(now_et),
+        _fetch_bls_events(now_et),
+        return_exceptions=True,
+    )
 
-    try:
-        events.extend(await _fetch_fomc_events(now_et))
-    except Exception as e:
-        warnings.append(f"FOMC source unavailable: {e}")
-
-    try:
-        events.extend(await _fetch_bls_events(now_et))
-    except Exception as e:
-        warnings.append(f"BLS source unavailable: {e}")
+    events: List[Dict[str, Any]] = []
+    for label, result in zip(("FOMC", "BLS"), results):
+        if isinstance(result, Exception):
+            warnings.append(f"{label} source unavailable: {result}")
+        else:
+            events.extend(result)
 
     deduped: List[Dict[str, Any]] = []
     seen = set()
@@ -280,14 +291,15 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
             seen.add(key)
             deduped.append(ev)
 
-    has_today = any(ev["date"] == today.isoformat() and ev["major"] for ev in deduped)
-    has_tomorrow = any(ev["date"] == tomorrow.isoformat() and ev["major"] for ev in deduped)
-    in_hold_window = [ev for ev in deduped if ev["date"] in hold_window and ev["major"]]
+    visible_events = [ev for ev in deduped if ev["date"] in hold_window]
+    has_today = any(ev["date"] == today.isoformat() and ev["major"] for ev in visible_events)
+    has_tomorrow = any(ev["date"] == tomorrow.isoformat() and ev["major"] for ev in visible_events)
+    in_hold_window = [ev for ev in visible_events if ev["major"]]
 
     if in_hold_window:
         risk_level = "high"
         note = "Major macro event is inside the next 3 trading days."
-    elif deduped:
+    elif visible_events or deduped:
         risk_level = "normal"
         note = "No major macro event found inside the next 3 trading days."
     else:
@@ -297,23 +309,26 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
     if warnings:
         note = f"{note} Warnings: {' | '.join(warnings)}"
 
-    return {
+    payload = {
         "ok": True,
         "requested": True,
         "has_major_event_today": has_today,
         "has_major_event_tomorrow": has_tomorrow,
-        "events": deduped,
+        "events": visible_events,
         "risk_level": risk_level,
         "note": note,
         "as_of_et": now_et.isoformat(timespec="seconds"),
     }
+    _MACRO_CACHE["ts"] = now_et
+    _MACRO_CACHE["payload"] = payload
+    return payload
 
 
 async def get_access_token() -> str:
     if not all([TT_CLIENT_ID, TT_CLIENT_SECRET, TT_REDIRECT_URI, TT_REFRESH_TOKEN]):
         raise HTTPException(status_code=500, detail="Missing TT OAuth environment variables")
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             f"{API_BASE}/oauth/token",
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -342,7 +357,7 @@ async def get_access_token() -> str:
 
 
 async def _fetch_option_chain(symbol: str, token: str) -> Any:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             f"{API_BASE}/option-chains/{symbol}",
             headers=_headers(token),
@@ -360,7 +375,7 @@ async def _fetch_option_chain(symbol: str, token: str) -> Any:
 
 
 async def _fetch_quotes(symbols: List[str], token: str) -> Any:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             f"{API_BASE}/market-data",
             headers=_headers(token),
@@ -382,7 +397,7 @@ async def _fetch_option_quotes(option_symbols: List[str], token: str) -> Any:
     if not option_symbols:
         return {"data": {"items": []}}
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             f"{API_BASE}/market-data/by-type",
             headers=_headers(token),
@@ -763,24 +778,28 @@ async def _build_summary_compact_payload(
     token: str,
 ) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(option_type)
-    ticker_summaries = []
 
-    for symbol in SYMBOL_ORDER:
-        summary = await _build_ticker_summary(
-            symbol=symbol,
-            option_type=clean_option_type,
-            min_dte=min_dte,
-            max_dte=max_dte,
-            near_limit=near_limit,
-            width_min=width_min,
-            width_max=width_max,
-            risk_min_dollars=risk_min_dollars,
-            risk_max_dollars=risk_max_dollars,
-            hard_max_dollars=hard_max_dollars,
-            allow_fallback=allow_fallback,
-            token=token,
+    ticker_summaries = list(
+        await asyncio.gather(
+            *[
+                _build_ticker_summary(
+                    symbol=symbol,
+                    option_type=clean_option_type,
+                    min_dte=min_dte,
+                    max_dte=max_dte,
+                    near_limit=near_limit,
+                    width_min=width_min,
+                    width_max=width_max,
+                    risk_min_dollars=risk_min_dollars,
+                    risk_max_dollars=risk_max_dollars,
+                    hard_max_dollars=hard_max_dollars,
+                    allow_fallback=allow_fallback,
+                    token=token,
+                )
+                for symbol in SYMBOL_ORDER
+            ]
         )
-        ticker_summaries.append(summary)
+    )
 
     ranked = _rank_ticker_summaries(ticker_summaries)
     best_summary = ranked[0] if ranked else None
@@ -801,6 +820,11 @@ async def _build_summary_compact_payload(
 
 
 async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
+    now_et = datetime.now(NY_TZ)
+    cached = _CHART_CACHE.get(symbol)
+    if cached and (now_et - cached["ts"]).total_seconds() < 60:
+        return cached["payload"]
+
     snapshot = await get_1h_ema50_snapshot(
         symbol=symbol,
         access_token=token,
@@ -808,7 +832,7 @@ async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
         user_agent=USER_AGENT,
         days_back=14,
     )
-    return {
+    payload = {
         "ok": True,
         "symbol": symbol,
         "latest_close": snapshot["latest_close"],
@@ -816,9 +840,10 @@ async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
         "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
         "latest_candle_time": snapshot["latest_candle_time"],
         "candle_count": snapshot["candle_count"],
-        "recent_candles": snapshot.get("recent_candles", []),
         "_all_candles": snapshot.get("all_candles", []),
     }
+    _CHART_CACHE[symbol] = {"ts": now_et, "payload": payload}
+    return payload
 
 
 def _calc_ema(values: List[float], length: int) -> Optional[float]:
@@ -1353,6 +1378,118 @@ def _build_user_facing_block(
 
 
 
+
+
+def _screened_sort_key(item: Dict[str, Any]) -> Any:
+    structure = item.get("structure_context", {})
+    primary = item.get("primary_candidate") or {}
+    final_verdict = item.get("final_verdict", "NO_TRADE")
+
+    verdict_rank = {"PENDING": 0, "NO_TRADE": 1}.get(final_verdict, 2)
+    setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
+    room_rank = 0 if structure.get("room_pass") is True else 1
+    wall_rank = 0 if structure.get("wall_pass") is True else 1
+    ext_rank = 0 if structure.get("extension_state") == "acceptable" else 1
+    trend_rank = 0 if structure.get("trend_label") == "Trend-aligned" else 1 if structure.get("trend_label") == "Countertrend" else 2
+    room_ratio = -(structure.get("room_ratio") or -999999)
+    risk_mid = primary.get("distance_from_target_risk_mid", 999999)
+    ticker_rank = SYMBOL_ORDER.index(item["symbol"]) if item.get("symbol") in SYMBOL_ORDER else 999999
+
+    return (
+        verdict_rank,
+        setup_rank,
+        room_rank,
+        wall_rank,
+        ext_rank,
+        trend_rank,
+        room_ratio,
+        risk_mid,
+        ticker_rank,
+    )
+
+
+def _screened_other_candidates(screened: List[Dict[str, Any]], best_ticker: Optional[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in screened:
+        if item.get("symbol") == best_ticker:
+            continue
+        out.append(
+            {
+                "symbol": item.get("symbol"),
+                "engine_verdict": item.get("engine_verdict"),
+                "final_verdict": item.get("final_verdict"),
+                "reason": item.get("reason"),
+                "primary_candidate": item.get("primary_candidate"),
+                "structure_context": item.get("structure_context"),
+            }
+        )
+    return out
+
+
+async def _screen_ticker_candidate(
+    summary: Dict[str, Any],
+    option_type: str,
+    token: str,
+    request: OnDemandRequest,
+    market_context: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    include_chart_checks: bool,
+) -> Dict[str, Any]:
+    symbol = summary.get("symbol")
+    primary_candidate = summary.get("primary_candidate")
+    chart_check: Optional[Dict[str, Any]] = None
+    chart_check_error: Optional[str] = None
+
+    if include_chart_checks and symbol and primary_candidate:
+        try:
+            chart_check = await asyncio.wait_for(_build_chart_check_payload(symbol, token), timeout=8.0)
+        except Exception as e:
+            chart_check_error = str(e)
+
+    structure_context = _build_structure_context(
+        symbol=symbol or "UNKNOWN",
+        option_type=option_type,
+        chart_check=chart_check,
+        primary_candidate=primary_candidate,
+    ) if symbol else {"ok": False, "why": "no symbol"}
+
+    chart_alignment = _chart_alignment_ok(option_type, chart_check)
+    final_verdict = _final_verdict(
+        request=request,
+        engine_status=summary.get("verdict", "NO_TRADE"),
+        chart_alignment=chart_alignment,
+        market_context=market_context,
+        macro_context=macro_context,
+        structure_context=structure_context,
+    )
+
+    reason = summary.get("reason", "No summary available.")
+    if structure_context.get("ok"):
+        if structure_context.get("room_pass") is False:
+            reason = "Room to first wall is too tight for SAFE-FAST."
+        elif structure_context.get("wall_pass") is False:
+            reason = "Wall thesis and strike placement do not match."
+        elif structure_context.get("extension_state") == "extended":
+            reason = "Move is too extended from the 1H 50 EMA."
+        elif structure_context.get("allowed_setup") is False:
+            reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
+        elif chart_alignment is False:
+            reason = "Price is on the wrong side of the 1H 50 EMA."
+
+    return {
+        "symbol": symbol,
+        "engine_verdict": summary.get("verdict"),
+        "final_verdict": final_verdict,
+        "reason": reason,
+        "primary_candidate": primary_candidate,
+        "backup_candidate": summary.get("backup_candidate"),
+        "summary": summary,
+        "chart_check": chart_check,
+        "chart_check_error": chart_check_error,
+        "structure_context": structure_context,
+    }
+
+
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
@@ -1378,34 +1515,64 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         token=token,
     )
 
-    best_ticker = summary_payload.get("best_ticker")
-    engine_status = summary_payload.get("verdict", "NO_TRADE")
-    primary_candidate = summary_payload.get("primary_candidate")
-    chart_check: Optional[Dict[str, Any]] = None
-    chart_check_error: Optional[str] = None
-
-    if request.include_chart_checks and best_ticker:
-        try:
-            chart_check = await _build_chart_check_payload(best_ticker, token)
-        except Exception as e:
-            chart_check_error = str(e)
-
-    structure_context = _build_structure_context(
-        symbol=best_ticker or "UNKNOWN",
-        option_type=clean_option_type,
-        chart_check=chart_check,
-        primary_candidate=primary_candidate,
-    ) if best_ticker else {"ok": False, "why": "no best ticker"}
-
-    chart_alignment = _chart_alignment_ok(clean_option_type, chart_check)
-    final_verdict = _final_verdict(
-        request=request,
-        engine_status=engine_status,
-        chart_alignment=chart_alignment,
-        market_context=market_context,
-        macro_context=macro_context,
-        structure_context=structure_context,
+    engine_ranked = sorted(
+        summary_payload.get("ticker_summaries", []),
+        key=lambda s: (
+            {"ACTIVE_NOW": 0, "PENDING": 1, "NO_TRADE": 2}.get(s.get("verdict", "NO_TRADE"), 3),
+            (s.get("primary_candidate") or {}).get("distance_from_target_risk_mid", 999999),
+            SYMBOL_ORDER.index(s.get("symbol")) if s.get("symbol") in SYMBOL_ORDER else 999999,
+        ),
     )
+
+    screened_candidates: List[Dict[str, Any]] = []
+    selected: Optional[Dict[str, Any]] = None
+
+    for summary in engine_ranked:
+        try:
+            screened = await asyncio.wait_for(
+                _screen_ticker_candidate(
+                    summary=summary,
+                    option_type=clean_option_type,
+                    token=token,
+                    request=request,
+                    market_context=market_context,
+                    macro_context=macro_context,
+                    include_chart_checks=request.include_chart_checks,
+                ),
+                timeout=6.0,
+            )
+        except Exception as e:
+            screened = {
+                "symbol": summary.get("symbol"),
+                "engine_verdict": summary.get("verdict"),
+                "final_verdict": "NO_TRADE",
+                "reason": f"screen failed: {e}",
+                "primary_candidate": summary.get("primary_candidate"),
+                "backup_candidate": summary.get("backup_candidate"),
+                "summary": summary,
+                "chart_check": None,
+                "chart_check_error": str(e),
+                "structure_context": {"ok": False, "why": str(e)},
+            }
+
+        screened_candidates.append(screened)
+
+        if screened.get("final_verdict") != "NO_TRADE":
+            selected = screened
+            break
+
+    if selected is None and screened_candidates:
+        screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
+        selected = screened_candidates[0]
+
+    best_ticker = selected.get("symbol") if selected else None
+    engine_status = selected.get("engine_verdict", "NO_TRADE") if selected else "NO_TRADE"
+    final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
+    primary_candidate = selected.get("primary_candidate") if selected else None
+    chart_check = selected.get("chart_check") if selected else None
+    chart_check_error = selected.get("chart_check_error") if selected else None
+    structure_context = selected.get("structure_context") if selected else {"ok": False, "why": "no screened candidates"}
+    selected_reason = selected.get("reason", summary_payload.get("reason", "No summary available.")) if selected else summary_payload.get("reason", "No summary available.")
 
     if request.include_chart_checks:
         chart_check_block: Dict[str, Any] = chart_check if chart_check else {
@@ -1421,10 +1588,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             "message": "Chart checks were not requested.",
         }
 
-    # remove internal candle payload from external response
-    if chart_check_block.get("_all_candles") is not None:
-        chart_check_block = {k: v for k, v in chart_check_block.items() if k != "_all_candles"}
-
     return {
         "ok": True,
         "mode": "on_demand",
@@ -1432,10 +1595,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "engine_status": engine_status,
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
+        "engine_best_ticker": summary_payload.get("best_ticker"),
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
-        "other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
+        "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
         "request": request.model_dump(),
         "candidate_engine": summary_payload,
         "chart_check": chart_check_block,
@@ -1452,7 +1616,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             best_ticker=best_ticker,
             chart_check=chart_check,
             chart_check_error=chart_check_error,
-            engine_reason=summary_payload.get("reason", "No summary available."),
+            engine_reason=selected_reason,
             market_context=market_context,
             macro_context=macro_context,
             structure_context=structure_context,
