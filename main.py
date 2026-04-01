@@ -1,4 +1,6 @@
 import os
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional
 
 import httpx
@@ -11,7 +13,42 @@ app = FastAPI()
 
 ALLOWED_SYMBOLS = {"SPY", "QQQ", "IWM", "GLD"}
 SYMBOL_ORDER = ["SPY", "QQQ", "IWM", "GLD"]
+NY_TZ = ZoneInfo("America/New_York")
 
+
+def _market_context_now() -> Dict[str, Any]:
+    now_et = datetime.now(NY_TZ)
+    is_weekday = now_et.weekday() < 5
+    in_regular_session = time(9, 30) <= now_et.time() < time(16, 0)
+    is_open = is_weekday and in_regular_session
+
+    return {
+        "is_open": is_open,
+        "as_of_et": now_et.isoformat(timespec="seconds"),
+        "session": "regular" if is_open else "closed",
+    }
+
+
+def _other_ticker_candidates(
+    summary_payload: Dict[str, Any],
+    best_ticker: Optional[str],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+
+    for s in summary_payload.get("ticker_summaries", []):
+        if s.get("symbol") == best_ticker:
+            continue
+
+        out.append(
+            {
+                "symbol": s.get("symbol"),
+                "verdict": s.get("verdict"),
+                "reason": s.get("reason"),
+                "primary_candidate": s.get("primary_candidate"),
+            }
+        )
+
+    return out
 
 class OnDemandRequest(BaseModel):
     option_type: str = "C"
@@ -586,8 +623,17 @@ def _chart_alignment_ok(option_type: str, chart_check: Optional[Dict[str, Any]])
     return side == "above" if option_type == "C" else side == "below"
 
 
-def _final_verdict(request: OnDemandRequest, engine_status: str, chart_alignment: Optional[bool]) -> str:
-    if request.open_positions > 0 or request.weekly_trade_count >= 4:
+def _final_verdict(
+    request: OnDemandRequest,
+    engine_status: str,
+    chart_alignment: Optional[bool],
+    market_context: Dict[str, Any],
+) -> str:
+    if request.open_positions > 0:
+        return "NO_TRADE"
+    if request.weekly_trade_count >= 4:
+        return "NO_TRADE"
+    if not market_context["is_open"]:
         return "NO_TRADE"
     if engine_status == "NO_TRADE":
         return "NO_TRADE"
