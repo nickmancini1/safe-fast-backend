@@ -175,14 +175,60 @@ def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any
         "short_leg_width": candidate.get("short_leg_width"),
         "long_leg_width_pct_of_mid": candidate.get("long_leg_width_pct_of_mid"),
         "short_leg_width_pct_of_mid": candidate.get("short_leg_width_pct_of_mid"),
+        "long_iv": candidate.get("long_iv"),
+        "short_iv": candidate.get("short_iv"),
+        "long_bid_iv": candidate.get("long_bid_iv"),
+        "long_ask_iv": candidate.get("long_ask_iv"),
+        "short_bid_iv": candidate.get("short_bid_iv"),
+        "short_ask_iv": candidate.get("short_ask_iv"),
+        "iv_source": candidate.get("iv_source"),
     }
 
 
-def _build_iv_context() -> Dict[str, Any]:
+def _build_iv_context(primary_candidate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not primary_candidate:
+        return {
+            "ok": False,
+            "status": "unconfirmed",
+            "why": "No primary candidate is available for IV evaluation.",
+        }
+
+    long_iv = _to_float(primary_candidate.get("long_iv"))
+    short_iv = _to_float(primary_candidate.get("short_iv"))
+    long_bid_iv = _to_float(primary_candidate.get("long_bid_iv"))
+    long_ask_iv = _to_float(primary_candidate.get("long_ask_iv"))
+    short_bid_iv = _to_float(primary_candidate.get("short_bid_iv"))
+    short_ask_iv = _to_float(primary_candidate.get("short_ask_iv"))
+
+    available_mid_ivs = [value for value in [long_iv, short_iv] if value is not None]
+    spread_mid_iv = round(sum(available_mid_ivs) / len(available_mid_ivs), 6) if available_mid_ivs else None
+
+    if spread_mid_iv is None and all(v is not None for v in [long_bid_iv, long_ask_iv, short_bid_iv, short_ask_iv]):
+        spread_mid_iv = round((long_bid_iv + long_ask_iv + short_bid_iv + short_ask_iv) / 4.0, 6)
+
+    if spread_mid_iv is None:
+        return {
+            "ok": False,
+            "status": "unconfirmed",
+            "why": "Option quote payload did not include usable IV fields.",
+            "source": None,
+            "spread_mid_iv": None,
+            "long_leg_iv": _round_or_none(long_iv, 6),
+            "short_leg_iv": _round_or_none(short_iv, 6),
+        }
+
     return {
-        "ok": False,
-        "status": "unconfirmed",
-        "why": "IV source is not wired into this build yet.",
+        "ok": True,
+        "status": "confirmed",
+        "source": primary_candidate.get("iv_source") or "option_quote_fields",
+        "spread_mid_iv": _round_or_none(spread_mid_iv, 6),
+        "long_leg_iv": _round_or_none(long_iv, 6),
+        "short_leg_iv": _round_or_none(short_iv, 6),
+        "long_leg_bid_iv": _round_or_none(long_bid_iv, 6),
+        "long_leg_ask_iv": _round_or_none(long_ask_iv, 6),
+        "short_leg_bid_iv": _round_or_none(short_bid_iv, 6),
+        "short_leg_ask_iv": _round_or_none(short_ask_iv, 6),
+        "why": "IV fields were sourced from option quote data for the selected spread.",
     }
 
 
@@ -621,6 +667,7 @@ def _merge_quotes_into_contracts(
     merged: List[Dict[str, Any]] = []
     for contract in near_contracts:
         quote = quote_map.get(contract["symbol"], {})
+        iv_fields = _extract_option_iv_fields(quote)
         merged.append(
             {
                 **contract,
@@ -629,6 +676,10 @@ def _merge_quotes_into_contracts(
                 "mid": quote.get("mid"),
                 "mark": quote.get("mark"),
                 "last": quote.get("last"),
+                "iv_mid": iv_fields.get("iv_mid"),
+                "iv_bid": iv_fields.get("iv_bid"),
+                "iv_ask": iv_fields.get("iv_ask"),
+                "iv_source": iv_fields.get("iv_source"),
             }
         )
 
@@ -757,6 +808,13 @@ def _generate_debit_spread_candidates(
                     "short_leg_width": _round_or_none(short_leg_width),
                     "long_leg_width_pct_of_mid": _calc_pct_of_mid(long_bid, long_ask, long_mid),
                     "short_leg_width_pct_of_mid": _calc_pct_of_mid(short_bid, short_ask, short_mid),
+                    "long_iv": long_leg.get("iv_mid"),
+                    "short_iv": short_leg.get("iv_mid"),
+                    "long_bid_iv": long_leg.get("iv_bid"),
+                    "long_ask_iv": long_leg.get("iv_ask"),
+                    "short_bid_iv": short_leg.get("iv_bid"),
+                    "short_ask_iv": short_leg.get("iv_ask"),
+                    "iv_source": long_leg.get("iv_source") or short_leg.get("iv_source"),
                 }
             )
 
@@ -2117,7 +2175,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "macro_context": macro_context,
         "structure_context": structure_context,
         "time_day_gate": time_day_gate,
-        "iv_context": _build_iv_context(),
+        "iv_context": _build_iv_context(primary_candidate),
         "liquidity_context": liquidity_context,
         "trigger_state": trigger_state,
         "targets": _build_targets_block(primary_candidate),
