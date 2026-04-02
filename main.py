@@ -1,3 +1,4 @@
+
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -88,6 +89,100 @@ def _best_price(contract: Dict[str, Any]) -> Optional[float]:
         if value is not None:
             return value
     return None
+
+def _round_or_none(value: Optional[float], places: int = 4) -> Optional[float]:
+    if value is None:
+        return None
+    return round(value, places)
+
+
+def _calc_pct_of_mid(bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> Optional[float]:
+    if bid is None or ask is None or mid in (None, 0):
+        return None
+    return round(((ask - bid) / mid) * 100, 3)
+
+
+def _classify_liquidity(
+    entry_slippage_vs_mid: Optional[float],
+    long_leg_width_pct_of_mid: Optional[float],
+    short_leg_width_pct_of_mid: Optional[float],
+) -> Dict[str, Any]:
+    if (
+        entry_slippage_vs_mid is None
+        or long_leg_width_pct_of_mid is None
+        or short_leg_width_pct_of_mid is None
+    ):
+        return {
+            "label": "unconfirmed",
+            "liquidity_pass": None,
+            "why": "Quotes did not provide enough bid/ask detail to confirm liquidity.",
+        }
+
+    if (
+        entry_slippage_vs_mid <= 0.15
+        and long_leg_width_pct_of_mid <= 12
+        and short_leg_width_pct_of_mid <= 12
+    ):
+        return {
+            "label": "tight",
+            "liquidity_pass": True,
+            "why": "Bid/ask widths and entry slippage are tight enough for a defined-risk debit spread.",
+        }
+
+    if (
+        entry_slippage_vs_mid <= 0.30
+        and long_leg_width_pct_of_mid <= 20
+        and short_leg_width_pct_of_mid <= 20
+    ):
+        return {
+            "label": "acceptable",
+            "liquidity_pass": True,
+            "why": "Bid/ask widths are workable, but not especially tight.",
+        }
+
+    return {
+        "label": "wide",
+        "liquidity_pass": False,
+        "why": "Bid/ask widths or entry slippage are too wide for a clean SAFE-FAST debit spread entry.",
+    }
+
+
+def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not candidate:
+        return {
+            "ok": False,
+            "status": "unconfirmed",
+            "why": "No candidate available.",
+        }
+
+    label_ctx = _classify_liquidity(
+        candidate.get("entry_slippage_vs_mid"),
+        candidate.get("long_leg_width_pct_of_mid"),
+        candidate.get("short_leg_width_pct_of_mid"),
+    )
+
+    return {
+        "ok": True,
+        "status": label_ctx["label"],
+        "liquidity_pass": label_ctx["liquidity_pass"],
+        "why": label_ctx["why"],
+        "mid_debit": candidate.get("est_debit"),
+        "natural_debit": candidate.get("natural_debit"),
+        "entry_slippage_vs_mid": candidate.get("entry_slippage_vs_mid"),
+        "spread_market_width": candidate.get("spread_market_width"),
+        "long_leg_width": candidate.get("long_leg_width"),
+        "short_leg_width": candidate.get("short_leg_width"),
+        "long_leg_width_pct_of_mid": candidate.get("long_leg_width_pct_of_mid"),
+        "short_leg_width_pct_of_mid": candidate.get("short_leg_width_pct_of_mid"),
+    }
+
+
+def _build_iv_context() -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "unconfirmed",
+        "why": "IV source is not wired into this build yet.",
+    }
 
 
 def _market_context_now() -> Dict[str, Any]:
@@ -599,6 +694,37 @@ def _generate_debit_spread_candidates(
 
             long_strike = _to_float(long_leg.get("strike_price")) or 0.0
 
+            long_bid = _to_float(long_leg.get("bid"))
+            long_ask = _to_float(long_leg.get("ask"))
+            long_mid = _to_float(long_leg.get("mid")) or _to_float(long_leg.get("mark"))
+            short_bid = _to_float(short_leg.get("bid"))
+            short_ask = _to_float(short_leg.get("ask"))
+            short_mid = _to_float(short_leg.get("mid")) or _to_float(short_leg.get("mark"))
+
+            natural_debit = None
+            if long_ask is not None and short_bid is not None:
+                natural_debit = round(long_ask - short_bid, 4)
+
+            bid_debit = None
+            if long_bid is not None and short_ask is not None:
+                bid_debit = round(long_bid - short_ask, 4)
+
+            spread_market_width = None
+            if natural_debit is not None and bid_debit is not None:
+                spread_market_width = round(natural_debit - bid_debit, 4)
+
+            entry_slippage_vs_mid = None
+            if natural_debit is not None:
+                entry_slippage_vs_mid = round(max(natural_debit - est_debit, 0.0), 4)
+
+            long_leg_width = None
+            if long_bid is not None and long_ask is not None:
+                long_leg_width = round(long_ask - long_bid, 4)
+
+            short_leg_width = None
+            if short_bid is not None and short_ask is not None:
+                short_leg_width = round(short_ask - short_bid, 4)
+
             candidates.append(
                 {
                     "long_symbol": long_leg.get("symbol"),
@@ -616,6 +742,20 @@ def _generate_debit_spread_candidates(
                     "fits_risk_budget": preferred_risk_band_pass and within_hard_max,
                     "long_distance_from_underlying": round(abs(long_strike - underlying_price), 4),
                     "distance_from_target_risk_mid": round(abs(max_loss_dollars_1lot - target_risk_mid), 2),
+                    "long_bid": _round_or_none(long_bid),
+                    "long_ask": _round_or_none(long_ask),
+                    "long_mid": _round_or_none(long_mid),
+                    "short_bid": _round_or_none(short_bid),
+                    "short_ask": _round_or_none(short_ask),
+                    "short_mid": _round_or_none(short_mid),
+                    "natural_debit": _round_or_none(natural_debit),
+                    "bid_debit": _round_or_none(bid_debit),
+                    "spread_market_width": _round_or_none(spread_market_width),
+                    "entry_slippage_vs_mid": _round_or_none(entry_slippage_vs_mid),
+                    "long_leg_width": _round_or_none(long_leg_width),
+                    "short_leg_width": _round_or_none(short_leg_width),
+                    "long_leg_width_pct_of_mid": _calc_pct_of_mid(long_bid, long_ask, long_mid),
+                    "short_leg_width_pct_of_mid": _calc_pct_of_mid(short_bid, short_ask, short_mid),
                 }
             )
 
@@ -675,6 +815,14 @@ def _compact_candidate(candidate: Optional[Dict[str, Any]]) -> Optional[Dict[str
         "feasibility_pass": candidate.get("feasibility_pass"),
         "fits_risk_budget": candidate.get("fits_risk_budget"),
         "distance_from_target_risk_mid": candidate.get("distance_from_target_risk_mid"),
+        "natural_debit": candidate.get("natural_debit"),
+        "bid_debit": candidate.get("bid_debit"),
+        "spread_market_width": candidate.get("spread_market_width"),
+        "entry_slippage_vs_mid": candidate.get("entry_slippage_vs_mid"),
+        "long_leg_width": candidate.get("long_leg_width"),
+        "short_leg_width": candidate.get("short_leg_width"),
+        "long_leg_width_pct_of_mid": candidate.get("long_leg_width_pct_of_mid"),
+        "short_leg_width_pct_of_mid": candidate.get("short_leg_width_pct_of_mid"),
     }
 
 
@@ -1653,6 +1801,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "macro_context": macro_context,
         "structure_context": structure_context,
         "time_day_gate": time_day_gate,
+        "iv_context": _build_iv_context(),
+        "liquidity_context": _build_liquidity_block(summary_payload.get("primary_candidate")),
         "targets": _build_targets_block(summary_payload.get("primary_candidate")),
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
         "checklist": checklist_block,
