@@ -1826,161 +1826,6 @@ def _failed_reason_messages(
     return out
 
 
-
-
-def _screened_sort_key(item: Dict[str, Any]) -> Any:
-    structure = item.get("structure_context", {})
-    primary = item.get("primary_candidate") or {}
-    liquidity = item.get("liquidity_context") or {}
-    trigger_state = item.get("trigger_state") or {}
-    checklist = item.get("checklist") or {}
-    final_verdict = item.get("final_verdict", "NO_TRADE")
-
-    verdict_rank = {"PENDING": 0, "NO_TRADE": 1}.get(final_verdict, 2)
-    setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
-    room_rank = 0 if structure.get("room_pass") is True else 1
-    wall_rank = 0 if structure.get("wall_pass") is True else 1
-    ext_rank = 0 if structure.get("extension_state") == "acceptable" else 1
-    trend_rank = 0 if structure.get("trend_label") == "Trend-aligned" else 1 if structure.get("trend_label") == "Countertrend" else 2
-    liquidity_rank = 0 if liquidity.get("liquidity_pass") is True else 1
-    trigger_rank = 0 if trigger_state.get("trigger_present") is True else 1
-    failed_count = len(checklist.get("failed_items", []))
-    room_ratio = -(structure.get("room_ratio") or -999999)
-    risk_mid = primary.get("distance_from_target_risk_mid", 999999)
-    ticker_rank = SYMBOL_ORDER.index(item["symbol"]) if item.get("symbol") in SYMBOL_ORDER else 999999
-
-    return (
-        verdict_rank,
-        setup_rank,
-        room_rank,
-        wall_rank,
-        ext_rank,
-        liquidity_rank,
-        trigger_rank,
-        trend_rank,
-        failed_count,
-        room_ratio,
-        risk_mid,
-        ticker_rank,
-    )
-
-
-def _screened_other_candidates(screened: List[Dict[str, Any]], best_ticker: Optional[str]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for item in screened:
-        if item.get("symbol") == best_ticker:
-            continue
-        out.append(
-            {
-                "symbol": item.get("symbol"),
-                "engine_verdict": item.get("engine_verdict"),
-                "final_verdict": item.get("final_verdict"),
-                "reason": item.get("reason"),
-                "primary_candidate": item.get("primary_candidate"),
-                "structure_context": item.get("structure_context"),
-                "liquidity_context": item.get("liquidity_context"),
-                "trigger_state": item.get("trigger_state"),
-                "checklist_failed_items": item.get("checklist", {}).get("failed_items", []),
-            }
-        )
-    return out
-
-
-async def _screen_ticker_candidate(
-    summary: Dict[str, Any],
-    option_type: str,
-    token: str,
-    request: OnDemandRequest,
-    market_context: Dict[str, Any],
-    macro_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
-    include_chart_checks: bool,
-) -> Dict[str, Any]:
-    symbol = summary.get("symbol")
-    primary_candidate = summary.get("primary_candidate")
-    chart_check: Optional[Dict[str, Any]] = None
-    chart_check_error: Optional[str] = None
-
-    if include_chart_checks and symbol and primary_candidate:
-        try:
-            chart_check = await _build_chart_check_payload(symbol, token)
-        except Exception as e:
-            chart_check_error = str(e)
-
-    structure_context = _build_structure_context(
-        symbol=symbol or "UNKNOWN",
-        option_type=option_type,
-        chart_check=chart_check,
-        primary_candidate=primary_candidate,
-    ) if symbol else {"ok": False, "why": "no symbol"}
-
-    liquidity_context = _build_liquidity_block(primary_candidate)
-    trigger_state = _build_trigger_state(
-        option_type=option_type,
-        market_context=market_context,
-        time_day_gate=time_day_gate,
-        structure_context=structure_context,
-        chart_check=chart_check,
-    )
-
-    chart_alignment = _chart_alignment_ok(option_type, chart_check)
-    final_verdict = _final_verdict(
-        request=request,
-        engine_status=summary.get("verdict", "NO_TRADE"),
-        chart_alignment=chart_alignment,
-        market_context=market_context,
-        macro_context=macro_context,
-        structure_context=structure_context,
-        time_day_gate=time_day_gate,
-        liquidity_context=liquidity_context,
-    )
-
-    checklist = _build_checklist_block(
-        request=request,
-        market_context=market_context,
-        time_day_gate=time_day_gate,
-        structure_context=structure_context,
-        chart_check=chart_check,
-        primary_candidate=primary_candidate,
-        liquidity_context=liquidity_context,
-        trigger_state=trigger_state,
-    )
-
-    reason = summary.get("reason", "No summary available.")
-    failed_items = checklist.get("failed_items", [])
-    if "liquidity_ok" in failed_items:
-        reason = liquidity_context.get("why") or "Options liquidity is too wide for a clean debit spread entry."
-    elif "clear_trigger" in failed_items:
-        reason = trigger_state.get("why") or "No valid live trigger is present."
-    elif structure_context.get("ok"):
-        if structure_context.get("room_pass") is False:
-            reason = "Room to first wall is too tight for SAFE-FAST."
-        elif structure_context.get("wall_pass") is False:
-            reason = "Wall thesis and strike placement do not match."
-        elif structure_context.get("extension_state") == "extended":
-            reason = "Move is too extended from the 1H 50 EMA."
-        elif structure_context.get("allowed_setup") is False:
-            reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
-        elif chart_alignment is False:
-            reason = "Price is on the wrong side of the 1H 50 EMA."
-
-    return {
-        "symbol": symbol,
-        "engine_verdict": summary.get("verdict"),
-        "final_verdict": final_verdict,
-        "reason": reason,
-        "primary_candidate": primary_candidate,
-        "backup_candidate": summary.get("backup_candidate"),
-        "summary": summary,
-        "chart_check": chart_check,
-        "chart_check_error": chart_check_error,
-        "structure_context": structure_context,
-        "liquidity_context": liquidity_context,
-        "trigger_state": trigger_state,
-        "checklist": checklist,
-    }
-
-
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
@@ -2007,53 +1852,44 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         token=token,
     )
 
-    screened_candidates = list(
-        await asyncio.gather(
-            *[
-                _screen_ticker_candidate(
-                    summary=summary,
-                    option_type=clean_option_type,
-                    token=token,
-                    request=request,
-                    market_context=market_context,
-                    macro_context=macro_context,
-                    time_day_gate=time_day_gate,
-                    include_chart_checks=request.include_chart_checks,
-                )
-                for summary in summary_payload.get("ticker_summaries", [])
-            ]
-        )
-    )
+    best_ticker = summary_payload.get("best_ticker")
+    engine_status = summary_payload.get("verdict", "NO_TRADE")
+    primary_candidate = summary_payload.get("primary_candidate")
+    chart_check: Optional[Dict[str, Any]] = None
+    chart_check_error: Optional[str] = None
 
-    screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
-    selected = screened_candidates[0] if screened_candidates else None
+    if request.include_chart_checks and best_ticker:
+        try:
+            chart_check = await _build_chart_check_payload(best_ticker, token)
+        except Exception as e:
+            chart_check_error = str(e)
 
-    best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
-    engine_status = selected.get("engine_verdict", "NO_TRADE") if selected else summary_payload.get("verdict", "NO_TRADE")
-    final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
-    primary_candidate = selected.get("primary_candidate") if selected else summary_payload.get("primary_candidate")
-    chart_check = selected.get("chart_check") if selected else None
-    chart_check_error = selected.get("chart_check_error") if selected else None
-    structure_context = selected.get("structure_context") if selected else {"ok": False, "why": "no screened candidates"}
-    liquidity_context = selected.get("liquidity_context") if selected else _build_liquidity_block(primary_candidate)
-    trigger_state = selected.get("trigger_state") if selected else _build_trigger_state(
+    structure_context = _build_structure_context(
+        symbol=best_ticker or "UNKNOWN",
+        option_type=clean_option_type,
+        chart_check=chart_check,
+        primary_candidate=primary_candidate,
+    ) if best_ticker else {"ok": False, "why": "no best ticker"}
+    liquidity_context = _build_liquidity_block(summary_payload.get("primary_candidate"))
+    trigger_state = _build_trigger_state(
         option_type=clean_option_type,
         market_context=market_context,
         time_day_gate=time_day_gate,
         structure_context=structure_context,
         chart_check=chart_check,
     )
-    checklist_block = selected.get("checklist") if selected else _build_checklist_block(
+
+    chart_alignment = _chart_alignment_ok(clean_option_type, chart_check)
+    final_verdict = _final_verdict(
         request=request,
+        engine_status=engine_status,
+        chart_alignment=chart_alignment,
         market_context=market_context,
-        time_day_gate=time_day_gate,
+        macro_context=macro_context,
         structure_context=structure_context,
-        chart_check=chart_check,
-        primary_candidate=primary_candidate,
+        time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
-        trigger_state=trigger_state,
     )
-    selected_reason = selected.get("reason", summary_payload.get("reason", "No summary available.")) if selected else summary_payload.get("reason", "No summary available.")
 
     if request.include_chart_checks:
         chart_check_block: Dict[str, Any] = chart_check if chart_check else {
@@ -2069,8 +1905,20 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             "message": "Chart checks were not requested.",
         }
 
+    # remove internal candle payload from external response
     if chart_check_block.get("_all_candles") is not None:
         chart_check_block = {k: v for k, v in chart_check_block.items() if k != "_all_candles"}
+
+    checklist_block = _build_checklist_block(
+        request=request,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+        chart_check=chart_check,
+        primary_candidate=primary_candidate,
+        liquidity_context=liquidity_context,
+        trigger_state=trigger_state,
+    )
 
     return {
         "ok": True,
@@ -2079,7 +1927,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "engine_status": engine_status,
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
-        "engine_best_ticker": summary_payload.get("best_ticker"),
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
@@ -2087,7 +1934,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "iv_context": _build_iv_context(),
         "liquidity_context": liquidity_context,
         "trigger_state": trigger_state,
-        "targets": _build_targets_block(primary_candidate),
+        "targets": _build_targets_block(summary_payload.get("primary_candidate")),
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
         "checklist": checklist_block,
         "failed_reasons": _failed_reason_messages(
@@ -2098,7 +1945,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             liquidity_context=liquidity_context,
             trigger_state=trigger_state,
         ),
-        "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
+        "other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
         "request": request.model_dump(),
         "candidate_engine": summary_payload,
         "chart_check": chart_check_block,
@@ -2115,7 +1962,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             best_ticker=best_ticker,
             chart_check=chart_check,
             chart_check_error=chart_check_error,
-            engine_reason=selected_reason,
+            engine_reason=summary_payload.get("reason", "No summary available."),
             market_context=market_context,
             macro_context=macro_context,
             structure_context=structure_context,
@@ -2129,6 +1976,49 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             checklist=checklist_block,
             chart_check=chart_check,
         ),
+    }
+
+
+def _build_two_path_block(
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    checklist: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ema = chart_check.get("ema50_1h") if chart_check else None
+
+    if market_context.get("is_open") is False:
+        return {
+            "ideal_path": "Wait for next regular session. Re-check before entry.",
+            "acceptable_path": "No entry while market is closed.",
+            "invalidation_1h_ema50": ema,
+        }
+
+    failed_items = set(checklist.get("failed_items", []))
+    if failed_items:
+        ideal_parts: List[str] = []
+        if "allowed_setup_type" in failed_items:
+            ideal_parts.append("allowed setup type")
+        if "twentyfour_hour_supportive" in failed_items:
+            ideal_parts.append("24H support")
+        if "clear_room" in failed_items:
+            ideal_parts.append("room pass")
+        if "early_enough" in failed_items:
+            ideal_parts.append("time/extension pass")
+        if "clear_trigger" in failed_items:
+            ideal_parts.append("live trigger")
+        ideal_text = "Need " + ", ".join(ideal_parts) + " before entry." if ideal_parts else "Need full gate pass before entry."
+        return {
+            "ideal_path": ideal_text,
+            "acceptable_path": "Stand down until all failed gates pass.",
+            "invalidation_1h_ema50": ema,
+        }
+
+    return {
+        "ideal_path": "Setup passes. Enter only if current bar behavior still confirms the trigger.",
+        "acceptable_path": "Take only the mapped entry with the 1H EMA invalidation active.",
+        "invalidation_1h_ema50": ema,
     }
 
 
