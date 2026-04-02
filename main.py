@@ -1485,7 +1485,7 @@ def _build_checklist_block(
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
-        {"item": "early_enough", "yes": bool(time_day_gate.get("fresh_entry_allowed") and structure_context.get("extension_state") != "extended")},
+        {"item": "early_enough", "yes": bool(time_day_gate.get("fresh_entry_allowed"))},
         {"item": "clear_trigger", "yes": bool(structure_context.get("allowed_setup") is True and market_context.get("is_open"))},
         {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
         {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
@@ -1515,7 +1515,7 @@ def _failed_reason_messages(
         "twentyfour_hour_supportive": "24H context is not supportive",
         "one_hour_clean_around_ema": "1H structure around the 50 EMA is not clean",
         "clear_room": "room to the first wall fails",
-        "early_enough": "entry is too late or outside the time/day window",
+        "early_enough": "entry is outside the time/day window",
         "clear_trigger": "no valid live trigger is present",
         "invalidation_clear": "invalidation is not clear",
         "fits_risk": "risk does not fit the SAFE-FAST budget",
@@ -1532,7 +1532,7 @@ def _failed_reason_messages(
     elif time_day_gate.get("fresh_entry_allowed") is False and time_day_gate.get("reason") not in {"market_closed", None}:
         reasons.insert(0, "fresh entry is outside the SAFE-FAST time/day window")
 
-    if structure_context.get("extension_state") == "extended" and "entry is too late or outside the time/day window" not in reasons:
+    if structure_context.get("extension_state") == "extended":
         reasons.append("move is extended versus the 1H 50 EMA")
 
     # de-duplicate while preserving order
