@@ -103,6 +103,44 @@ def _market_context_now() -> Dict[str, Any]:
     }
 
 
+def _time_day_gate(market_context: Dict[str, Any]) -> Dict[str, Any]:
+    now_et = datetime.fromisoformat(market_context["as_of_et"])
+    weekday = now_et.weekday()
+
+    if not market_context.get("is_open"):
+        return {
+            "fresh_entry_allowed": False,
+            "reason": "market_closed",
+            "cutoff_et": None,
+        }
+
+    # Monday-Thursday: no fresh setups after 2:00 p.m. ET
+    if weekday <= 3:
+        cutoff = time(14, 0)
+        allowed = now_et.time() < cutoff
+        return {
+            "fresh_entry_allowed": allowed,
+            "reason": "within_time_window" if allowed else "past_monday_thursday_cutoff",
+            "cutoff_et": "14:00:00",
+        }
+
+    # Friday: no fresh setups after 12:00 p.m. ET
+    if weekday == 4:
+        cutoff = time(12, 0)
+        allowed = now_et.time() < cutoff
+        return {
+            "fresh_entry_allowed": allowed,
+            "reason": "within_time_window" if allowed else "past_friday_cutoff",
+            "cutoff_et": "12:00:00",
+        }
+
+    return {
+        "fresh_entry_allowed": False,
+        "reason": "weekend",
+        "cutoff_et": None,
+    }
+
+
 def _other_ticker_candidates(
     summary_payload: Dict[str, Any],
     best_ticker: Optional[str],
@@ -1164,12 +1202,15 @@ def _final_verdict(
     market_context: Dict[str, Any],
     macro_context: Dict[str, Any],
     structure_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
 ) -> str:
     if request.open_positions > 0:
         return "NO_TRADE"
     if request.weekly_trade_count >= 4:
         return "NO_TRADE"
     if not market_context["is_open"]:
+        return "NO_TRADE"
+    if not time_day_gate.get("fresh_entry_allowed"):
         return "NO_TRADE"
     if macro_context.get("ok") and (
         macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
@@ -1241,6 +1282,7 @@ def _build_user_facing_block(
     market_context: Dict[str, Any],
     macro_context: Dict[str, Any],
     structure_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
@@ -1285,6 +1327,16 @@ def _build_user_facing_block(
             "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
             "setup_state": "NO TRADE",
             "why": macro_context.get("note") or "Major event risk is inside the expected hold window.",
+        }
+
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "NO TRADE",
+            "why": f"Time/day filter fails: {time_day_gate.get('reason')}.",
         }
 
     if engine_status == "NO_TRADE" or not best_ticker:
@@ -1398,6 +1450,7 @@ def _build_targets_block(primary_candidate: Optional[Dict[str, Any]]) -> Dict[st
 def _build_checklist_block(
     request: OnDemandRequest,
     market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
     structure_context: Dict[str, Any],
     chart_check: Optional[Dict[str, Any]],
     primary_candidate: Optional[Dict[str, Any]],
@@ -1410,7 +1463,7 @@ def _build_checklist_block(
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
-        {"item": "early_enough", "yes": bool(market_context.get("is_open") and structure_context.get("extension_state") != "extended")},
+        {"item": "early_enough", "yes": bool(time_day_gate.get("fresh_entry_allowed") and structure_context.get("extension_state") != "extended")},
         {"item": "clear_trigger", "yes": bool(structure_context.get("allowed_setup") is True and market_context.get("is_open"))},
         {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
         {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
@@ -1429,6 +1482,7 @@ def _build_checklist_block(
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
+    time_day_gate = _time_day_gate(market_context)
     macro_context = await _build_macro_context(request.macro_context_requested)
 
     if request.open_positions < 0 or request.open_positions > 1:
@@ -1478,6 +1532,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         market_context=market_context,
         macro_context=macro_context,
         structure_context=structure_context,
+        time_day_gate=time_day_gate,
     )
 
     if request.include_chart_checks:
@@ -1508,11 +1563,13 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
+        "time_day_gate": time_day_gate,
         "targets": _build_targets_block(summary_payload.get("primary_candidate")),
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
         "checklist": _build_checklist_block(
             request=request,
             market_context=market_context,
+            time_day_gate=time_day_gate,
             structure_context=structure_context,
             chart_check=chart_check,
             primary_candidate=primary_candidate,
@@ -1538,6 +1595,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             market_context=market_context,
             macro_context=macro_context,
             structure_context=structure_context,
+            time_day_gate=time_day_gate,
         ),
     }
 
