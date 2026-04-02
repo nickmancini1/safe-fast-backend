@@ -1,4 +1,3 @@
-
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -1672,6 +1671,56 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             structure_context=structure_context,
             time_day_gate=time_day_gate,
         ),
+        "two_path": _build_two_path_block(
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+            structure_context=structure_context,
+            checklist=checklist_block,
+            chart_check=chart_check,
+        ),
+    }
+
+
+def _build_two_path_block(
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    checklist: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ema = chart_check.get("ema50_1h") if chart_check else None
+
+    if market_context.get("is_open") is False:
+        return {
+            "ideal_path": "Wait for next regular session. Re-check before entry.",
+            "acceptable_path": "No entry while market is closed.",
+            "invalidation_1h_ema50": ema,
+        }
+
+    failed_items = set(checklist.get("failed_items", []))
+    if failed_items:
+        ideal_parts: List[str] = []
+        if "allowed_setup_type" in failed_items:
+            ideal_parts.append("allowed setup type")
+        if "twentyfour_hour_supportive" in failed_items:
+            ideal_parts.append("24H support")
+        if "clear_room" in failed_items:
+            ideal_parts.append("room pass")
+        if "early_enough" in failed_items:
+            ideal_parts.append("time/extension pass")
+        if "clear_trigger" in failed_items:
+            ideal_parts.append("live trigger")
+        ideal_text = "Need " + ", ".join(ideal_parts) + " before entry." if ideal_parts else "Need full gate pass before entry."
+        return {
+            "ideal_path": ideal_text,
+            "acceptable_path": "Stand down until all failed gates pass.",
+            "invalidation_1h_ema50": ema,
+        }
+
+    return {
+        "ideal_path": "Setup passes. Enter only if current bar behavior still confirms the trigger.",
+        "acceptable_path": "Take only the mapped entry with the 1H EMA invalidation active.",
+        "invalidation_1h_ema50": ema,
     }
 
 
