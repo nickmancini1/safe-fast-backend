@@ -185,6 +185,81 @@ def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
+
+
+def _extract_option_iv_fields(quote: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Best-effort IV extraction from option quote payloads.
+    This is intentionally tolerant because quote providers can expose IV fields
+    under different names or nested structures.
+    """
+    if not quote:
+        return {
+            "iv_mid": None,
+            "iv_bid": None,
+            "iv_ask": None,
+            "iv_source": None,
+        }
+
+    def pick(obj: Dict[str, Any], keys: List[str]) -> Optional[float]:
+        for key in keys:
+            if key in obj:
+                value = _to_float(obj.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    # Flat key variants
+    iv_mid = pick(
+        quote,
+        [
+            "implied-volatility",
+            "implied_volatility",
+            "iv",
+            "iv_mid",
+            "mark-implied-volatility",
+            "mark_implied_volatility",
+            "mid-implied-volatility",
+            "mid_implied_volatility",
+        ],
+    )
+    iv_bid = pick(
+        quote,
+        [
+            "bid-implied-volatility",
+            "bid_implied_volatility",
+            "iv_bid",
+        ],
+    )
+    iv_ask = pick(
+        quote,
+        [
+            "ask-implied-volatility",
+            "ask_implied_volatility",
+            "iv_ask",
+        ],
+    )
+
+    # Nested/extra containers occasionally appear
+    if iv_mid is None and isinstance(quote.get("greeks"), dict):
+        iv_mid = pick(quote["greeks"], ["implied-volatility", "implied_volatility", "iv"])
+    if iv_bid is None and isinstance(quote.get("greeks"), dict):
+        iv_bid = pick(quote["greeks"], ["bid-implied-volatility", "bid_implied_volatility", "iv_bid"])
+    if iv_ask is None and isinstance(quote.get("greeks"), dict):
+        iv_ask = pick(quote["greeks"], ["ask-implied-volatility", "ask_implied_volatility", "iv_ask"])
+
+    source = None
+    if any(v is not None for v in [iv_mid, iv_bid, iv_ask]):
+        source = "option_quote_fields"
+
+    return {
+        "iv_mid": _round_or_none(iv_mid, 6),
+        "iv_bid": _round_or_none(iv_bid, 6),
+        "iv_ask": _round_or_none(iv_ask, 6),
+        "iv_source": source,
+    }
+
+
 def _build_iv_context(primary_candidate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not primary_candidate:
         return {
