@@ -1920,17 +1920,17 @@ def _failed_reason_messages(
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
 ) -> List[str]:
-    failed = set(checklist.get("failed_items", []))
     reasons: List[str] = []
 
+    # Normalize reasons so contextual failures are stated once.
     mapping = {
         "allowed_setup_type": "setup type is not allowed",
         "twentyfour_hour_supportive": "24H context is not supportive",
         "one_hour_clean_around_ema": "1H structure around the 50 EMA is not clean",
         "clear_room": "room to the first wall fails",
-        "early_enough": "entry is outside the time/day window",
+        # early_enough is handled contextually below to avoid duplicate time/day wording
         "clear_trigger": "no valid live trigger is present",
-        "liquidity_ok": "options liquidity is too wide for a clean debit spread entry",
+        # liquidity_ok is handled contextually below to avoid duplicate liquidity wording
         "invalidation_clear": "invalidation is not clear",
         "fits_risk": "risk does not fit the SAFE-FAST budget",
         "open_trade_already": "an open trade already exists",
@@ -1941,23 +1941,32 @@ def _failed_reason_messages(
         if msg:
             reasons.append(msg)
 
+    gate_reason = time_day_gate.get("reason")
     if not market_context.get("is_open"):
         reasons.insert(0, "market is closed")
-    elif time_day_gate.get("fresh_entry_allowed") is False and time_day_gate.get("reason") not in {"market_closed", None}:
-        reasons.insert(0, "fresh entry is outside the SAFE-FAST time/day window")
+    elif time_day_gate.get("fresh_entry_allowed") is False:
+        if gate_reason == "past_monday_thursday_cutoff":
+            reasons.insert(0, "fresh entry is outside the SAFE-FAST time/day window")
+        elif gate_reason not in {None, "market_closed"}:
+            reasons.insert(0, f"fresh entry blocked: {gate_reason}")
 
     if structure_context.get("extension_state") == "extended":
         reasons.append("move is extended versus the 1H 50 EMA")
-    if liquidity_context.get("liquidity_pass") is False and liquidity_context.get("why"):
-        reasons.append(liquidity_context.get("why"))
+
+    if liquidity_context.get("liquidity_pass") is False:
+        reasons.append(
+            liquidity_context.get("why")
+            or "Bid/ask widths or entry slippage are too wide for a clean SAFE-FAST debit spread entry."
+        )
 
     # de-duplicate while preserving order
     out: List[str] = []
     seen = set()
     for reason in reasons:
-        if reason not in seen:
-            seen.add(reason)
-            out.append(reason)
+        normalized = str(reason).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
     return out
 
 
