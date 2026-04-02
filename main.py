@@ -1,3 +1,4 @@
+
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -1608,6 +1609,104 @@ def _build_user_facing_block(
 
 
 
+
+
+def _build_trigger_state(
+    option_type: str,
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    trigger_style = "close_above_recent_high" if option_type == "C" else "close_below_recent_low"
+
+    if not market_context.get("is_open"):
+        return {
+            "ok": True,
+            "trigger_present": False,
+            "trigger_style": trigger_style,
+            "trigger_level": None,
+            "current_close": chart_check.get("latest_close") if chart_check else None,
+            "why": "market_closed",
+        }
+
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return {
+            "ok": True,
+            "trigger_present": False,
+            "trigger_style": trigger_style,
+            "trigger_level": None,
+            "current_close": chart_check.get("latest_close") if chart_check else None,
+            "why": time_day_gate.get("reason", "time_day_gate_blocked"),
+        }
+
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "ok": False,
+            "trigger_present": False,
+            "trigger_style": trigger_style,
+            "trigger_level": None,
+            "current_close": None,
+            "why": "chart_unavailable",
+        }
+
+    recent = chart_check.get("recent_candles") or []
+    current_close = chart_check.get("latest_close")
+    price_side = chart_check.get("price_vs_ema50_1h")
+
+    if len(recent) < 2 or current_close is None:
+        return {
+            "ok": False,
+            "trigger_present": False,
+            "trigger_style": trigger_style,
+            "trigger_level": None,
+            "current_close": current_close,
+            "why": "insufficient_recent_candles",
+        }
+
+    prior = recent[:-1] if len(recent) >= 2 else recent
+    window = prior[-3:] if len(prior) >= 3 else prior
+
+    trigger_level: Optional[float]
+    crossed = False
+    if option_type == "C":
+        trigger_level = max((c.get("high") for c in window if c.get("high") is not None), default=None)
+        crossed = bool(trigger_level is not None and current_close > trigger_level)
+        side_ok = price_side == "above"
+    else:
+        trigger_level = min((c.get("low") for c in window if c.get("low") is not None), default=None)
+        crossed = bool(trigger_level is not None and current_close < trigger_level)
+        side_ok = price_side == "below"
+
+    structure_ok = bool(
+        structure_context.get("allowed_setup") is True
+        and structure_context.get("room_pass") is True
+        and structure_context.get("wall_pass") is True
+        and structure_context.get("extension_state") != "extended"
+        and structure_context.get("chop_risk") is False
+    )
+
+    trigger_present = bool(crossed and side_ok and structure_ok)
+
+    why = "trigger_present"
+    if not structure_ok:
+        why = "structure_not_ready"
+    elif not side_ok:
+        why = "wrong_side_of_ema"
+    elif not crossed:
+        why = "close_trigger_not_hit"
+
+    return {
+        "ok": True,
+        "trigger_present": trigger_present,
+        "trigger_style": trigger_style,
+        "trigger_level": _round_or_none(trigger_level, 4),
+        "current_close": _round_or_none(current_close, 4),
+        "price_vs_ema50_1h": price_side,
+        "structure_ready": structure_ok,
+        "why": why,
+    }
+
 def _build_targets_block(primary_candidate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not primary_candidate:
         return {
@@ -1652,6 +1751,7 @@ def _build_checklist_block(
     chart_check: Optional[Dict[str, Any]],
     primary_candidate: Optional[Dict[str, Any]],
     liquidity_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
 ) -> Dict[str, Any]:
     ema_value = chart_check.get("ema50_1h") if chart_check else None
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
@@ -1662,7 +1762,7 @@ def _build_checklist_block(
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
         {"item": "early_enough", "yes": bool(time_day_gate.get("fresh_entry_allowed"))},
-        {"item": "clear_trigger", "yes": bool(structure_context.get("allowed_setup") is True and market_context.get("is_open"))},
+        {"item": "clear_trigger", "yes": bool(trigger_state.get("trigger_present") is True)},
         {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
         {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
         {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
@@ -1684,6 +1784,7 @@ def _failed_reason_messages(
     market_context: Dict[str, Any],
     structure_context: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
 ) -> List[str]:
     failed = set(checklist.get("failed_items", []))
     reasons: List[str] = []
@@ -1771,6 +1872,13 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         primary_candidate=primary_candidate,
     ) if best_ticker else {"ok": False, "why": "no best ticker"}
     liquidity_context = _build_liquidity_block(summary_payload.get("primary_candidate"))
+    trigger_state = _build_trigger_state(
+        option_type=clean_option_type,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+        chart_check=chart_check,
+    )
 
     chart_alignment = _chart_alignment_ok(clean_option_type, chart_check)
     final_verdict = _final_verdict(
@@ -1810,6 +1918,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         chart_check=chart_check,
         primary_candidate=primary_candidate,
         liquidity_context=liquidity_context,
+        trigger_state=trigger_state,
     )
 
     return {
@@ -1825,6 +1934,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "time_day_gate": time_day_gate,
         "iv_context": _build_iv_context(),
         "liquidity_context": liquidity_context,
+        "trigger_state": trigger_state,
         "targets": _build_targets_block(summary_payload.get("primary_candidate")),
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
         "checklist": checklist_block,
@@ -1834,6 +1944,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             market_context=market_context,
             structure_context=structure_context,
             liquidity_context=liquidity_context,
+            trigger_state=trigger_state,
         ),
         "other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
         "request": request.model_dump(),
