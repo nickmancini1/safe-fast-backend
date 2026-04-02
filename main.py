@@ -830,6 +830,7 @@ async def _build_summary_compact_payload(
         "ok": True,
         "verdict": verdict,
         "best_ticker": best_ticker,
+        "candidate_sort_reason": _candidate_sort_reason_from_best(best_summary),
         "selection_mode": best_summary["selection_mode"] if best_summary else "none",
         "reason": best_summary["reason"] if best_summary else "No summary available.",
         "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
@@ -838,6 +839,19 @@ async def _build_summary_compact_payload(
     }
 
 
+
+
+
+def _candidate_sort_reason_from_best(best_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    primary = (best_summary or {}).get("primary_candidate") or {}
+    return {
+        "best_ticker": (best_summary or {}).get("symbol"),
+        "selection_mode": (best_summary or {}).get("selection_mode"),
+        "reason": (best_summary or {}).get("reason"),
+        "distance_from_target_risk_mid": primary.get("distance_from_target_risk_mid"),
+        "feasibility_pass": primary.get("feasibility_pass"),
+        "fits_risk_budget": primary.get("fits_risk_budget"),
+    }
 
 async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
     snapshot = await get_1h_ema50_snapshot(
