@@ -1,4 +1,3 @@
-
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -1365,6 +1364,7 @@ def _final_verdict(
     macro_context: Dict[str, Any],
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
 ) -> str:
     if request.open_positions > 0:
         return "NO_TRADE"
@@ -1377,6 +1377,8 @@ def _final_verdict(
     if macro_context.get("ok") and (
         macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
     ):
+        return "NO_TRADE"
+    if liquidity_context.get("liquidity_pass") is False:
         return "NO_TRADE"
     if engine_status == "NO_TRADE":
         return "NO_TRADE"
@@ -1445,6 +1447,7 @@ def _build_user_facing_block(
     macro_context: Dict[str, Any],
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
@@ -1521,6 +1524,16 @@ def _build_user_facing_block(
             "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
             "setup_state": "NO TRADE",
             "why": f"Time/day filter fails: {time_day_gate.get('reason')}.",
+        }
+
+    if liquidity_context.get("liquidity_pass") is False:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "NO TRADE",
+            "why": liquidity_context.get("why") or "Options liquidity is too wide for a clean SAFE-FAST entry.",
         }
 
     if engine_status == "NO_TRADE" or not best_ticker:
@@ -1638,6 +1651,7 @@ def _build_checklist_block(
     structure_context: Dict[str, Any],
     chart_check: Optional[Dict[str, Any]],
     primary_candidate: Optional[Dict[str, Any]],
+    liquidity_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     ema_value = chart_check.get("ema50_1h") if chart_check else None
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
@@ -1649,6 +1663,7 @@ def _build_checklist_block(
         {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
         {"item": "early_enough", "yes": bool(time_day_gate.get("fresh_entry_allowed"))},
         {"item": "clear_trigger", "yes": bool(structure_context.get("allowed_setup") is True and market_context.get("is_open"))},
+        {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
         {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
         {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
         {"item": "open_trade_already", "yes": bool(request.open_positions > 0)},
@@ -1668,6 +1683,7 @@ def _failed_reason_messages(
     time_day_gate: Dict[str, Any],
     market_context: Dict[str, Any],
     structure_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
 ) -> List[str]:
     failed = set(checklist.get("failed_items", []))
     reasons: List[str] = []
@@ -1679,6 +1695,7 @@ def _failed_reason_messages(
         "clear_room": "room to the first wall fails",
         "early_enough": "entry is outside the time/day window",
         "clear_trigger": "no valid live trigger is present",
+        "liquidity_ok": "options liquidity is too wide for a clean debit spread entry",
         "invalidation_clear": "invalidation is not clear",
         "fits_risk": "risk does not fit the SAFE-FAST budget",
         "open_trade_already": "an open trade already exists",
@@ -1696,6 +1713,8 @@ def _failed_reason_messages(
 
     if structure_context.get("extension_state") == "extended":
         reasons.append("move is extended versus the 1H 50 EMA")
+    if liquidity_context.get("liquidity_pass") is False and liquidity_context.get("why"):
+        reasons.append(liquidity_context.get("why"))
 
     # de-duplicate while preserving order
     out: List[str] = []
@@ -1751,6 +1770,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         chart_check=chart_check,
         primary_candidate=primary_candidate,
     ) if best_ticker else {"ok": False, "why": "no best ticker"}
+    liquidity_context = _build_liquidity_block(summary_payload.get("primary_candidate"))
 
     chart_alignment = _chart_alignment_ok(clean_option_type, chart_check)
     final_verdict = _final_verdict(
@@ -1761,6 +1781,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         macro_context=macro_context,
         structure_context=structure_context,
         time_day_gate=time_day_gate,
+        liquidity_context=liquidity_context,
     )
 
     if request.include_chart_checks:
@@ -1788,6 +1809,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         structure_context=structure_context,
         chart_check=chart_check,
         primary_candidate=primary_candidate,
+        liquidity_context=liquidity_context,
     )
 
     return {
@@ -1802,7 +1824,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "structure_context": structure_context,
         "time_day_gate": time_day_gate,
         "iv_context": _build_iv_context(),
-        "liquidity_context": _build_liquidity_block(summary_payload.get("primary_candidate")),
+        "liquidity_context": liquidity_context,
         "targets": _build_targets_block(summary_payload.get("primary_candidate")),
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
         "checklist": checklist_block,
@@ -1811,6 +1833,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             time_day_gate=time_day_gate,
             market_context=market_context,
             structure_context=structure_context,
+            liquidity_context=liquidity_context,
         ),
         "other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
         "request": request.model_dump(),
@@ -1834,6 +1857,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             macro_context=macro_context,
             structure_context=structure_context,
             time_day_gate=time_day_gate,
+            liquidity_context=liquidity_context,
         ),
         "two_path": _build_two_path_block(
             market_context=market_context,
