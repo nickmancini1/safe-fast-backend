@@ -1479,6 +1479,50 @@ def _build_checklist_block(
     }
 
 
+def _failed_reason_messages(
+    checklist: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    market_context: Dict[str, Any],
+    structure_context: Dict[str, Any],
+) -> List[str]:
+    failed = set(checklist.get("failed_items", []))
+    reasons: List[str] = []
+
+    mapping = {
+        "allowed_setup_type": "setup type is not allowed",
+        "twentyfour_hour_supportive": "24H context is not supportive",
+        "one_hour_clean_around_ema": "1H structure around the 50 EMA is not clean",
+        "clear_room": "room to the first wall fails",
+        "early_enough": "entry is too late or outside the time/day window",
+        "clear_trigger": "no valid live trigger is present",
+        "invalidation_clear": "invalidation is not clear",
+        "fits_risk": "risk does not fit the SAFE-FAST budget",
+        "open_trade_already": "an open trade already exists",
+    }
+
+    for item in checklist.get("failed_items", []):
+        msg = mapping.get(item)
+        if msg:
+            reasons.append(msg)
+
+    if not market_context.get("is_open"):
+        reasons.insert(0, "market is closed")
+    elif time_day_gate.get("fresh_entry_allowed") is False and time_day_gate.get("reason") not in {"market_closed", None}:
+        reasons.insert(0, "fresh entry is outside the SAFE-FAST time/day window")
+
+    if structure_context.get("extension_state") == "extended" and "entry is too late or outside the time/day window" not in reasons:
+        reasons.append("move is extended versus the 1H 50 EMA")
+
+    # de-duplicate while preserving order
+    out: List[str] = []
+    seen = set()
+    for reason in reasons:
+        if reason not in seen:
+            seen.add(reason)
+            out.append(reason)
+    return out
+
+
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
@@ -1553,6 +1597,15 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     if chart_check_block.get("_all_candles") is not None:
         chart_check_block = {k: v for k, v in chart_check_block.items() if k != "_all_candles"}
 
+    checklist_block = _build_checklist_block(
+        request=request,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+        chart_check=chart_check,
+        primary_candidate=primary_candidate,
+    )
+
     return {
         "ok": True,
         "mode": "on_demand",
@@ -1566,13 +1619,12 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "time_day_gate": time_day_gate,
         "targets": _build_targets_block(summary_payload.get("primary_candidate")),
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
-        "checklist": _build_checklist_block(
-            request=request,
-            market_context=market_context,
+        "checklist": checklist_block,
+        "failed_reasons": _failed_reason_messages(
+            checklist=checklist_block,
             time_day_gate=time_day_gate,
+            market_context=market_context,
             structure_context=structure_context,
-            chart_check=chart_check,
-            primary_candidate=primary_candidate,
         ),
         "other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
         "request": request.model_dump(),
