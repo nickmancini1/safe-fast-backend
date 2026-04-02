@@ -2076,3 +2076,4 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
 @app.post("/safe-fast/on-demand")
 async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
     return await _build_on_demand_payload(request)
+
