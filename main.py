@@ -1888,6 +1888,32 @@ def _screened_other_candidates(screened: List[Dict[str, Any]], best_ticker: Opti
     return out
 
 
+def _build_screened_best_context(
+    selected: Optional[Dict[str, Any]],
+    engine_best_ticker: Optional[str],
+    screened_candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not selected:
+        return {"ok": False, "why": "no screened candidates"}
+
+    engine_pick = next(
+        (item for item in screened_candidates if item.get("symbol") == engine_best_ticker),
+        None,
+    )
+
+    return {
+        "ok": True,
+        "screened_best_ticker": selected.get("symbol"),
+        "engine_best_ticker": engine_best_ticker,
+        "changed_from_engine_best": selected.get("symbol") != engine_best_ticker,
+        "screened_final_verdict": selected.get("final_verdict"),
+        "screened_reason": selected.get("reason"),
+        "screened_checklist_failed_items": (selected.get("checklist") or {}).get("failed_items", []),
+        "engine_best_final_verdict_after_screen": engine_pick.get("final_verdict") if engine_pick else None,
+        "engine_best_reason_after_screen": engine_pick.get("reason") if engine_pick else None,
+    }
+
+
 async def _screen_ticker_candidate(
     summary: Dict[str, Any],
     option_type: str,
@@ -2082,6 +2108,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
         "engine_best_ticker": summary_payload.get("best_ticker"),
+        "screened_best_context": _build_screened_best_context(
+            selected=selected,
+            engine_best_ticker=summary_payload.get("best_ticker"),
+            screened_candidates=screened_candidates,
+        ),
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
