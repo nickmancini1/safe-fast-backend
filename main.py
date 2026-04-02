@@ -1,3 +1,4 @@
+
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -269,8 +270,8 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
 
     try:
         events.extend(await _fetch_bls_events(now_et))
-    except Exception as e:
-        warnings.append(f"BLS source unavailable: {e}")
+    except Exception:
+        warnings.append("BLS schedule unavailable; macro check used available sources.")
 
     deduped: List[Dict[str, Any]] = []
     seen = set()
@@ -296,7 +297,7 @@ async def _build_macro_context(requested: bool) -> Dict[str, Any]:
         note = "Macro sources returned no usable schedule data."
 
     if warnings:
-        note = f"{note} Warnings: {' | '.join(warnings)}"
+        note = f"{note} {' | '.join(warnings)}"
 
     return {
         "ok": True,
