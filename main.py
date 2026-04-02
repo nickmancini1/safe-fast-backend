@@ -1,4 +1,3 @@
-
 import os
 import re
 from datetime import datetime, time, timedelta
@@ -1396,6 +1395,37 @@ def _build_targets_block(primary_candidate: Optional[Dict[str, Any]]) -> Dict[st
     }
 
 
+def _build_checklist_block(
+    request: OnDemandRequest,
+    market_context: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ema_value = chart_check.get("ema50_1h") if chart_check else None
+    price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
+
+    items = [
+        {"item": "allowed_setup_type", "yes": bool(structure_context.get("allowed_setup") is True)},
+        {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
+        {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False)},
+        {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
+        {"item": "early_enough", "yes": bool(market_context.get("is_open") and structure_context.get("extension_state") != "extended")},
+        {"item": "clear_trigger", "yes": bool(structure_context.get("allowed_setup") is True and market_context.get("is_open"))},
+        {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
+        {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
+        {"item": "open_trade_already", "yes": bool(request.open_positions > 0)},
+    ]
+
+    failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
+
+    return {
+        "ok": True,
+        "items": items,
+        "failed_items": failed_items,
+    }
+
+
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
@@ -1480,6 +1510,13 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "structure_context": structure_context,
         "targets": _build_targets_block(summary_payload.get("primary_candidate")),
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
+        "checklist": _build_checklist_block(
+            request=request,
+            market_context=market_context,
+            structure_context=structure_context,
+            chart_check=chart_check,
+            primary_candidate=primary_candidate,
+        ),
         "other_ticker_candidates": _other_ticker_candidates(summary_payload, best_ticker),
         "request": request.model_dump(),
         "candidate_engine": summary_payload,
