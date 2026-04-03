@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.13")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.18")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.13"
+USER_AGENT = "safe-fast-backend/1.9.18"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1359,6 +1359,14 @@ async def _build_tick_context(token: str) -> Dict[str, Any]:
         ["TICKI"],
         ["$TICKQ"],
         ["TICKQ"],
+        ["$TICK-NYSE"],
+        ["TICK-NYSE"],
+        ["$TICK-NASDAQ"],
+        ["TICK-NASDAQ"],
+        ["$TICK-NQ"],
+        ["TICK-NQ"],
+        ["$TICK", "$TICKI", "$TICKQ"],
+        ["TICK", "TICKI", "TICKQ"],
     ]
 
     errors: List[str] = []
@@ -1371,10 +1379,51 @@ async def _build_tick_context(token: str) -> Dict[str, Any]:
                 errors.append(f"{','.join(symbols)}: no items")
                 continue
 
-            item = items[0]
-            value = _extract_market_data_value(item)
+            selected_item = None
+            selected_symbol = None
+
+            for requested in symbols:
+                preferred = requested.replace("$", "").upper()
+                for item in items:
+                    raw_symbol = (
+                        item.get("symbol")
+                        or item.get("streamer-symbol")
+                        or item.get("instrument-symbol")
+                        or item.get("eventSymbol")
+                        or ""
+                    )
+                    normalized = str(raw_symbol).replace("$", "").upper()
+                    if normalized == preferred:
+                        value = _extract_market_data_value(item)
+                        if value is not None:
+                            selected_item = item
+                            selected_symbol = requested
+                            break
+                if selected_item is not None:
+                    break
+
+            if selected_item is None:
+                for item in items:
+                    value = _extract_market_data_value(item)
+                    if value is not None:
+                        selected_item = item
+                        raw_symbol = (
+                            item.get("symbol")
+                            or item.get("streamer-symbol")
+                            or item.get("instrument-symbol")
+                            or item.get("eventSymbol")
+                            or symbols[0]
+                        )
+                        selected_symbol = str(raw_symbol)
+                        break
+
+            if selected_item is None:
+                errors.append(f"{','.join(symbols)}: items returned but no usable mark/last/mid/close value")
+                continue
+
+            value = _extract_market_data_value(selected_item)
             if value is None:
-                errors.append(f"{symbols[0]}: no usable mark/last/mid/close value")
+                errors.append(f"{','.join(symbols)}: no usable mark/last/mid/close value")
                 continue
 
             value = round(value, 4)
@@ -1382,7 +1431,7 @@ async def _build_tick_context(token: str) -> Dict[str, Any]:
                 "status": "confirmed",
                 "value": value,
                 "tick_state": _tick_state_from_value(value),
-                "source_symbol": symbols[0],
+                "source_symbol": selected_symbol,
                 "why": None,
             }
         except Exception as exc:
@@ -1390,7 +1439,7 @@ async def _build_tick_context(token: str) -> Dict[str, Any]:
 
     why = "TICK fetch did not return a usable value."
     if errors:
-        why = why + " Attempts: " + " | ".join(errors[:6])
+        why = why + " Attempts: " + " | ".join(errors[:8])
 
     return {
         "status": "unconfirmed",
@@ -2779,7 +2828,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "p_patch_ad_harden_2026_04_03",
+        "build_tag": "q_patch_tick_harden_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
