@@ -3647,6 +3647,7 @@ def _build_two_path_block(
             "ideal_path": ideal_text,
             "acceptable_path": "Stand down until all failed gates pass.",
             "invalidation_1h_ema50": ema,
+        
         }
 
     return {
