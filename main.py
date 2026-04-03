@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.3")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.4")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.3"
+USER_AGENT = "safe-fast-backend/1.9.4"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1489,6 +1489,21 @@ def _build_structure_context(
         candles=candles,
     )
 
+    room_required_for_pass = round((invalidation_distance * 2.0), 4) if invalidation_distance not in (None, 0) else None
+    room_shortfall = None
+    if wall_levels.get("room_distance") is not None and room_required_for_pass is not None:
+        room_shortfall = round(wall_levels.get("room_distance") - room_required_for_pass, 4)
+
+    if room_pass is True:
+        room_note = "Room passes the SAFE-FAST 2x invalidation rule."
+    elif room_pass is False:
+        room_note = (
+            f"Room fails the SAFE-FAST 2x invalidation rule: needs {room_required_for_pass}, "
+            f"has {wall_levels.get('room_distance')}."
+        )
+    else:
+        room_note = "Room could not be confirmed."
+
     return {
         "ok": True,
         "twentyfour_hour_trend": trend_ctx.get("label"),
@@ -1496,7 +1511,11 @@ def _build_structure_context(
         "twentyfour_hour_source": trend_ctx.get("source"),
         "first_wall": wall_levels.get("first_wall"),
         "next_pocket": wall_levels.get("next_pocket"),
+        "invalidation_distance": round(invalidation_distance, 4) if invalidation_distance is not None else None,
         "room_to_first_wall": wall_levels.get("room_distance"),
+        "room_required_for_pass": room_required_for_pass,
+        "room_shortfall": room_shortfall,
+        "room_note": room_note,
         "room_ratio": round(room_ratio, 3) if room_ratio is not None else None,
         "room_pass": room_pass,
         "wall_thesis": wall_ctx.get("wall_thesis"),
@@ -1594,6 +1613,8 @@ def _build_chart_confirmation_block(
             "latest_close": _status_field(chart_check.get("latest_close") if chart_check else None, one_hour_confirmed),
             "twentyfour_hour_trend": _status_field(structure_context.get("twentyfour_hour_trend"), structure_confirmed),
             "room_to_first_wall": _status_field(structure_context.get("room_to_first_wall"), structure_confirmed),
+            "room_required_for_pass": _status_field(structure_context.get("room_required_for_pass"), structure_confirmed),
+            "room_shortfall": _status_field(structure_context.get("room_shortfall"), structure_confirmed),
             "first_wall": _status_field(structure_context.get("first_wall"), structure_confirmed),
             "next_pocket": _status_field(structure_context.get("next_pocket"), structure_confirmed),
             "room_ratio": _status_field(structure_context.get("room_ratio"), structure_confirmed),
@@ -2332,10 +2353,25 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     if chart_check_block.get("_all_candles") is not None:
         chart_check_block = {k: v for k, v in chart_check_block.items() if k != "_all_candles"}
 
+    user_facing_block = _build_user_facing_block(
+        request=request,
+        engine_status=engine_status,
+        final_verdict=final_verdict,
+        best_ticker=best_ticker,
+        chart_check=chart_check,
+        chart_check_error=chart_check_error,
+        engine_reason=selected_reason,
+        market_context=market_context,
+        macro_context=macro_context,
+        structure_context=structure_context,
+        time_day_gate=time_day_gate,
+        liquidity_context=liquidity_context,
+    )
+
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "f_patch_trigger_signal_split_2026_04_03",
+        "build_tag": "h_patch_simple_output_2026_04_03",
         "source_of_truth": "candidate_engine",
         "engine_status": engine_status,
         "candidate_engine_status": candidate_engine_status,
@@ -2404,20 +2440,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             chart_check_error=chart_check_error,
             structure_context=structure_context,
         ),
-        "user_facing": _build_user_facing_block(
-            request=request,
-            engine_status=engine_status,
-            final_verdict=final_verdict,
-            best_ticker=best_ticker,
-            chart_check=chart_check,
-            chart_check_error=chart_check_error,
-            engine_reason=selected_reason,
-            market_context=market_context,
-            macro_context=macro_context,
-            structure_context=structure_context,
-            time_day_gate=time_day_gate,
-            liquidity_context=liquidity_context,
+        "simple_output": _build_simple_output_block(
+            user_facing=user_facing_block,
+            trigger_state=trigger_state,
         ),
+        "user_facing": user_facing_block,
         "two_path": _build_two_path_block(
             market_context=market_context,
             time_day_gate=time_day_gate,
@@ -2580,6 +2607,27 @@ def _build_journal_context_block(
     }
 
 
+
+def _build_simple_output_block(
+    user_facing: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    signal_present = bool(
+        trigger_state.get("signal_present") is True
+        or trigger_state.get("trigger_present") is True
+    )
+
+    return {
+        "design_goal": "complex_inputs_simple_outputs",
+        "good_idea_now": user_facing.get("good_idea_now"),
+        "ticker": user_facing.get("ticker"),
+        "action": user_facing.get("action"),
+        "invalidation": user_facing.get("invalidation"),
+        "setup_state": user_facing.get("setup_state"),
+        "why": user_facing.get("why"),
+        "signal_present": signal_present,
+    }
+
 def _build_two_path_block(
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
@@ -2590,8 +2638,12 @@ def _build_two_path_block(
     ema = chart_check.get("ema50_1h") if chart_check else None
 
     if market_context.get("is_open") is False:
+        room_note = structure_context.get("room_note")
+        ideal_path = "Wait for next regular session. Re-check before entry."
+        if room_note:
+            ideal_path = f"{ideal_path} {room_note}"
         return {
-            "ideal_path": "Wait for next regular session. Re-check before entry.",
+            "ideal_path": ideal_path,
             "acceptable_path": "No entry while market is closed.",
             "invalidation_1h_ema50": ema,
         }
