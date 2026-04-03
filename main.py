@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.22")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.23")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.22"
+USER_AGENT = "safe-fast-backend/1.9.23"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1974,6 +1974,8 @@ def _wall_thesis(
         return {
             "wall_thesis": "unconfirmed",
             "wall_pass": None,
+            "room_basis": "unconfirmed",
+            "effective_wall": None,
         }
 
     short_strike = _to_float(primary_candidate.get("short_strike"))
@@ -1981,27 +1983,54 @@ def _wall_thesis(
         return {
             "wall_thesis": "unconfirmed",
             "wall_pass": None,
+            "room_basis": "unconfirmed",
+            "effective_wall": None,
         }
 
     next_pocket_room = None
     if next_pocket is not None and invalidation_distance not in (None, 0):
         next_pocket_room = abs(next_pocket - first_wall) / invalidation_distance
 
+    through_wall_candidate = False
+    if option_type == "C":
+        through_wall_candidate = next_pocket is not None and short_strike > next_pocket
+    else:
+        through_wall_candidate = next_pocket is not None and short_strike < next_pocket
+
+    if through_wall_candidate and next_pocket is not None:
+        return {
+            "wall_thesis": "THROUGH_THE_WALL",
+            "wall_pass": True,
+            "next_pocket_room_ratio": next_pocket_room,
+            "room_basis": "next_pocket",
+            "effective_wall": next_pocket,
+        }
+
     if option_type == "C":
         if short_strike > first_wall:
-            return {"wall_thesis": "TO_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
-        if next_pocket is not None and (next_pocket_room or 0) >= 1.5:
-            return {"wall_thesis": "THROUGH_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
+            return {
+                "wall_thesis": "TO_THE_WALL",
+                "wall_pass": True,
+                "next_pocket_room_ratio": next_pocket_room,
+                "room_basis": "first_wall",
+                "effective_wall": first_wall,
+            }
     else:
         if short_strike < first_wall:
-            return {"wall_thesis": "TO_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
-        if next_pocket is not None and (next_pocket_room or 0) >= 1.5:
-            return {"wall_thesis": "THROUGH_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
+            return {
+                "wall_thesis": "TO_THE_WALL",
+                "wall_pass": True,
+                "next_pocket_room_ratio": next_pocket_room,
+                "room_basis": "first_wall",
+                "effective_wall": first_wall,
+            }
 
     return {
         "wall_thesis": "WALL_MISMATCH",
         "wall_pass": False,
         "next_pocket_room_ratio": next_pocket_room,
+        "room_basis": "first_wall",
+        "effective_wall": first_wall,
     }
 
 
@@ -2137,11 +2166,6 @@ def _build_structure_context(
     trend_ctx = _twentyfour_hour_context(candles, option_type)
     wall_levels = _find_wall_levels(candles, latest_close, option_type)
     invalidation_distance = abs(latest_close - ema50_1h) if ema50_1h is not None else None
-    room_ratio = None
-    if wall_levels["room_distance"] is not None and invalidation_distance not in (None, 0):
-        room_ratio = wall_levels["room_distance"] / invalidation_distance
-
-    room_pass = (room_ratio is not None and room_ratio >= 2.0)
     extension_ctx = _extension_state(symbol, latest_close, ema50_1h, wall_levels.get("first_wall"))
     wall_ctx = _wall_thesis(
         option_type=option_type,
@@ -2150,6 +2174,17 @@ def _build_structure_context(
         next_pocket=wall_levels.get("next_pocket"),
         invalidation_distance=invalidation_distance,
     )
+
+    effective_wall = wall_ctx.get("effective_wall")
+    effective_room_distance = None
+    if effective_wall is not None:
+        effective_room_distance = round(abs(effective_wall - latest_close), 4)
+
+    room_ratio = None
+    if effective_room_distance is not None and invalidation_distance not in (None, 0):
+        room_ratio = effective_room_distance / invalidation_distance
+
+    room_pass = (room_ratio is not None and room_ratio >= 2.0)
     setup_ctx = _setup_classifier(
         option_type=option_type,
         chart_check=chart_check,
@@ -2163,15 +2198,15 @@ def _build_structure_context(
 
     room_required_for_pass = round((invalidation_distance * 2.0), 4) if invalidation_distance not in (None, 0) else None
     room_shortfall = None
-    if wall_levels.get("room_distance") is not None and room_required_for_pass is not None:
-        room_shortfall = round(wall_levels.get("room_distance") - room_required_for_pass, 4)
+    if effective_room_distance is not None and room_required_for_pass is not None:
+        room_shortfall = round(effective_room_distance - room_required_for_pass, 4)
 
     if room_pass is True:
         room_note = "Room passes the SAFE-FAST 2x invalidation rule."
     elif room_pass is False:
         room_note = (
-            f"Room fails the SAFE-FAST 2x invalidation rule: needs {room_required_for_pass}, "
-            f"has {wall_levels.get('room_distance')}."
+            f"Room fails the SAFE-FAST 2x invalidation rule on {wall_ctx.get('room_basis')}: needs {room_required_for_pass}, "
+            f"has {effective_room_distance}."
         )
     else:
         room_note = "Room could not be confirmed."
@@ -2183,8 +2218,11 @@ def _build_structure_context(
         "twentyfour_hour_source": trend_ctx.get("source"),
         "first_wall": wall_levels.get("first_wall"),
         "next_pocket": wall_levels.get("next_pocket"),
+        "effective_wall": wall_ctx.get("effective_wall"),
+        "room_basis": wall_ctx.get("room_basis"),
         "invalidation_distance": round(invalidation_distance, 4) if invalidation_distance is not None else None,
         "room_to_first_wall": wall_levels.get("room_distance"),
+        "effective_room_distance": effective_room_distance,
         "room_required_for_pass": room_required_for_pass,
         "room_shortfall": room_shortfall,
         "room_note": room_note,
@@ -3051,7 +3089,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "u_patch_setup_classifier_refine_2026_04_03",
+        "build_tag": "v_patch_room_wall_refine_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
