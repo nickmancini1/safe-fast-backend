@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.6")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.7")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.6"
+USER_AGENT = "safe-fast-backend/1.9.7"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -669,6 +669,25 @@ async def _fetch_quotes(symbols: List[str], token: str) -> Any:
     return payload
 
 
+async def _fetch_index_quotes(symbols: List[str], token: str) -> Any:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{API_BASE}/market-data",
+            headers=_headers(token),
+            params={"index": ",".join(symbols)},
+        )
+
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {"raw": resp.text}
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=payload)
+
+    return payload
+
+
 async def _fetch_option_quotes(option_symbols: List[str], token: str) -> Any:
     if not option_symbols:
         return {"data": {"items": []}}
@@ -1233,10 +1252,63 @@ def _calc_atr(candles: List[Dict[str, Any]], length: int = 14) -> Optional[float
     return round(atr, 4)
 
 
+async def _build_vix_context(token: str) -> Dict[str, Any]:
+    try:
+        payload = await _fetch_index_quotes(["VIX"], token)
+        items = payload.get("data", {}).get("items", [])
+        if not items:
+            return {
+                "status": "unconfirmed",
+                "value": None,
+                "regime": None,
+                "why": "No VIX index quote was returned by the market-data endpoint.",
+            }
+
+        item = items[0]
+        value = None
+        for field in ("mark", "last", "mid", "close"):
+            value = _to_float(item.get(field))
+            if value is not None:
+                break
+
+        if value is None:
+            return {
+                "status": "unconfirmed",
+                "value": None,
+                "regime": None,
+                "why": "VIX quote payload did not include a usable mark/last/mid/close value.",
+            }
+
+        if value < 16:
+            regime = "calm"
+        elif value < 22:
+            regime = "normal"
+        elif value < 30:
+            regime = "elevated"
+        else:
+            regime = "high_stress"
+
+        return {
+            "status": "confirmed",
+            "value": round(value, 4),
+            "regime": regime,
+            "symbol": "VIX",
+            "why": None,
+        }
+    except Exception as exc:
+        return {
+            "status": "unconfirmed",
+            "value": None,
+            "regime": None,
+            "why": f"VIX fetch failed: {str(exc)}",
+        }
+
+
 def _build_indicator_context(
     best_ticker: Optional[str],
     chart_check: Optional[Dict[str, Any]],
     structure_context: Dict[str, Any],
+    vix_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     candles = chart_check.get("_all_candles", []) if chart_check else []
     latest_close = _to_float(chart_check.get("latest_close")) if chart_check else None
@@ -1304,7 +1376,7 @@ def _build_indicator_context(
             "value": None,
             "why": "TICK feed is not wired into the backend yet.",
         },
-        "vix": {
+        "vix": vix_context or {
             "status": "unconfirmed",
             "value": None,
             "regime": None,
@@ -2397,6 +2469,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="weekly_trade_count must be >= 0")
 
     token = await get_access_token()
+    vix_context = await _build_vix_context(token)
     summary_payload = await _build_summary_compact_payload(
         option_type=clean_option_type,
         min_dte=request.min_dte,
@@ -2495,7 +2568,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "k_patch_indicator_scaffold_2026_04_03",
+        "build_tag": "l_patch_vix_live_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -2519,6 +2592,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             best_ticker=best_ticker,
             chart_check=chart_check,
             structure_context=structure_context,
+            vix_context=vix_context,
         ),
         "structure_context": structure_context,
         "screenshot_traps_context": _build_screenshot_traps_context(
