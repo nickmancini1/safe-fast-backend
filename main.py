@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.20")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.21")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.20"
+USER_AGENT = "safe-fast-backend/1.9.21"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1312,6 +1312,52 @@ def _build_vwap_context_from_candles(candles: List[Dict[str, Any]]) -> Dict[str,
         "volume_field_used": chosen_field,
         "candle_count_with_volume": used,
         "why": None,
+    }
+
+
+def _build_volume_diagnostics_context(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    volume_fields = ["volume", "dayVolume", "totalVolume", "vol"]
+
+    if not candles:
+        return {
+            "ok": False,
+            "status": "no_candles",
+            "fields_checked": volume_fields,
+            "candle_count": 0,
+            "volume_field_counts": {field: 0 for field in volume_fields},
+            "usable_volume_fields": [],
+            "sample_preview": [],
+            "why": "No candle data is available for volume diagnostics.",
+        }
+
+    counts = {field: 0 for field in volume_fields}
+    preview = []
+
+    for candle in candles[:3]:
+        preview.append(
+            {
+                field: candle.get(field)
+                for field in volume_fields
+            }
+        )
+
+    for candle in candles:
+        for field in volume_fields:
+            value = _to_float(candle.get(field))
+            if value is not None and value > 0:
+                counts[field] += 1
+
+    usable_fields = [field for field, count in counts.items() if count > 0]
+
+    return {
+        "ok": True,
+        "status": "usable_volume_found" if usable_fields else "no_usable_volume",
+        "fields_checked": volume_fields,
+        "candle_count": len(candles),
+        "volume_field_counts": counts,
+        "usable_volume_fields": usable_fields,
+        "sample_preview": preview,
+        "why": None if usable_fields else "No checked candle volume field contained usable positive values.",
     }
 
 
@@ -2953,7 +2999,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "s_patch_vwap_path_2026_04_03",
+        "build_tag": "t_patch_volume_diagnostics_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -2980,6 +3026,9 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             vix_context=vix_context,
             advance_decline_context=advance_decline_context,
             tick_context=tick_context,
+        ),
+        "volume_diagnostics_context": _build_volume_diagnostics_context(
+            chart_check.get("_all_candles", []) if chart_check else []
         ),
         "indicator_filter_context": _build_indicator_filter_context(
             indicator_context=_build_indicator_context(
