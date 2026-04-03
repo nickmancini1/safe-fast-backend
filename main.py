@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.0")
+app = FastAPI(title="SAFE-FAST Backend", version="1.10.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.0"
+USER_AGENT = "safe-fast-backend/1.10.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2273,6 +2273,16 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             market_context=market_context,
         ),
         "journal_context": _build_journal_context_block(
+        "account_state_context": _build_account_state_context(
+            request=request,
+            market_context=market_context,
+        ),
+        "system_enforcement": _build_system_enforcement_block(
+            request=request,
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+            checklist=checklist_block,
+        ),
             request=request,
             market_context=market_context,
             best_ticker=best_ticker,
@@ -2333,6 +2343,71 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             checklist=checklist_block,
             chart_check=chart_check,
         ),
+    }
+
+
+
+def _build_account_state_context(request: OnDemandRequest, market_context: Dict[str, Any]) -> Dict[str, Any]:
+    max_open_positions = 1
+    weekly_soft_min = 2
+    weekly_soft_max = 4
+    can_open_new_trade = request.open_positions < max_open_positions
+
+    if request.weekly_trade_count < weekly_soft_min:
+        weekly_status = "under_soft_band"
+    elif request.weekly_trade_count <= weekly_soft_max:
+        weekly_status = "within_soft_band"
+    else:
+        weekly_status = "over_soft_band"
+
+    return {
+        "ok": True,
+        "account_size_dollars": 1000,
+        "preferred_risk_band_dollars": [250.0, 300.0],
+        "hard_max_risk_dollars": 400.0,
+        "max_open_positions": max_open_positions,
+        "weekly_trade_soft_band": [weekly_soft_min, weekly_soft_max],
+        "open_positions": request.open_positions,
+        "weekly_trade_count": request.weekly_trade_count,
+        "can_open_new_trade": can_open_new_trade,
+        "weekly_trade_status": weekly_status,
+        "market_open": market_context.get("is_open"),
+        "enforcement_note": (
+            "No new trade should be opened when open_positions is already 1 or greater."
+            if not can_open_new_trade
+            else "Account state allows evaluation of a fresh trade, subject to all SAFE-FAST gates."
+        ),
+    }
+
+
+def _build_system_enforcement_block(
+    request: OnDemandRequest,
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    checklist: Dict[str, Any],
+) -> Dict[str, Any]:
+    failed_items = checklist.get("failed_items", []) if checklist else []
+    can_open_new_trade = request.open_positions <= 0
+    weekly_count = request.weekly_trade_count
+
+    return {
+        "ok": True,
+        "new_trade_allowed_by_position_limit": can_open_new_trade,
+        "new_trade_allowed_by_market_hours": bool(market_context.get("is_open")),
+        "fresh_entry_allowed_now": bool(time_day_gate.get("fresh_entry_allowed")),
+        "weekly_trade_count": weekly_count,
+        "over_weekly_soft_cap": weekly_count > 4,
+        "position_limit_note": (
+            "second position = system says NO"
+            if not can_open_new_trade
+            else "position limit is clear"
+        ),
+        "gating_summary": (
+            "NO_TRADE"
+            if failed_items or not can_open_new_trade or not time_day_gate.get("fresh_entry_allowed")
+            else "PENDING_OR_TRADE_REVIEW"
+        ),
+        "failed_items": failed_items,
     }
 
 
