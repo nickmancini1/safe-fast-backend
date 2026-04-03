@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.11")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.12")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.11"
+USER_AGENT = "safe-fast-backend/1.9.12"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1253,55 +1253,69 @@ def _calc_atr(candles: List[Dict[str, Any]], length: int = 14) -> Optional[float
 
 
 async def _build_vix_context(token: str) -> Dict[str, Any]:
-    try:
-        payload = await _fetch_index_quotes(["VIX"], token)
-        items = payload.get("data", {}).get("items", [])
-        if not items:
-            return {
-                "status": "unconfirmed",
-                "value": None,
-                "regime": None,
-                "why": "No VIX index quote was returned by the market-data endpoint.",
-            }
+    attempts = [
+        ["VIX"],
+        ["^VIX"],
+        ["VIX.X"],
+        ["$VIX.X"],
+        ["VIX", "^VIX"],
+        ["VIX.X", "$VIX.X"],
+    ]
 
-        item = items[0]
-        value = None
-        for field in ("mark", "last", "mid", "close"):
-            value = _to_float(item.get(field))
-            if value is not None:
-                break
+    errors: List[str] = []
 
-        if value is None:
-            return {
-                "status": "unconfirmed",
-                "value": None,
-                "regime": None,
-                "why": "VIX quote payload did not include a usable mark/last/mid/close value.",
-            }
+    for symbols in attempts:
+        try:
+            payload = await _fetch_index_quotes(symbols, token)
+            items = payload.get("data", {}).get("items", [])
+            if not items:
+                errors.append(f"{','.join(symbols)}: no items")
+                continue
 
-        if value < 16:
-            regime = "calm"
-        elif value < 22:
-            regime = "normal"
-        elif value < 30:
-            regime = "elevated"
-        else:
-            regime = "high_stress"
+            for idx, item in enumerate(items):
+                value = _extract_market_data_value(item)
+                if value is None:
+                    continue
 
-        return {
-            "status": "confirmed",
-            "value": round(value, 4),
-            "regime": regime,
-            "symbol": "VIX",
-            "why": None,
-        }
-    except Exception as exc:
-        return {
-            "status": "unconfirmed",
-            "value": None,
-            "regime": None,
-            "why": f"VIX fetch failed: {str(exc)}",
-        }
+                symbol = (
+                    item.get("symbol")
+                    or item.get("streamer-symbol")
+                    or item.get("index-symbol")
+                    or symbols[min(idx, len(symbols) - 1)]
+                )
+
+                if value < 16:
+                    regime = "calm"
+                elif value < 22:
+                    regime = "normal"
+                elif value < 30:
+                    regime = "elevated"
+                else:
+                    regime = "high_stress"
+
+                return {
+                    "status": "confirmed",
+                    "value": round(value, 4),
+                    "regime": regime,
+                    "symbol": symbol,
+                    "why": None,
+                }
+
+            errors.append(f"{','.join(symbols)}: items returned but no usable mark/last/mid/close value")
+        except Exception as exc:
+            errors.append(f"{','.join(symbols)}: {str(exc)}")
+
+    why = "VIX fetch did not return a usable value."
+    if errors:
+        why = why + " Attempts: " + " | ".join(errors[:6])
+
+    return {
+        "status": "unconfirmed",
+        "value": None,
+        "regime": None,
+        "symbol": None,
+        "why": why,
+    }
 
 
 
@@ -2740,7 +2754,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "n_patch_tick_live_2026_04_03",
+        "build_tag": "o_patch_vix_harden_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
