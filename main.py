@@ -425,8 +425,8 @@ def _parse_month_day_year(raw: str, fallback_year: int) -> Optional[datetime.dat
     day_token = parts[1]
     if "-" in day_token:
         day_token = day_token.split("-")[0]
-    if "â" in day_token:
-        day_token = day_token.split("â")[0]
+    if "Ã¢ÂÂ" in day_token:
+        day_token = day_token.split("Ã¢ÂÂ")[0]
     day_token = re.sub(r"[^0-9]", "", day_token)
     if not day_token:
         return None
@@ -445,7 +445,7 @@ def _extract_dates_by_patterns(text: str, fallback_year: int) -> List[datetime.d
     pattern = re.compile(
         r"(January|February|March|April|May|June|July|August|September|October|November|December|"
         r"Jan\.?|Feb\.?|Mar\.?|Apr\.?|May|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)"
-        r"\s+\d{1,2}(?:\s*[-â]\s*\d{1,2})?(?:,\s*\d{4}|\s+\d{4})?",
+        r"\s+\d{1,2}(?:\s*[-Ã¢ÂÂ]\s*\d{1,2})?(?:,\s*\d{4}|\s+\d{4})?",
         re.IGNORECASE,
     )
     out: List[datetime.date] = []
@@ -1541,13 +1541,17 @@ def _build_chart_confirmation_block(
 ) -> Dict[str, Any]:
     one_hour_confirmed = bool(chart_check and chart_check.get("ok"))
     structure_confirmed = bool(structure_context.get("ok"))
-    message = (
-        "Candidate engine result only - chart confirmation still required. Chart check failed in this run."
-        if chart_check_error
-        else "Candidate engine result only - chart confirmation still required."
-    )
+    confirmed = bool(one_hour_confirmed and structure_confirmed and not chart_check_error)
+
+    if chart_check_error:
+        message = "Chart check failed in this run."
+    elif confirmed:
+        message = "Chart confirmation fields are present in this run."
+    else:
+        message = "Candidate engine result only - chart confirmation still required."
+
     return {
-        "confirmed": False,
+        "confirmed": confirmed,
         "message": message,
         "fields": {
             "one_hour_50_ema": _status_field(chart_check.get("ema50_1h") if chart_check else None, one_hour_confirmed),
@@ -2199,8 +2203,9 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     selected = screened_candidates[0] if screened_candidates else None
 
     best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
-    engine_status = selected.get("engine_verdict", "NO_TRADE") if selected else summary_payload.get("verdict", "NO_TRADE")
+    candidate_engine_status = selected.get("engine_verdict", "NO_TRADE") if selected else summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
+    engine_status = final_verdict
     primary_candidate = selected.get("primary_candidate") if selected else summary_payload.get("primary_candidate")
     chart_check = selected.get("chart_check") if selected else None
     chart_check_error = selected.get("chart_check_error") if selected else None
@@ -2247,6 +2252,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "mode": "on_demand",
         "source_of_truth": "candidate_engine",
         "engine_status": engine_status,
+        "candidate_engine_status": candidate_engine_status,
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
         "engine_best_ticker": summary_payload.get("best_ticker"),
