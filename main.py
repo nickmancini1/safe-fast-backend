@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.5")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.6")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.5"
+USER_AGENT = "safe-fast-backend/1.9.6"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1201,6 +1201,125 @@ def _calc_ema(values: List[float], length: int) -> Optional[float]:
     return round(ema, 4)
 
 
+def _calc_atr(candles: List[Dict[str, Any]], length: int = 14) -> Optional[float]:
+    if not candles or len(candles) < 2:
+        return None
+
+    true_ranges: List[float] = []
+    prev_close: Optional[float] = None
+
+    for candle in candles:
+        high = _to_float(candle.get("high"))
+        low = _to_float(candle.get("low"))
+        close = _to_float(candle.get("close"))
+        if high is None or low is None or close is None:
+            continue
+
+        if prev_close is None:
+            tr = high - low
+        else:
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            )
+        true_ranges.append(tr)
+        prev_close = close
+
+    if len(true_ranges) < length:
+        return None
+
+    atr = sum(true_ranges[-length:]) / length
+    return round(atr, 4)
+
+
+def _build_indicator_context(
+    best_ticker: Optional[str],
+    chart_check: Optional[Dict[str, Any]],
+    structure_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    candles = chart_check.get("_all_candles", []) if chart_check else []
+    latest_close = _to_float(chart_check.get("latest_close")) if chart_check else None
+
+    closes = [
+        _to_float(c.get("close"))
+        for c in candles
+        if _to_float(c.get("close")) is not None
+    ]
+
+    ema20 = _calc_ema(closes, 20) if len(closes) >= 20 else None
+    atr14 = _calc_atr(candles, 14)
+
+    keltner_upper = None
+    keltner_lower = None
+    keltner_position = None
+    if ema20 is not None and atr14 is not None:
+        keltner_upper = round(ema20 + (2 * atr14), 4)
+        keltner_lower = round(ema20 - (2 * atr14), 4)
+        if latest_close is not None:
+            if latest_close > keltner_upper:
+                keltner_position = "above_upper"
+            elif latest_close < keltner_lower:
+                keltner_position = "below_lower"
+            else:
+                keltner_position = "inside_channel"
+
+    atr_pct = None
+    if atr14 is not None and latest_close not in (None, 0):
+        atr_pct = round((atr14 / latest_close) * 100, 3)
+
+    extension_note = None
+    if structure_context.get("extension_state") == "extended":
+        extension_note = "Core structure already flags extension; indicators are supporting context only."
+
+    return {
+        "ok": True,
+        "design_goal": "background_only_supporting_indicators",
+        "note": "Indicators are supporting context only and do not override core SAFE-FAST structure rules.",
+        "ticker": best_ticker,
+        "atr": {
+            "status": "confirmed" if atr14 is not None else "unconfirmed",
+            "length": 14,
+            "atr_14_1h": atr14,
+            "atr_percent_of_price": atr_pct,
+        },
+        "keltner": {
+            "status": "confirmed" if ema20 is not None and atr14 is not None else "unconfirmed",
+            "basis_ema_length": 20,
+            "atr_length": 14,
+            "multiplier": 2.0,
+            "middle_ema_20_1h": ema20,
+            "upper_band_1h": keltner_upper,
+            "lower_band_1h": keltner_lower,
+            "channel_position": keltner_position,
+        },
+        "vwap": {
+            "status": "unconfirmed",
+            "session_vwap": None,
+            "anchored_vwap": None,
+            "why": "Current chart feed snapshot does not include volume, so VWAP is not computed yet.",
+        },
+        "tick": {
+            "status": "unconfirmed",
+            "value": None,
+            "why": "TICK feed is not wired into the backend yet.",
+        },
+        "vix": {
+            "status": "unconfirmed",
+            "value": None,
+            "regime": None,
+            "why": "VIX feed is not wired into the backend yet.",
+        },
+        "advance_decline": {
+            "status": "unconfirmed",
+            "value": None,
+            "breadth_state": None,
+            "why": "Advance/Decline breadth feed is not wired into the backend yet.",
+        },
+        "extension_support_note": extension_note,
+    }
+
+
 def _candles_by_day_et(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     ordered_days: List[str] = []
@@ -2376,7 +2495,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "j_patch_simple_output_priority_2026_04_03",
+        "build_tag": "k_patch_indicator_scaffold_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -2396,6 +2515,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         ),
         "market_context": market_context,
         "macro_context": macro_context,
+        "indicator_context": _build_indicator_context(
+            best_ticker=best_ticker,
+            chart_check=chart_check,
+            structure_context=structure_context,
+        ),
         "structure_context": structure_context,
         "screenshot_traps_context": _build_screenshot_traps_context(
             structure_context=structure_context,
