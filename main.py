@@ -2264,6 +2264,7 @@ def _final_verdict(
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    screenshot_traps_context: Dict[str, Any],
 ) -> str:
     if request.open_positions > 0:
         return "NO_TRADE"
@@ -2292,6 +2293,8 @@ def _final_verdict(
             return "NO_TRADE"
         if structure_context.get("allowed_setup") is False:
             return "NO_TRADE"
+    if _trap_blocks_trade(screenshot_traps_context):
+        return "NO_TRADE"
     return "PENDING"
 
 
@@ -2371,6 +2374,7 @@ def _build_user_facing_block(
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    screenshot_traps_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
@@ -2417,6 +2421,9 @@ def _build_user_facing_block(
                 blocking_reasons.append("Wall thesis and strike placement do not match.")
         elif chart_check_error:
             blocking_reasons.append("Candidate engine result only - chart confirmation still required.")
+
+        if _trap_blocks_trade(screenshot_traps_context):
+            blocking_reasons.append(_trap_failure_user_text(screenshot_traps_context))
 
         if blocking_reasons:
             return {
@@ -2760,6 +2767,7 @@ def _failed_reason_messages(
     structure_context: Dict[str, Any],
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    screenshot_traps_context: Dict[str, Any],
 ) -> List[str]:
     reasons: List[str] = []
 
@@ -2799,6 +2807,8 @@ def _failed_reason_messages(
             liquidity_context.get("why")
             or "Bid/ask widths or entry slippage are too wide for a clean SAFE-FAST debit spread entry."
         )
+
+    reasons.extend(_trap_failed_reason_messages(screenshot_traps_context))
 
     # de-duplicate while preserving order
     out: List[str] = []
@@ -2927,6 +2937,12 @@ async def _screen_ticker_candidate(
         primary_candidate=primary_candidate,
     ) if symbol else {"ok": False, "why": "no symbol"}
 
+    screenshot_traps_context = _build_screenshot_traps_context(
+        structure_context=structure_context,
+        chart_check=chart_check,
+        option_type=option_type,
+    )
+
     liquidity_context = _build_liquidity_block(primary_candidate)
     trigger_state = _build_trigger_state(
         option_type=option_type,
@@ -2946,6 +2962,7 @@ async def _screen_ticker_candidate(
         structure_context=structure_context,
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
+        screenshot_traps_context=screenshot_traps_context,
     )
 
     checklist = _build_checklist_block(
@@ -2974,6 +2991,8 @@ async def _screen_ticker_candidate(
             reason = "Move is too extended from the 1H 50 EMA."
         elif structure_context.get("allowed_setup") is False:
             reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
+        elif _trap_blocks_trade(screenshot_traps_context):
+            reason = _trap_failure_user_text(screenshot_traps_context)
         elif chart_alignment is False:
             reason = "Price is on the wrong side of the 1H 50 EMA."
 
@@ -2990,6 +3009,7 @@ async def _screen_ticker_candidate(
         "structure_context": structure_context,
         "liquidity_context": liquidity_context,
         "trigger_state": trigger_state,
+        "screenshot_traps_context": screenshot_traps_context,
         "checklist": checklist,
     }
 
@@ -3060,6 +3080,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         structure_context=structure_context,
         chart_check=chart_check,
     )
+    screenshot_traps_context = selected.get("screenshot_traps_context") if selected else _build_screenshot_traps_context(
+        structure_context=structure_context,
+        chart_check=chart_check,
+        option_type=clean_option_type,
+    )
     checklist_block = selected.get("checklist") if selected else _build_checklist_block(
         request=request,
         market_context=market_context,
@@ -3102,12 +3127,13 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         structure_context=structure_context,
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
+        screenshot_traps_context=screenshot_traps_context,
     )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "x_patch_screenshot_traps_2026_04_03",
+        "build_tag": "y_patch_trap_enforcement_sync_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3150,11 +3176,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             structure_context=structure_context,
         ),
         "structure_context": structure_context,
-        "screenshot_traps_context": _build_screenshot_traps_context(
-            structure_context=structure_context,
-            chart_check=chart_check,
-            option_type=clean_option_type,
-        ),
+        "screenshot_traps_context": screenshot_traps_context,
         "active_trade_flow": _build_active_trade_flow_block(
             request=request,
             option_type=clean_option_type,
@@ -3178,6 +3200,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
                 structure_context=structure_context,
                 liquidity_context=liquidity_context,
                 trigger_state=trigger_state,
+                screenshot_traps_context=screenshot_traps_context,
             ),
         ),
         "time_day_gate": time_day_gate,
@@ -3405,6 +3428,53 @@ def _build_screenshot_traps_context(
         "all_candles_available": bool(all_candles),
         "note": "Backend proxy now exposes hidden-left-level, chop, and exhaustion proxies, but full screenshot trap review still requires uploaded chart screenshots.",
     }
+
+def _trap_blocks_trade(screenshot_traps_context: Dict[str, Any]) -> bool:
+    if not screenshot_traps_context:
+        return False
+    if screenshot_traps_context.get("trap_summary") == "blocked":
+        return True
+
+    noisy_chop = screenshot_traps_context.get("noisy_chop") or {}
+    if noisy_chop.get("status") == "possible" and noisy_chop.get("backend_chop_risk") is True:
+        return True
+
+    return False
+
+
+def _trap_failure_user_text(screenshot_traps_context: Dict[str, Any]) -> str:
+    if not screenshot_traps_context:
+        return "Screenshot trap proxy blocks this setup."
+
+    if screenshot_traps_context.get("hidden_left_level_pass") is False:
+        return "Hidden left-side level sits inside the room."
+    noisy_chop = screenshot_traps_context.get("noisy_chop") or {}
+    if noisy_chop.get("status") == "possible" and noisy_chop.get("backend_chop_risk") is True:
+        return "Noisy chop proxy is too high for a clean SAFE-FAST entry."
+    volume_climax = screenshot_traps_context.get("volume_climax") or {}
+    if volume_climax.get("status") == "possible":
+        return "Exhaustion proxy is elevated for a clean SAFE-FAST entry."
+    return "Screenshot trap proxy blocks this setup."
+
+
+def _trap_failed_reason_messages(screenshot_traps_context: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    if not screenshot_traps_context:
+        return reasons
+
+    if screenshot_traps_context.get("hidden_left_level_pass") is False:
+        reasons.append("hidden left-side level sits inside the room")
+
+    noisy_chop = screenshot_traps_context.get("noisy_chop") or {}
+    if noisy_chop.get("status") == "possible" and noisy_chop.get("backend_chop_risk") is True:
+        reasons.append("noisy chop proxy is possible")
+
+    volume_climax = screenshot_traps_context.get("volume_climax") or {}
+    if volume_climax.get("status") == "possible":
+        reasons.append("exhaustion proxy is possible")
+
+    return reasons
+
 
 def _build_active_trade_flow_block(
     request: OnDemandRequest,
