@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.1")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.2")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.1"
+USER_AGENT = "safe-fast-backend/1.9.2"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1802,34 +1802,25 @@ def _build_trigger_state(
     chart_check: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     trigger_style = "close_above_recent_high" if option_type == "C" else "close_below_recent_low"
-
-    if not market_context.get("is_open"):
-        return {
-            "ok": True,
-            "trigger_present": False,
-            "trigger_style": trigger_style,
-            "trigger_level": None,
-            "current_close": chart_check.get("latest_close") if chart_check else None,
-            "why": "market_closed",
-        }
-
-    if not time_day_gate.get("fresh_entry_allowed"):
-        return {
-            "ok": True,
-            "trigger_present": False,
-            "trigger_style": trigger_style,
-            "trigger_level": None,
-            "current_close": chart_check.get("latest_close") if chart_check else None,
-            "why": time_day_gate.get("reason", "time_day_gate_blocked"),
-        }
+    market_open = bool(market_context.get("is_open"))
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
 
     if not chart_check or not chart_check.get("ok"):
         return {
             "ok": False,
+            "entry_state": "UNCONFIRMED_CHART",
             "trigger_present": False,
             "trigger_style": trigger_style,
             "trigger_level": None,
             "current_close": None,
+            "price_vs_ema50_1h": None,
+            "price_vs_trigger": None,
+            "distance_to_trigger": None,
+            "crossed_trigger": False,
+            "structure_ready": False,
+            "market_open": market_open,
+            "fresh_entry_allowed": fresh_entry_allowed,
+            "entry_blockers": ["chart_unavailable"],
             "why": "chart_unavailable",
         }
 
@@ -1840,10 +1831,19 @@ def _build_trigger_state(
     if len(recent) < 2 or current_close is None:
         return {
             "ok": False,
+            "entry_state": "UNCONFIRMED_CHART",
             "trigger_present": False,
             "trigger_style": trigger_style,
             "trigger_level": None,
-            "current_close": current_close,
+            "current_close": _round_or_none(current_close, 4),
+            "price_vs_ema50_1h": price_side,
+            "price_vs_trigger": None,
+            "distance_to_trigger": None,
+            "crossed_trigger": False,
+            "structure_ready": False,
+            "market_open": market_open,
+            "fresh_entry_allowed": fresh_entry_allowed,
+            "entry_blockers": ["insufficient_recent_candles"],
             "why": "insufficient_recent_candles",
         }
 
@@ -1869,24 +1869,57 @@ def _build_trigger_state(
         and structure_context.get("chop_risk") is False
     )
 
-    trigger_present = bool(crossed and side_ok and structure_ok)
-
-    why = "trigger_present"
+    entry_blockers: List[str] = []
+    if not market_open:
+        entry_blockers.append("market_closed")
+    if market_open and not fresh_entry_allowed:
+        entry_blockers.append(time_day_gate.get("reason", "time_day_gate_blocked"))
     if not structure_ok:
+        entry_blockers.append("structure_not_ready")
+    if not side_ok:
+        entry_blockers.append("wrong_side_of_ema")
+    if not crossed:
+        entry_blockers.append("close_trigger_not_hit")
+
+    trigger_present = bool(crossed and side_ok and structure_ok and market_open and fresh_entry_allowed)
+
+    if trigger_present:
+        entry_state = "ACTIVE_NOW"
+        why = "trigger_present"
+    elif not market_open:
+        entry_state = "BLOCKED_MARKET_CLOSED"
+        why = "market_closed"
+    elif not fresh_entry_allowed:
+        entry_state = "BLOCKED_TIME_WINDOW"
+        why = time_day_gate.get("reason", "time_day_gate_blocked")
+    elif not structure_ok:
+        entry_state = "NO_TRADE_STRUCTURE"
         why = "structure_not_ready"
-    elif not side_ok:
-        why = "wrong_side_of_ema"
-    elif not crossed:
-        why = "close_trigger_not_hit"
+    else:
+        entry_state = "PENDING_TRIGGER"
+        why = "close_trigger_not_hit" if not crossed else "wrong_side_of_ema"
+
+    price_vs_trigger = None
+    distance_to_trigger = None
+    if trigger_level is not None:
+        price_vs_trigger = round(current_close - trigger_level, 4)
+        distance_to_trigger = round(abs(current_close - trigger_level), 4)
 
     return {
         "ok": True,
+        "entry_state": entry_state,
         "trigger_present": trigger_present,
         "trigger_style": trigger_style,
         "trigger_level": _round_or_none(trigger_level, 4),
         "current_close": _round_or_none(current_close, 4),
         "price_vs_ema50_1h": price_side,
+        "price_vs_trigger": _round_or_none(price_vs_trigger, 4),
+        "distance_to_trigger": _round_or_none(distance_to_trigger, 4),
+        "crossed_trigger": crossed,
         "structure_ready": structure_ok,
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "entry_blockers": entry_blockers,
         "why": why,
     }
 
@@ -2297,7 +2330,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "d_patch_liquidity_debug_2026_04_03",
+        "build_tag": "e_patch_trigger_state_2026_04_03",
         "source_of_truth": "candidate_engine",
         "engine_status": engine_status,
         "candidate_engine_status": candidate_engine_status,
