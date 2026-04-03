@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.4")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.5")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.4"
+USER_AGENT = "safe-fast-backend/1.9.5"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1741,7 +1741,7 @@ def _build_user_facing_block(
             "why": liquidity_context.get("why") or "Options liquidity is too wide for a clean SAFE-FAST entry.",
         }
 
-    if engine_status == "NO_TRADE" or not best_ticker:
+    if not best_ticker:
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
@@ -1793,11 +1793,16 @@ def _build_user_facing_block(
         why = "Best ticker failed the 1H EMA alignment check."
         if chart_check_error:
             why = "Chart check failed in this run."
+        invalidation_text = (
+            f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}."
+            if best_ticker and chart_check and chart_check.get("ok")
+            else "No valid new entry from the current combined read."
+        )
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
             "action": "stand down",
-            "invalidation": "No valid new entry from the current combined read.",
+            "invalidation": invalidation_text,
             "setup_state": "NO TRADE",
             "why": why,
         }
@@ -2371,7 +2376,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "h_patch_simple_output_2026_04_03",
+        "build_tag": "i_patch_user_facing_invalidation_2026_04_03",
         "source_of_truth": "candidate_engine",
         "engine_status": engine_status,
         "candidate_engine_status": candidate_engine_status,
