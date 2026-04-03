@@ -2376,13 +2376,19 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "i_patch_user_facing_invalidation_2026_04_03",
+        "build_tag": "j_patch_simple_output_priority_2026_04_03",
         "source_of_truth": "candidate_engine",
+        "read_this_first": "simple_output",
         "engine_status": engine_status,
         "candidate_engine_status": candidate_engine_status,
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
         "engine_best_ticker": summary_payload.get("best_ticker"),
+        "simple_output": _build_simple_output_block(
+            user_facing=user_facing_block,
+            trigger_state=trigger_state,
+        ),
+        "user_facing": user_facing_block,
         "screened_best_context": _build_screened_best_context(
             selected=selected,
             engine_best_ticker=summary_payload.get("best_ticker"),
@@ -2445,11 +2451,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             chart_check_error=chart_check_error,
             structure_context=structure_context,
         ),
-        "simple_output": _build_simple_output_block(
-            user_facing=user_facing_block,
-            trigger_state=trigger_state,
-        ),
-        "user_facing": user_facing_block,
         "two_path": _build_two_path_block(
             market_context=market_context,
             time_day_gate=time_day_gate,
