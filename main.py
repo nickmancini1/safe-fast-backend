@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.2")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.3")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.2"
+USER_AGENT = "safe-fast-backend/1.9.3"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1881,7 +1881,8 @@ def _build_trigger_state(
     if not crossed:
         entry_blockers.append("close_trigger_not_hit")
 
-    trigger_present = bool(crossed and side_ok and structure_ok and market_open and fresh_entry_allowed)
+    signal_present = bool(crossed and side_ok)
+    trigger_present = bool(signal_present and structure_ok and market_open and fresh_entry_allowed)
 
     if trigger_present:
         entry_state = "ACTIVE_NOW"
@@ -1892,6 +1893,9 @@ def _build_trigger_state(
     elif not fresh_entry_allowed:
         entry_state = "BLOCKED_TIME_WINDOW"
         why = time_day_gate.get("reason", "time_day_gate_blocked")
+    elif signal_present and not structure_ok:
+        entry_state = "SIGNAL_PRESENT_BUT_BLOCKED"
+        why = "structure_not_ready"
     elif not structure_ok:
         entry_state = "NO_TRADE_STRUCTURE"
         why = "structure_not_ready"
@@ -1908,6 +1912,7 @@ def _build_trigger_state(
     return {
         "ok": True,
         "entry_state": entry_state,
+        "signal_present": signal_present,
         "trigger_present": trigger_present,
         "trigger_style": trigger_style,
         "trigger_level": _round_or_none(trigger_level, 4),
@@ -1978,7 +1983,7 @@ def _build_checklist_block(
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
         {"item": "early_enough", "yes": bool(time_day_gate.get("fresh_entry_allowed"))},
-        {"item": "clear_trigger", "yes": bool(trigger_state.get("trigger_present") is True)},
+        {"item": "clear_trigger", "yes": bool(trigger_state.get("signal_present") is True)},
         {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
         {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
         {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
@@ -2330,7 +2335,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "e_patch_trigger_state_2026_04_03",
+        "build_tag": "f_patch_trigger_signal_split_2026_04_03",
         "source_of_truth": "candidate_engine",
         "engine_status": engine_status,
         "candidate_engine_status": candidate_engine_status,
