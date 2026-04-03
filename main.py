@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.7")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.8")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.7"
+USER_AGENT = "safe-fast-backend/1.9.8"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1304,11 +1304,115 @@ async def _build_vix_context(token: str) -> Dict[str, Any]:
         }
 
 
+
+def _extract_market_data_value(item: Dict[str, Any]) -> Optional[float]:
+    for field in ("mark", "last", "mid", "close", "price", "value"):
+        value = _to_float(item.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def _breadth_state_from_value(value: float) -> str:
+    if value >= 1000:
+        return "strongly_positive"
+    if value > 0:
+        return "positive"
+    if value <= -1000:
+        return "strongly_negative"
+    if value < 0:
+        return "negative"
+    return "neutral"
+
+
+async def _build_advance_decline_context(token: str) -> Dict[str, Any]:
+    attempts = [
+        {"mode": "difference", "symbols": ["$ADUSD"]},
+        {"mode": "difference", "symbols": ["ADUSD"]},
+        {"mode": "components", "symbols": ["$ADVUS", "$DECLUS"]},
+        {"mode": "components", "symbols": ["ADVUS", "DECLUS"]},
+    ]
+
+    errors: List[str] = []
+
+    for attempt in attempts:
+        try:
+            payload = await _fetch_index_quotes(attempt["symbols"], token)
+            items = payload.get("data", {}).get("items", [])
+            if not items:
+                errors.append(f"{','.join(attempt['symbols'])}: no items")
+                continue
+
+            if attempt["mode"] == "difference":
+                value = _extract_market_data_value(items[0])
+                if value is None:
+                    errors.append(f"{attempt['symbols'][0]}: no usable mark/last/mid/close value")
+                    continue
+                value = round(value, 4)
+                return {
+                    "status": "confirmed",
+                    "value": value,
+                    "breadth_state": _breadth_state_from_value(value),
+                    "source_symbol": attempt["symbols"][0],
+                    "why": None,
+                }
+
+            symbol_map: Dict[str, Dict[str, Any]] = {}
+            for item in items:
+                raw_symbol = (
+                    item.get("symbol")
+                    or item.get("streamer-symbol")
+                    or item.get("instrument-symbol")
+                    or item.get("eventSymbol")
+                    or ""
+                )
+                normalized = str(raw_symbol).replace("$", "").upper()
+                symbol_map[normalized] = item
+
+            adv_item = symbol_map.get("ADVUS")
+            dec_item = symbol_map.get("DECLUS")
+            if not adv_item or not dec_item:
+                errors.append(f"{','.join(attempt['symbols'])}: ADVUS/DECLUS items not both returned")
+                continue
+
+            adv_value = _extract_market_data_value(adv_item)
+            dec_value = _extract_market_data_value(dec_item)
+            if adv_value is None or dec_value is None:
+                errors.append(f"{','.join(attempt['symbols'])}: ADVUS/DECLUS values unusable")
+                continue
+
+            value = round(adv_value - dec_value, 4)
+            return {
+                "status": "confirmed",
+                "value": value,
+                "breadth_state": _breadth_state_from_value(value),
+                "source_symbol": "ADVUS-DECLUS",
+                "advancing_issues": round(adv_value, 4),
+                "declining_issues": round(dec_value, 4),
+                "why": None,
+            }
+        except Exception as exc:
+            errors.append(f"{','.join(attempt['symbols'])}: {str(exc)}")
+
+    why = "Advance/Decline breadth fetch did not return a usable value."
+    if errors:
+        why = why + " Attempts: " + " | ".join(errors[:4])
+
+    return {
+        "status": "unconfirmed",
+        "value": None,
+        "breadth_state": None,
+        "source_symbol": None,
+        "why": why,
+    }
+
+
 def _build_indicator_context(
     best_ticker: Optional[str],
     chart_check: Optional[Dict[str, Any]],
     structure_context: Dict[str, Any],
     vix_context: Optional[Dict[str, Any]] = None,
+    advance_decline_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     candles = chart_check.get("_all_candles", []) if chart_check else []
     latest_close = _to_float(chart_check.get("latest_close")) if chart_check else None
@@ -1382,10 +1486,11 @@ def _build_indicator_context(
             "regime": None,
             "why": "VIX feed is not wired into the backend yet.",
         },
-        "advance_decline": {
+        "advance_decline": advance_decline_context or {
             "status": "unconfirmed",
             "value": None,
             "breadth_state": None,
+            "source_symbol": None,
             "why": "Advance/Decline breadth feed is not wired into the backend yet.",
         },
         "extension_support_note": extension_note,
@@ -2470,6 +2575,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     token = await get_access_token()
     vix_context = await _build_vix_context(token)
+    advance_decline_context = await _build_advance_decline_context(token)
     summary_payload = await _build_summary_compact_payload(
         option_type=clean_option_type,
         min_dte=request.min_dte,
@@ -2568,7 +2674,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "l_patch_vix_live_2026_04_03",
+        "build_tag": "m_patch_ad_live_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -2593,6 +2699,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             chart_check=chart_check,
             structure_context=structure_context,
             vix_context=vix_context,
+            advance_decline_context=advance_decline_context,
         ),
         "structure_context": structure_context,
         "screenshot_traps_context": _build_screenshot_traps_context(
