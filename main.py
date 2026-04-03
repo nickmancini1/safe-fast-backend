@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.8")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.11")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.8"
+USER_AGENT = "safe-fast-backend/1.9.11"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1325,6 +1325,68 @@ def _breadth_state_from_value(value: float) -> str:
     return "neutral"
 
 
+def _tick_state_from_value(value: float) -> str:
+    if value >= 1000:
+        return "strongly_positive"
+    if value >= 500:
+        return "positive"
+    if value <= -1000:
+        return "strongly_negative"
+    if value <= -500:
+        return "negative"
+    return "neutral"
+
+
+async def _build_tick_context(token: str) -> Dict[str, Any]:
+    attempts = [
+        ["$TICK"],
+        ["TICK"],
+        ["$TICKI"],
+        ["TICKI"],
+        ["$TICKQ"],
+        ["TICKQ"],
+    ]
+
+    errors: List[str] = []
+
+    for symbols in attempts:
+        try:
+            payload = await _fetch_index_quotes(symbols, token)
+            items = payload.get("data", {}).get("items", [])
+            if not items:
+                errors.append(f"{','.join(symbols)}: no items")
+                continue
+
+            item = items[0]
+            value = _extract_market_data_value(item)
+            if value is None:
+                errors.append(f"{symbols[0]}: no usable mark/last/mid/close value")
+                continue
+
+            value = round(value, 4)
+            return {
+                "status": "confirmed",
+                "value": value,
+                "tick_state": _tick_state_from_value(value),
+                "source_symbol": symbols[0],
+                "why": None,
+            }
+        except Exception as exc:
+            errors.append(f"{','.join(symbols)}: {str(exc)}")
+
+    why = "TICK fetch did not return a usable value."
+    if errors:
+        why = why + " Attempts: " + " | ".join(errors[:6])
+
+    return {
+        "status": "unconfirmed",
+        "value": None,
+        "tick_state": None,
+        "source_symbol": None,
+        "why": why,
+    }
+
+
 async def _build_advance_decline_context(token: str) -> Dict[str, Any]:
     attempts = [
         {"mode": "difference", "symbols": ["$ADUSD"]},
@@ -1413,6 +1475,7 @@ def _build_indicator_context(
     structure_context: Dict[str, Any],
     vix_context: Optional[Dict[str, Any]] = None,
     advance_decline_context: Optional[Dict[str, Any]] = None,
+    tick_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     candles = chart_check.get("_all_candles", []) if chart_check else []
     latest_close = _to_float(chart_check.get("latest_close")) if chart_check else None
@@ -1475,9 +1538,11 @@ def _build_indicator_context(
             "anchored_vwap": None,
             "why": "Current chart feed snapshot does not include volume, so VWAP is not computed yet.",
         },
-        "tick": {
+        "tick": tick_context or {
             "status": "unconfirmed",
             "value": None,
+            "tick_state": None,
+            "source_symbol": None,
             "why": "TICK feed is not wired into the backend yet.",
         },
         "vix": vix_context or {
@@ -2576,6 +2641,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     token = await get_access_token()
     vix_context = await _build_vix_context(token)
     advance_decline_context = await _build_advance_decline_context(token)
+    tick_context = await _build_tick_context(token)
     summary_payload = await _build_summary_compact_payload(
         option_type=clean_option_type,
         min_dte=request.min_dte,
@@ -2674,7 +2740,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "m_patch_ad_live_2026_04_03",
+        "build_tag": "n_patch_tick_live_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -2700,6 +2766,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             structure_context=structure_context,
             vix_context=vix_context,
             advance_decline_context=advance_decline_context,
+            tick_context=tick_context,
         ),
         "structure_context": structure_context,
         "screenshot_traps_context": _build_screenshot_traps_context(
