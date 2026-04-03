@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.19")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.20")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.19"
+USER_AGENT = "safe-fast-backend/1.9.20"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1252,6 +1252,69 @@ def _calc_atr(candles: List[Dict[str, Any]], length: int = 14) -> Optional[float
     return round(atr, 4)
 
 
+def _build_vwap_context_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not candles:
+        return {
+            "status": "unconfirmed",
+            "session_vwap": None,
+            "anchored_vwap": None,
+            "source": None,
+            "volume_field_used": None,
+            "candle_count_with_volume": 0,
+            "why": "No candle data is available for VWAP.",
+        }
+
+    volume_fields = ["volume", "dayVolume", "totalVolume", "vol"]
+    chosen_field: Optional[str] = None
+    weighted_sum = 0.0
+    volume_sum = 0.0
+    used = 0
+
+    for candle in candles:
+        volume_value = None
+        field_used = None
+        for field in volume_fields:
+            maybe = _to_float(candle.get(field))
+            if maybe is not None and maybe > 0:
+                volume_value = maybe
+                field_used = field
+                break
+
+        high = _to_float(candle.get("high"))
+        low = _to_float(candle.get("low"))
+        close = _to_float(candle.get("close"))
+        if volume_value is None or high is None or low is None or close is None:
+            continue
+
+        typical_price = (high + low + close) / 3.0
+        weighted_sum += typical_price * volume_value
+        volume_sum += volume_value
+        used += 1
+        if chosen_field is None:
+            chosen_field = field_used
+
+    if volume_sum <= 0 or used == 0:
+        return {
+            "status": "unconfirmed",
+            "session_vwap": None,
+            "anchored_vwap": None,
+            "source": None,
+            "volume_field_used": None,
+            "candle_count_with_volume": 0,
+            "why": "Current chart feed snapshot does not include usable volume, so VWAP is not computed yet.",
+        }
+
+    return {
+        "status": "confirmed",
+        "session_vwap": round(weighted_sum / volume_sum, 4),
+        "anchored_vwap": None,
+        "source": "candle_volume_snapshot",
+        "volume_field_used": chosen_field,
+        "candle_count_with_volume": used,
+        "why": None,
+    }
+
+
 async def _build_vix_context(token: str) -> Dict[str, Any]:
     attempts = [
         ["VIX"],
@@ -1595,6 +1658,8 @@ def _build_indicator_context(
     if atr14 is not None and latest_close not in (None, 0):
         atr_pct = round((atr14 / latest_close) * 100, 3)
 
+    vwap_context = _build_vwap_context_from_candles(candles)
+
     extension_note = None
     if structure_context.get("extension_state") == "extended":
         extension_note = "Core structure already flags extension; indicators are supporting context only."
@@ -1620,12 +1685,7 @@ def _build_indicator_context(
             "lower_band_1h": keltner_lower,
             "channel_position": keltner_position,
         },
-        "vwap": {
-            "status": "unconfirmed",
-            "session_vwap": None,
-            "anchored_vwap": None,
-            "why": "Current chart feed snapshot does not include volume, so VWAP is not computed yet.",
-        },
+        "vwap": vwap_context,
         "tick": tick_context or {
             "status": "unconfirmed",
             "value": None,
@@ -1656,9 +1716,11 @@ def _build_indicator_filter_context(
 ) -> Dict[str, Any]:
     atr_pct = _to_float(indicator_context.get("atr", {}).get("atr_percent_of_price"))
     keltner = indicator_context.get("keltner", {})
+    vwap = indicator_context.get("vwap", {})
     channel_position = keltner.get("channel_position")
     extension_state = structure_context.get("extension_state")
     pct_from_ema = _to_float(structure_context.get("pct_from_ema"))
+    vwap_status = vwap.get("status")
 
     atr_regime = "unconfirmed"
     if atr_pct is not None:
@@ -1692,8 +1754,18 @@ def _build_indicator_filter_context(
         "ok": True,
         "design_goal": "background_only_filtering",
         "note": "Confirmed indicators may warn or filter in the background, but do not change the simple output format.",
+        "confirmed_inputs": [
+            name
+            for name, status in [
+                ("atr", indicator_context.get("atr", {}).get("status")),
+                ("keltner", indicator_context.get("keltner", {}).get("status")),
+                ("vwap", vwap_status),
+            ]
+            if status == "confirmed"
+        ],
         "atr_regime": atr_regime,
         "keltner_filter_state": keltner_filter_state,
+        "vwap_filter_state": "confirmed_available" if vwap_status == "confirmed" else "unconfirmed",
         "extension_state": extension_state,
         "pct_from_ema": pct_from_ema,
         "caution": caution,
@@ -2881,7 +2953,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "r_patch_indicator_filters_2026_04_03",
+        "build_tag": "s_patch_vwap_path_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
