@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.18")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.19")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.18"
+USER_AGENT = "safe-fast-backend/1.9.19"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1650,6 +1650,59 @@ def _build_indicator_context(
     }
 
 
+def _build_indicator_filter_context(
+    indicator_context: Dict[str, Any],
+    structure_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    atr_pct = _to_float(indicator_context.get("atr", {}).get("atr_percent_of_price"))
+    keltner = indicator_context.get("keltner", {})
+    channel_position = keltner.get("channel_position")
+    extension_state = structure_context.get("extension_state")
+    pct_from_ema = _to_float(structure_context.get("pct_from_ema"))
+
+    atr_regime = "unconfirmed"
+    if atr_pct is not None:
+        if atr_pct >= 0.8:
+            atr_regime = "expanded"
+        elif atr_pct >= 0.5:
+            atr_regime = "active"
+        else:
+            atr_regime = "calm"
+
+    keltner_filter_state = "unconfirmed"
+    if channel_position in {"above_upper", "below_lower"}:
+        keltner_filter_state = "outside_channel"
+    elif channel_position == "inside_channel":
+        keltner_filter_state = "inside_channel"
+
+    caution_flags: List[str] = []
+    if extension_state == "extended":
+        caution_flags.append("structure_extended")
+    if atr_regime in {"active", "expanded"}:
+        caution_flags.append(f"atr_{atr_regime}")
+    if keltner_filter_state == "outside_channel":
+        caution_flags.append("outside_keltner_channel")
+    if pct_from_ema is not None and pct_from_ema >= 1.0:
+        caution_flags.append("pct_from_ema_elevated")
+
+    caution = len(caution_flags) > 0
+    summary = "caution" if caution else "neutral"
+
+    return {
+        "ok": True,
+        "design_goal": "background_only_filtering",
+        "note": "Confirmed indicators may warn or filter in the background, but do not change the simple output format.",
+        "atr_regime": atr_regime,
+        "keltner_filter_state": keltner_filter_state,
+        "extension_state": extension_state,
+        "pct_from_ema": pct_from_ema,
+        "caution": caution,
+        "caution_flags": caution_flags,
+        "summary": summary,
+        "blocks_trade_directly": False,
+    }
+
+
 def _candles_by_day_et(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     ordered_days: List[str] = []
@@ -2828,7 +2881,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "q_patch_tick_harden_2026_04_03",
+        "build_tag": "r_patch_indicator_filters_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -2855,6 +2908,17 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             vix_context=vix_context,
             advance_decline_context=advance_decline_context,
             tick_context=tick_context,
+        ),
+        "indicator_filter_context": _build_indicator_filter_context(
+            indicator_context=_build_indicator_context(
+                best_ticker=best_ticker,
+                chart_check=chart_check,
+                structure_context=structure_context,
+                vix_context=vix_context,
+                advance_decline_context=advance_decline_context,
+                tick_context=tick_context,
+            ),
+            structure_context=structure_context,
         ),
         "structure_context": structure_context,
         "screenshot_traps_context": _build_screenshot_traps_context(
