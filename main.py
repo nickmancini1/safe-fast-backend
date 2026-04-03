@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.24")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.25")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.24"
+USER_AGENT = "safe-fast-backend/1.9.25"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -3107,7 +3107,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "w_patch_user_facing_room_sync_2026_04_03",
+        "build_tag": "x_patch_screenshot_traps_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3153,6 +3153,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "screenshot_traps_context": _build_screenshot_traps_context(
             structure_context=structure_context,
             chart_check=chart_check,
+            option_type=clean_option_type,
         ),
         "active_trade_flow": _build_active_trade_flow_block(
             request=request,
@@ -3215,44 +3216,195 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
 
 
+
+
+def _nearest_hidden_left_level(
+    candles: List[Dict[str, Any]],
+    latest_close: Optional[float],
+    option_type: str,
+) -> Optional[float]:
+    if latest_close is None or not candles or len(candles) < 8:
+        return None
+
+    left_side = candles[:-5]
+    candidates: List[float] = []
+
+    if option_type == "C":
+        for candle in left_side:
+            high = _to_float(candle.get("high"))
+            if high is not None and high > latest_close:
+                candidates.append(high)
+        return round(min(candidates), 4) if candidates else None
+
+    for candle in left_side:
+        low = _to_float(candle.get("low"))
+        if low is not None and low < latest_close:
+            candidates.append(low)
+    return round(max(candidates), 4) if candidates else None
+
+
+def _build_noisy_chop_proxy(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not candles or len(candles) < 6:
+        return {
+            "status": "unconfirmed",
+            "backend_chop_risk": None,
+            "overlap_ratio": None,
+            "why": "Not enough candles to build a chop proxy.",
+        }
+
+    recent = candles[-6:]
+    overlap_hits = 0
+    comparisons = 0
+
+    for prev, curr in zip(recent[:-1], recent[1:]):
+        prev_high = _to_float(prev.get("high"))
+        prev_low = _to_float(prev.get("low"))
+        curr_high = _to_float(curr.get("high"))
+        curr_low = _to_float(curr.get("low"))
+        if None in (prev_high, prev_low, curr_high, curr_low):
+            continue
+        comparisons += 1
+        overlap_low = max(prev_low, curr_low)
+        overlap_high = min(prev_high, curr_high)
+        if overlap_high > overlap_low:
+            overlap_hits += 1
+
+    overlap_ratio = round(overlap_hits / comparisons, 3) if comparisons else None
+    if overlap_ratio is None:
+        status = "unconfirmed"
+    elif overlap_ratio >= 0.67:
+        status = "possible"
+    else:
+        status = "not_flagged"
+
+    return {
+        "status": status,
+        "backend_chop_risk": status == "possible",
+        "overlap_ratio": overlap_ratio,
+        "why": None if overlap_ratio is not None else "Chop proxy could not be computed.",
+    }
+
+
+def _build_volume_climax_proxy(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not candles:
+        return {
+            "status": "unconfirmed",
+            "proxy": "range_expansion_only",
+            "range_vs_median": None,
+            "why": "No candles are available for exhaustion proxy.",
+        }
+
+    ranges: List[float] = []
+    for candle in candles[-10:]:
+        high = _to_float(candle.get("high"))
+        low = _to_float(candle.get("low"))
+        if high is not None and low is not None:
+            ranges.append(high - low)
+
+    if len(ranges) < 4:
+        return {
+            "status": "unconfirmed",
+            "proxy": "range_expansion_only",
+            "range_vs_median": None,
+            "why": "Not enough candle ranges are available for exhaustion proxy.",
+        }
+
+    latest_range = ranges[-1]
+    historical = sorted(ranges[:-1])
+    median_range = historical[len(historical) // 2] if historical else None
+    if not median_range or median_range <= 0:
+        return {
+            "status": "unconfirmed",
+            "proxy": "range_expansion_only",
+            "range_vs_median": None,
+            "why": "Median range could not be computed for exhaustion proxy.",
+        }
+
+    range_vs_median = round(latest_range / median_range, 3)
+    status = "possible" if range_vs_median >= 1.8 else "not_flagged"
+    return {
+        "status": status,
+        "proxy": "range_expansion_only",
+        "range_vs_median": range_vs_median,
+        "why": "Volume fields are unavailable, so exhaustion uses a candle-range proxy only.",
+    }
+
+
 def _build_screenshot_traps_context(
     structure_context: Dict[str, Any],
     chart_check: Optional[Dict[str, Any]],
+    option_type: str,
 ) -> Dict[str, Any]:
     recent_candles = chart_check.get("recent_candles") if chart_check else None
+    all_candles = chart_check.get("_all_candles") if chart_check else None
     latest_close = chart_check.get("latest_close") if chart_check else None
     ema50 = chart_check.get("ema50_1h") if chart_check else None
 
     pct_from_ema = structure_context.get("pct_from_ema")
     extension_state = structure_context.get("extension_state")
     chop_risk = structure_context.get("chop_risk")
+    effective_wall = structure_context.get("effective_wall")
 
     overextended_hint = None
     if isinstance(pct_from_ema, (int, float)):
         overextended_hint = pct_from_ema >= 1.0
 
+    candle_source = all_candles if all_candles else recent_candles if recent_candles else []
+    hidden_left_level = _nearest_hidden_left_level(candle_source, latest_close, option_type)
+
+    hidden_left_level_pass = None
+    if hidden_left_level is not None and effective_wall is not None:
+        if option_type == "C":
+            hidden_left_level_pass = hidden_left_level >= effective_wall
+        else:
+            hidden_left_level_pass = hidden_left_level <= effective_wall
+
+    noisy_chop = _build_noisy_chop_proxy(candle_source)
+    if noisy_chop.get("status") == "not_flagged" and chop_risk:
+        noisy_chop["status"] = "possible"
+        noisy_chop["backend_chop_risk"] = True
+
+    volume_climax = _build_volume_climax_proxy(candle_source)
+
+    trap_flags: List[str] = []
+    if hidden_left_level_pass is False:
+        trap_flags.append("hidden_left_level_inside_room")
+    if overextended_hint:
+        trap_flags.append("overextended_vs_ema")
+    if noisy_chop.get("status") == "possible":
+        trap_flags.append("noisy_chop_possible")
+    if volume_climax.get("status") == "possible":
+        trap_flags.append("exhaustion_proxy_possible")
+
+    if hidden_left_level_pass is False:
+        trap_summary = "blocked"
+    elif trap_flags:
+        trap_summary = "caution"
+    else:
+        trap_summary = "clear"
+
     return {
         "ok": True,
         "screenshot_review_available": False,
         "source": "backend_proxy_only",
-        "hidden_left_level": None,
-        "hidden_left_level_pass": None,
+        "trap_summary": trap_summary,
+        "trap_flags": trap_flags,
+        "hidden_left_level": hidden_left_level,
+        "hidden_left_level_pass": hidden_left_level_pass,
+        "effective_wall": effective_wall,
         "overextension_vs_ema": {
             "state": extension_state,
             "pct_from_ema": pct_from_ema,
             "overextended_hint": overextended_hint,
         },
-        "volume_climax": None,
-        "noisy_chop": {
-            "status": "possible" if chop_risk else "not_flagged",
-            "backend_chop_risk": chop_risk,
-        },
+        "volume_climax": volume_climax,
+        "noisy_chop": noisy_chop,
         "latest_close": latest_close,
         "ema50_1h": ema50,
         "recent_candles_available": bool(recent_candles),
-        "note": "Backend proxy can expose extension and chop hints, but full screenshot trap review still requires uploaded chart screenshots.",
+        "all_candles_available": bool(all_candles),
+        "note": "Backend proxy now exposes hidden-left-level, chop, and exhaustion proxies, but full screenshot trap review still requires uploaded chart screenshots.",
     }
-
 
 def _build_active_trade_flow_block(
     request: OnDemandRequest,
