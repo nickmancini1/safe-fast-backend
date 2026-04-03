@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.23")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.24")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.23"
+USER_AGENT = "safe-fast-backend/1.9.24"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2340,6 +2340,24 @@ def _build_chart_confirmation_block(
 
 
 
+def _room_failure_user_text(structure_context: Dict[str, Any]) -> str:
+    room_basis = structure_context.get("room_basis")
+    if room_basis == "next_pocket":
+        return "Room to next pocket is too tight for SAFE-FAST."
+    if room_basis == "first_wall":
+        return "Room to first wall is too tight for SAFE-FAST."
+    return "Room is too tight for SAFE-FAST."
+
+
+def _room_failure_failed_reason_text(structure_context: Dict[str, Any]) -> str:
+    room_basis = structure_context.get("room_basis")
+    if room_basis == "next_pocket":
+        return "room to the next pocket fails"
+    if room_basis == "first_wall":
+        return "room to the first wall fails"
+    return "room fails the SAFE-FAST rule"
+
+
 def _build_user_facing_block(
     request: OnDemandRequest,
     engine_status: str,
@@ -2390,7 +2408,7 @@ def _build_user_facing_block(
 
         if structure_context.get("ok"):
             if structure_context.get("room_pass") is False:
-                blocking_reasons.append("Room to first wall is too tight for SAFE-FAST.")
+                blocking_reasons.append(_room_failure_user_text(structure_context))
             if structure_context.get("extension_state") == "extended":
                 blocking_reasons.append("Move is too extended from the 1H 50 EMA.")
             if structure_context.get("allowed_setup") is False:
@@ -2469,7 +2487,7 @@ def _build_user_facing_block(
                 "action": "stand down",
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
-                "why": "Room to first wall is too tight for SAFE-FAST.",
+                "why": _room_failure_user_text(structure_context),
             }
         if structure_context.get("wall_pass") is False:
             return {
@@ -2750,7 +2768,7 @@ def _failed_reason_messages(
         "allowed_setup_type": "setup type is not allowed",
         "twentyfour_hour_supportive": "24H context is not supportive",
         "one_hour_clean_around_ema": "1H structure around the 50 EMA is not clean",
-        "clear_room": "room to the first wall fails",
+        "clear_room": _room_failure_failed_reason_text(structure_context),
         # early_enough is handled contextually below to avoid duplicate time/day wording
         "clear_trigger": "no valid live trigger is present",
         # liquidity_ok is handled contextually below to avoid duplicate liquidity wording
@@ -2949,7 +2967,7 @@ async def _screen_ticker_candidate(
         reason = trigger_state.get("why") or "No valid live trigger is present."
     elif structure_context.get("ok"):
         if structure_context.get("room_pass") is False:
-            reason = "Room to first wall is too tight for SAFE-FAST."
+            reason = _room_failure_user_text(structure_context)
         elif structure_context.get("wall_pass") is False:
             reason = "Wall thesis and strike placement do not match."
         elif structure_context.get("extension_state") == "extended":
@@ -3089,7 +3107,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "v_patch_room_wall_refine_2026_04_03",
+        "build_tag": "w_patch_user_facing_room_sync_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
