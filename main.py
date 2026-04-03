@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.12")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.13")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.12"
+USER_AGENT = "safe-fast-backend/1.9.13"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1405,8 +1405,12 @@ async def _build_advance_decline_context(token: str) -> Dict[str, Any]:
     attempts = [
         {"mode": "difference", "symbols": ["$ADUSD"]},
         {"mode": "difference", "symbols": ["ADUSD"]},
+        {"mode": "difference", "symbols": ["$ADUSDC"]},
+        {"mode": "difference", "symbols": ["ADUSDC"]},
         {"mode": "components", "symbols": ["$ADVUS", "$DECLUS"]},
         {"mode": "components", "symbols": ["ADVUS", "DECLUS"]},
+        {"mode": "components", "symbols": ["$ADVUSC", "$DECLUSC"]},
+        {"mode": "components", "symbols": ["ADVUSC", "DECLUSC"]},
     ]
 
     errors: List[str] = []
@@ -1420,7 +1424,25 @@ async def _build_advance_decline_context(token: str) -> Dict[str, Any]:
                 continue
 
             if attempt["mode"] == "difference":
-                value = _extract_market_data_value(items[0])
+                preferred_symbol = attempt["symbols"][0].replace("$", "").upper()
+                selected_item = None
+                for item in items:
+                    raw_symbol = (
+                        item.get("symbol")
+                        or item.get("streamer-symbol")
+                        or item.get("instrument-symbol")
+                        or item.get("eventSymbol")
+                        or ""
+                    )
+                    normalized = str(raw_symbol).replace("$", "").upper()
+                    if normalized == preferred_symbol:
+                        selected_item = item
+                        break
+
+                if selected_item is None:
+                    selected_item = items[0]
+
+                value = _extract_market_data_value(selected_item)
                 if value is None:
                     errors.append(f"{attempt['symbols'][0]}: no usable mark/last/mid/close value")
                     continue
@@ -1445,16 +1467,19 @@ async def _build_advance_decline_context(token: str) -> Dict[str, Any]:
                 normalized = str(raw_symbol).replace("$", "").upper()
                 symbol_map[normalized] = item
 
-            adv_item = symbol_map.get("ADVUS")
-            dec_item = symbol_map.get("DECLUS")
+            adv_key = attempt["symbols"][0].replace("$", "").upper()
+            dec_key = attempt["symbols"][1].replace("$", "").upper()
+
+            adv_item = symbol_map.get(adv_key)
+            dec_item = symbol_map.get(dec_key)
             if not adv_item or not dec_item:
-                errors.append(f"{','.join(attempt['symbols'])}: ADVUS/DECLUS items not both returned")
+                errors.append(f"{','.join(attempt['symbols'])}: {adv_key}/{dec_key} items not both returned")
                 continue
 
             adv_value = _extract_market_data_value(adv_item)
             dec_value = _extract_market_data_value(dec_item)
             if adv_value is None or dec_value is None:
-                errors.append(f"{','.join(attempt['symbols'])}: ADVUS/DECLUS values unusable")
+                errors.append(f"{','.join(attempt['symbols'])}: {adv_key}/{dec_key} values unusable")
                 continue
 
             value = round(adv_value - dec_value, 4)
@@ -1462,7 +1487,7 @@ async def _build_advance_decline_context(token: str) -> Dict[str, Any]:
                 "status": "confirmed",
                 "value": value,
                 "breadth_state": _breadth_state_from_value(value),
-                "source_symbol": "ADVUS-DECLUS",
+                "source_symbol": f"{adv_key}-{dec_key}",
                 "advancing_issues": round(adv_value, 4),
                 "declining_issues": round(dec_value, 4),
                 "why": None,
@@ -1472,7 +1497,7 @@ async def _build_advance_decline_context(token: str) -> Dict[str, Any]:
 
     why = "Advance/Decline breadth fetch did not return a usable value."
     if errors:
-        why = why + " Attempts: " + " | ".join(errors[:4])
+        why = why + " Attempts: " + " | ".join(errors[:8])
 
     return {
         "status": "unconfirmed",
@@ -2754,7 +2779,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "o_patch_vix_harden_2026_04_03",
+        "build_tag": "p_patch_ad_harden_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
