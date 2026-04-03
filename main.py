@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.21")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.22")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.21"
+USER_AGENT = "safe-fast-backend/1.9.22"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2024,31 +2024,83 @@ def _setup_classifier(
     if latest_close is None or ema50_1h is None:
         return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None}
 
-    near_ema = abs(latest_close - ema50_1h) / ema50_1h <= 0.0025
+    close_distance_pct = abs(latest_close - ema50_1h) / ema50_1h if ema50_1h else None
+    near_ema = bool(close_distance_pct is not None and close_distance_pct <= 0.0035)
+
     chop = _is_chop(candles)
+
     recent_closes = [c["close"] for c in candles[-3:]] if len(candles) >= 3 else []
+    recent_highs = [c["high"] for c in candles[-6:-1]] if len(candles) >= 6 else []
+    recent_lows = [c["low"] for c in candles[-6:-1]] if len(candles) >= 6 else []
     tight_break = False
+    break_signal = False
+    ema_reclaim = False
+
     if recent_closes and latest_close:
         tight_break = (max(recent_closes) - min(recent_closes)) / latest_close <= 0.003
 
-    if room_pass is False or wall_pass is False or extension_state.get("state") == "extended":
-        if trend_supportive is True and near_ema:
-            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": False}
-        if trend_supportive is True and tight_break and not chop:
+    if option_type == "C":
+        if recent_highs:
+            break_signal = latest_close > max(recent_highs)
+        if len(recent_closes) >= 2:
+            ema_reclaim = (
+                latest_close > ema50_1h and
+                min(recent_closes[-2:]) >= ema50_1h * 0.998
+            )
+    else:
+        if recent_lows:
+            break_signal = latest_close < min(recent_lows)
+        if len(recent_closes) >= 2:
+            ema_reclaim = (
+                latest_close < ema50_1h and
+                max(recent_closes[-2:]) <= ema50_1h * 1.002
+            )
+
+    ideal_candidate = bool(
+        trend_supportive is True and
+        near_ema and
+        ema_reclaim and
+        not chop and
+        (room_ratio or 0) >= 2.5
+    )
+    clean_fast_break_candidate = bool(
+        trend_supportive is True and
+        break_signal and
+        tight_break and
+        not chop
+    )
+    continuation_candidate = bool(
+        trend_supportive is True and
+        near_ema and
+        not chop
+    )
+
+    structural_block = bool(
+        room_pass is False or
+        wall_pass is False or
+        extension_state.get("state") == "extended"
+    )
+
+    if structural_block:
+        if ideal_candidate:
+            return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": False}
+        if clean_fast_break_candidate:
             return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": False}
+        if continuation_candidate:
+            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": False}
         return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False}
 
     if trend_supportive is True:
-        if near_ema and (room_ratio or 0) >= 2.5 and not chop:
+        if ideal_candidate:
             return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": True}
-        if tight_break and not chop:
+        if clean_fast_break_candidate:
             return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True}
-        if near_ema:
+        if continuation_candidate:
             return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True}
-        return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": False}
+        return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False}
 
     if trend_supportive is False:
-        if tight_break and not chop:
+        if break_signal and tight_break and not chop and not structural_block:
             return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True}
         return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False}
 
@@ -2999,7 +3051,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "t_patch_volume_diagnostics_2026_04_03",
+        "build_tag": "u_patch_setup_classifier_refine_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
