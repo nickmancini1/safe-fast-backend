@@ -2258,6 +2258,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
+        "screenshot_traps_context": _build_screenshot_traps_context(
+            structure_context=structure_context,
+            chart_check=chart_check,
+        ),
         "time_day_gate": time_day_gate,
         "iv_context": _build_iv_context(primary_candidate),
         "liquidity_context": liquidity_context,
@@ -2304,6 +2308,46 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             checklist=checklist_block,
             chart_check=chart_check,
         ),
+    }
+
+
+
+def _build_screenshot_traps_context(
+    structure_context: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    recent_candles = chart_check.get("recent_candles") if chart_check else None
+    latest_close = chart_check.get("latest_close") if chart_check else None
+    ema50 = chart_check.get("ema50_1h") if chart_check else None
+
+    pct_from_ema = structure_context.get("pct_from_ema")
+    extension_state = structure_context.get("extension_state")
+    chop_risk = structure_context.get("chop_risk")
+
+    overextended_hint = None
+    if isinstance(pct_from_ema, (int, float)):
+        overextended_hint = pct_from_ema >= 1.0
+
+    return {
+        "ok": True,
+        "screenshot_review_available": False,
+        "source": "backend_proxy_only",
+        "hidden_left_level": None,
+        "hidden_left_level_pass": None,
+        "overextension_vs_ema": {
+            "state": extension_state,
+            "pct_from_ema": pct_from_ema,
+            "overextended_hint": overextended_hint,
+        },
+        "volume_climax": None,
+        "noisy_chop": {
+            "status": "possible" if chop_risk else "not_flagged",
+            "backend_chop_risk": chop_risk,
+        },
+        "latest_close": latest_close,
+        "ema50_1h": ema50,
+        "recent_candles_available": bool(recent_candles),
+        "note": "Backend proxy can expose extension and chop hints, but full screenshot trap review still requires uploaded chart screenshots.",
     }
 
 
