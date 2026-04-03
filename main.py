@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.0")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.0")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.0"
+USER_AGENT = "safe-fast-backend/1.9.0"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2262,6 +2262,31 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             structure_context=structure_context,
             chart_check=chart_check,
         ),
+        "active_trade_flow": _build_active_trade_flow_block(
+            request=request,
+            option_type=clean_option_type,
+            chart_check=chart_check,
+            market_context=market_context,
+        ),
+        "close_trade_flow": _build_close_trade_flow_block(
+            request=request,
+            market_context=market_context,
+        ),
+        "journal_context": _build_journal_context_block(
+            request=request,
+            market_context=market_context,
+            best_ticker=best_ticker,
+            final_verdict=final_verdict,
+            checklist=checklist_block,
+            failed_reasons=_failed_reason_messages(
+                checklist=checklist_block,
+                time_day_gate=time_day_gate,
+                market_context=market_context,
+                structure_context=structure_context,
+                liquidity_context=liquidity_context,
+                trigger_state=trigger_state,
+            ),
+        ),
         "time_day_gate": time_day_gate,
         "iv_context": _build_iv_context(primary_candidate),
         "liquidity_context": liquidity_context,
@@ -2348,6 +2373,118 @@ def _build_screenshot_traps_context(
         "ema50_1h": ema50,
         "recent_candles_available": bool(recent_candles),
         "note": "Backend proxy can expose extension and chop hints, but full screenshot trap review still requires uploaded chart screenshots.",
+    }
+
+
+def _build_active_trade_flow_block(
+    request: OnDemandRequest,
+    option_type: str,
+    chart_check: Optional[Dict[str, Any]],
+    market_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    if request.open_positions <= 0:
+        return {
+            "ok": True,
+            "active_trade_mode": False,
+            "status": "no_open_trade",
+            "message": "No open trade is currently reported, so active-trade enforcement is not engaged.",
+        }
+
+    latest_close = chart_check.get("latest_close") if chart_check else None
+    ema50 = chart_check.get("ema50_1h") if chart_check else None
+
+    invalidated_now = None
+    if latest_close is not None and ema50 is not None:
+        if option_type == "C":
+            invalidated_now = latest_close < ema50
+        elif option_type == "P":
+            invalidated_now = latest_close > ema50
+
+    if invalidated_now is True:
+        action = "exit_now"
+        status = "invalidated"
+        message = "1H close is beyond the 50 EMA against the thesis. Exit now."
+    elif invalidated_now is False:
+        action = "hold_only_if_targets_and_structure_support"
+        status = "still_valid"
+        message = "No 1H EMA invalidation is detected from the latest snapshot."
+    else:
+        action = "unconfirmed"
+        status = "unconfirmed"
+        message = "Latest chart snapshot did not provide enough data to confirm invalidation."
+
+    return {
+        "ok": True,
+        "active_trade_mode": True,
+        "market_open": market_context.get("is_open"),
+        "status": status,
+        "latest_close": latest_close,
+        "ema50_1h": ema50,
+        "invalidated_now": invalidated_now,
+        "action": action,
+        "message": message,
+        "required_for_full_check": [
+            "entry price",
+            "original 1H EMA at entry if you want strict historical comparison",
+            "current 1H chart if screenshot review is desired",
+        ],
+    }
+
+
+def _build_close_trade_flow_block(
+    request: OnDemandRequest,
+    market_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    can_close = request.open_positions > 0
+    return {
+        "ok": True,
+        "can_log_close_now": can_close,
+        "status": "ready_for_close_flow" if can_close else "no_open_trade_to_close",
+        "market_open": market_context.get("is_open"),
+        "required_inputs": [
+            "ticker",
+            "result",
+            "new_position_count",
+            "weekly_trade_count",
+        ],
+        "next_state_if_closed": {
+            "open_positions_after_close": 0 if can_close else request.open_positions,
+            "weekly_trade_count_remains_user_supplied": True,
+        },
+        "message": "Close-trade flow can be completed once the result and updated counts are supplied." if can_close else "No open trade is reported, so close-trade flow is informational only.",
+    }
+
+
+
+
+
+def _build_journal_context_block(
+    request: OnDemandRequest,
+    market_context: Dict[str, Any],
+    best_ticker: Optional[str],
+    final_verdict: str,
+    checklist: Dict[str, Any],
+    failed_reasons: List[str],
+) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "journal_ready": True,
+        "market_open": market_context.get("is_open"),
+        "ticker": best_ticker,
+        "final_verdict": final_verdict,
+        "open_positions": request.open_positions,
+        "weekly_trade_count": request.weekly_trade_count,
+        "failed_items": checklist.get("failed_items", []),
+        "failed_reasons": failed_reasons,
+        "required_fields_for_manual_log": [
+            "ticker",
+            "verdict",
+            "entry or no-entry decision",
+            "reason",
+            "open_positions",
+            "weekly_trade_count",
+        ],
+        "message": "Journal/log context is ready for manual logging or a later automated trade log flow.",
     }
 
 
