@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.0")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.1")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.0"
+USER_AGENT = "safe-fast-backend/1.9.1"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -104,47 +104,75 @@ def _calc_pct_of_mid(bid: Optional[float], ask: Optional[float], mid: Optional[f
 
 
 def _classify_liquidity(
+    mid_debit: Optional[float],
+    natural_debit: Optional[float],
     entry_slippage_vs_mid: Optional[float],
+    spread_market_width: Optional[float],
+    long_leg_width: Optional[float],
+    short_leg_width: Optional[float],
     long_leg_width_pct_of_mid: Optional[float],
     short_leg_width_pct_of_mid: Optional[float],
 ) -> Dict[str, Any]:
-    if (
-        entry_slippage_vs_mid is None
-        or long_leg_width_pct_of_mid is None
-        or short_leg_width_pct_of_mid is None
-    ):
+    required_values = [
+        mid_debit,
+        entry_slippage_vs_mid,
+        spread_market_width,
+        long_leg_width,
+        short_leg_width,
+    ]
+    if any(value is None for value in required_values):
         return {
             "label": "unconfirmed",
             "liquidity_pass": None,
             "why": "Quotes did not provide enough bid/ask detail to confirm liquidity.",
         }
 
+    spread_width_limit = 0.15 if mid_debit < 1.50 else 0.20
+    spread_width_pct_of_debit = None
+    if mid_debit not in (None, 0):
+        spread_width_pct_of_debit = round((spread_market_width / mid_debit) * 100, 3)
+
+    failed_reasons: List[str] = []
+    if long_leg_width > 0.15:
+        failed_reasons.append("long leg bid/ask exceeds $0.15")
+    if short_leg_width > 0.15:
+        failed_reasons.append("short leg bid/ask exceeds $0.15")
+    if spread_market_width > spread_width_limit:
+        failed_reasons.append(f"net spread width exceeds ${spread_width_limit:.2f}")
+    if spread_width_pct_of_debit is not None and spread_width_pct_of_debit > 10:
+        failed_reasons.append("net spread width exceeds 10% of debit")
+    if entry_slippage_vs_mid > 0.05:
+        failed_reasons.append("fill would require more than mid + $0.05")
+
+    if failed_reasons:
+        return {
+            "label": "wide",
+            "liquidity_pass": False,
+            "why": " / ".join(failed_reasons),
+            "spread_width_limit": spread_width_limit,
+            "spread_width_pct_of_debit": spread_width_pct_of_debit,
+        }
+
     if (
-        entry_slippage_vs_mid <= 0.15
-        and long_leg_width_pct_of_mid <= 12
-        and short_leg_width_pct_of_mid <= 12
+        long_leg_width <= 0.10
+        and short_leg_width <= 0.10
+        and spread_market_width <= 0.15
+        and entry_slippage_vs_mid <= 0.03
     ):
         return {
             "label": "tight",
             "liquidity_pass": True,
-            "why": "Bid/ask widths and entry slippage are tight enough for a defined-risk debit spread.",
-        }
-
-    if (
-        entry_slippage_vs_mid <= 0.30
-        and long_leg_width_pct_of_mid <= 20
-        and short_leg_width_pct_of_mid <= 20
-    ):
-        return {
-            "label": "acceptable",
-            "liquidity_pass": True,
-            "why": "Bid/ask widths are workable, but not especially tight.",
+            "why": "Leg widths, net spread width, and entry slippage all pass tight SAFE-FAST liquidity thresholds.",
+            "spread_width_limit": spread_width_limit,
+            "spread_width_pct_of_debit": spread_width_pct_of_debit,
         }
 
     return {
-        "label": "wide",
-        "liquidity_pass": False,
-        "why": "Bid/ask widths or entry slippage are too wide for a clean SAFE-FAST debit spread entry.",
+        "label": "acceptable",
+        "liquidity_pass": True,
+        "why": "Liquidity passes SAFE-FAST hard thresholds, but not at the tighter end.",
+        "spread_width_limit": spread_width_limit,
+        "spread_width_pct_of_debit": spread_width_pct_of_debit,
     }
 
 
@@ -157,7 +185,12 @@ def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any
         }
 
     label_ctx = _classify_liquidity(
+        candidate.get("est_debit"),
+        candidate.get("natural_debit"),
         candidate.get("entry_slippage_vs_mid"),
+        candidate.get("spread_market_width"),
+        candidate.get("long_leg_width"),
+        candidate.get("short_leg_width"),
         candidate.get("long_leg_width_pct_of_mid"),
         candidate.get("short_leg_width_pct_of_mid"),
     )
@@ -175,6 +208,8 @@ def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any
         "short_leg_width": candidate.get("short_leg_width"),
         "long_leg_width_pct_of_mid": candidate.get("long_leg_width_pct_of_mid"),
         "short_leg_width_pct_of_mid": candidate.get("short_leg_width_pct_of_mid"),
+        "spread_width_limit": label_ctx.get("spread_width_limit"),
+        "spread_width_pct_of_debit": label_ctx.get("spread_width_pct_of_debit"),
         "long_iv": candidate.get("long_iv"),
         "short_iv": candidate.get("short_iv"),
         "long_bid_iv": candidate.get("long_bid_iv"),
@@ -1614,6 +1649,14 @@ def _build_user_facing_block(
     if not market_context["is_open"]:
         blocking_reasons: List[str] = []
 
+        if liquidity_context.get("liquidity_pass") is False:
+            blocking_reasons.append(
+                liquidity_context.get("why") or "Options liquidity is too wide for a clean SAFE-FAST entry."
+            )
+
+        if chart_check_error:
+            blocking_reasons.append("Chart check failed in this run.")
+
         if structure_context.get("ok"):
             if structure_context.get("room_pass") is False:
                 blocking_reasons.append("Room to first wall is too tight for SAFE-FAST.")
@@ -1623,6 +1666,8 @@ def _build_user_facing_block(
                 blocking_reasons.append(f"Setup type is {structure_context.get('setup_type')}, which is not tradable now.")
             if structure_context.get("wall_pass") is False:
                 blocking_reasons.append("Wall thesis and strike placement do not match.")
+        elif chart_check_error:
+            blocking_reasons.append("Candidate engine result only - chart confirmation still required.")
 
         if blocking_reasons:
             return {
@@ -1985,13 +2030,14 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
     final_verdict = item.get("final_verdict", "NO_TRADE")
 
     verdict_rank = {"PENDING": 0, "NO_TRADE": 1}.get(final_verdict, 2)
-    setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
-    room_rank = 0 if structure.get("room_pass") is True else 1
-    wall_rank = 0 if structure.get("wall_pass") is True else 1
-    ext_rank = 0 if structure.get("extension_state") == "acceptable" else 1
+    chart_rank = 0 if structure.get("ok") is True else 1
+    setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is False else 2
+    room_rank = 0 if structure.get("room_pass") is True else 1 if structure.get("room_pass") is False else 2
+    wall_rank = 0 if structure.get("wall_pass") is True else 1 if structure.get("wall_pass") is False else 2
+    ext_rank = 0 if structure.get("extension_state") == "acceptable" else 1 if structure.get("extension_state") == "extended" else 2
     trend_rank = 0 if structure.get("trend_label") == "Trend-aligned" else 1 if structure.get("trend_label") == "Countertrend" else 2
-    liquidity_rank = 0 if liquidity.get("liquidity_pass") is True else 1
-    trigger_rank = 0 if trigger_state.get("trigger_present") is True else 1
+    liquidity_rank = 0 if liquidity.get("liquidity_pass") is True else 1 if liquidity.get("liquidity_pass") is False else 2
+    trigger_rank = 0 if trigger_state.get("trigger_present") is True else 1 if trigger_state.get("ok") is True else 2
     failed_count = len(checklist.get("failed_items", []))
     room_ratio = -(structure.get("room_ratio") or -999999)
     risk_mid = primary.get("distance_from_target_risk_mid", 999999)
@@ -1999,6 +2045,7 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
 
     return (
         verdict_rank,
+        chart_rank,
         setup_rank,
         room_rank,
         wall_rank,
@@ -2250,6 +2297,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
+        "build_tag": "d_patch_liquidity_debug_2026_04_03",
         "source_of_truth": "candidate_engine",
         "engine_status": engine_status,
         "candidate_engine_status": candidate_engine_status,
