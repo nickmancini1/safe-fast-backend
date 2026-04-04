@@ -3374,7 +3374,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "al_patch_no_candidate_context_summary_2026_04_04",
+        "build_tag": "am_patch_no_candidate_context_details_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3397,6 +3397,17 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             chart_check_block=chart_check_block,
             trigger_state=trigger_state,
             structure_context=structure_context,
+            liquidity_context=liquidity_context,
+            iv_context=_build_iv_context(primary_candidate),
+            failed_reasons=_failed_reason_messages(
+                checklist=checklist_block,
+                time_day_gate=time_day_gate,
+                market_context=market_context,
+                structure_context=structure_context,
+                liquidity_context=liquidity_context,
+                trigger_state=trigger_state,
+                screenshot_traps_context=screenshot_traps_context,
+            ),
         ),
         "market_context": market_context,
         "macro_context": macro_context,
@@ -3866,6 +3877,9 @@ def _build_no_candidate_context(
     chart_check_block: Dict[str, Any],
     trigger_state: Dict[str, Any],
     structure_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+    failed_reasons: List[str],
 ) -> Dict[str, Any]:
     active = bool(
         summary_payload.get("selection_mode") == "none"
@@ -3880,6 +3894,9 @@ def _build_no_candidate_context(
         "chart_check_status": chart_check_block.get("status") if active else None,
         "trigger_state": trigger_state.get("entry_state") if active else None,
         "structure_status": structure_context.get("why") if active else None,
+        "liquidity_status": liquidity_context.get("status") if active else None,
+        "iv_status": iv_context.get("status") if active else None,
+        "failed_reasons": failed_reasons if active else [],
     }
 
 def _build_two_path_block(
