@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.34")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.35")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.34"
+USER_AGENT = "safe-fast-backend/1.9.35"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -3374,7 +3374,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "am_patch_no_candidate_context_details_2026_04_04",
+        "build_tag": "an_patch_no_candidate_context_reasons_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3895,7 +3895,9 @@ def _build_no_candidate_context(
         "trigger_state": trigger_state.get("entry_state") if active else None,
         "structure_status": structure_context.get("why") if active else None,
         "liquidity_status": liquidity_context.get("status") if active else None,
+        "liquidity_reason": liquidity_context.get("why") if active else None,
         "iv_status": iv_context.get("status") if active else None,
+        "iv_reason": iv_context.get("why") if active else None,
         "failed_reasons": failed_reasons if active else [],
     }
 
