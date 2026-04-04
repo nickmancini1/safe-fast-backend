@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.30")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.31")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.30"
+USER_AGENT = "safe-fast-backend/1.9.31"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2368,7 +2368,11 @@ def _priority_blocker_user_text(
     trigger_state: Dict[str, Any],
     screenshot_traps_context: Dict[str, Any],
     chart_check_error: Optional[str] = None,
+    engine_reason: Optional[str] = None,
 ) -> Optional[str]:
+    if liquidity_context.get("why") == "No candidate available.":
+        return engine_reason or "No feasible candidates found for the current filters."
+
     blocker_order = []
     if checklist:
         blocker_order = checklist.get("decision_blockers_priority") or checklist.get("all_failed_items") or checklist.get("failed_items") or []
@@ -2377,7 +2381,10 @@ def _priority_blocker_user_text(
         if blocker in {"hidden_left_level", "noisy_chop", "volume_climax"}:
             return _trap_failure_user_text(screenshot_traps_context)
         if blocker == "allowed_setup_type":
-            return f"Setup type is {structure_context.get('setup_type')}, which is not tradable now."
+            setup_type = structure_context.get("setup_type")
+            if setup_type is None:
+                return engine_reason or "No feasible candidates found for the current filters."
+            return f"Setup type is {setup_type}, which is not tradable now."
         if blocker == "twentyfour_hour_supportive":
             return "24H context is not supportive for this setup."
         if blocker == "one_hour_clean_around_ema":
@@ -2431,6 +2438,7 @@ def _build_user_facing_block(
         trigger_state=trigger_state,
         screenshot_traps_context=screenshot_traps_context,
         chart_check_error=chart_check_error,
+        engine_reason=engine_reason,
     )
 
     if request.open_positions > 0:
@@ -3137,6 +3145,7 @@ async def _screen_ticker_candidate(
         trigger_state=trigger_state,
         screenshot_traps_context=screenshot_traps_context,
         chart_check_error=chart_check_error,
+        engine_reason=summary.get("reason"),
     )
     if priority_reason:
         reason = priority_reason
@@ -3299,7 +3308,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ag_patch_engine_best_ticker_consistency_2026_04_04",
+        "build_tag": "ah_patch_no_candidate_reason_consistency_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
