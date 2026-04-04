@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.25")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.26")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.25"
+USER_AGENT = "safe-fast-backend/1.9.26"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -3133,7 +3133,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "y_patch_trap_enforcement_sync_2026_04_03",
+        "build_tag": "z_patch_trap_runtime_fix_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3217,6 +3217,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             structure_context=structure_context,
             liquidity_context=liquidity_context,
             trigger_state=trigger_state,
+            screenshot_traps_context=screenshot_traps_context,
         ),
         "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
         "request": request.model_dump(),
@@ -3647,7 +3648,6 @@ def _build_two_path_block(
             "ideal_path": ideal_text,
             "acceptable_path": "Stand down until all failed gates pass.",
             "invalidation_1h_ema50": ema,
-        
         }
 
     return {
