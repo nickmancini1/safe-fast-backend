@@ -3374,7 +3374,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ak_patch_no_candidate_chart_consistency_2026_04_04",
+        "build_tag": "al_patch_no_candidate_context_summary_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3391,6 +3391,12 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             selected=selected,
             engine_best_ticker=summary_payload.get("best_ticker"),
             screened_candidates=screened_candidates,
+        ),
+        "no_candidate_context": _build_no_candidate_context(
+            summary_payload=summary_payload,
+            chart_check_block=chart_check_block,
+            trigger_state=trigger_state,
+            structure_context=structure_context,
         ),
         "market_context": market_context,
         "macro_context": macro_context,
@@ -3851,6 +3857,29 @@ def _build_simple_output_block(
         "setup_state": user_facing.get("setup_state"),
         "why": user_facing.get("why"),
         "signal_present": signal_present,
+    }
+
+
+
+def _build_no_candidate_context(
+    summary_payload: Dict[str, Any],
+    chart_check_block: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    structure_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    active = bool(
+        summary_payload.get("selection_mode") == "none"
+        and summary_payload.get("primary_candidate") is None
+    )
+
+    return {
+        "active": active,
+        "reason": summary_payload.get("reason") if active else None,
+        "selection_mode": summary_payload.get("selection_mode"),
+        "best_ticker": summary_payload.get("best_ticker"),
+        "chart_check_status": chart_check_block.get("status") if active else None,
+        "trigger_state": trigger_state.get("entry_state") if active else None,
+        "structure_status": structure_context.get("why") if active else None,
     }
 
 def _build_two_path_block(
