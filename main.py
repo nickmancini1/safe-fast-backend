@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.28")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.29")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.28"
+USER_AGENT = "safe-fast-backend/1.9.29"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2775,6 +2775,27 @@ def _build_checklist_block(
 
     all_failed_items = pre_check_failed_items + failed_items
 
+    priority_order = [
+        "hidden_left_level",
+        "noisy_chop",
+        "volume_climax",
+        "allowed_setup_type",
+        "twentyfour_hour_supportive",
+        "one_hour_clean_around_ema",
+        "clear_room",
+        "early_enough",
+        "clear_trigger",
+        "liquidity_ok",
+        "invalidation_clear",
+        "fits_risk",
+        "open_trade_already",
+    ]
+    priority_rank = {name: idx for idx, name in enumerate(priority_order)}
+    decision_blockers_priority = sorted(
+        all_failed_items,
+        key=lambda item: (priority_rank.get(item, 999), item),
+    )
+
     return {
         "ok": True,
         "items": items,
@@ -2783,6 +2804,7 @@ def _build_checklist_block(
         "pre_check_ok": len(pre_check_failed_items) == 0,
         "pre_check_failed_items": pre_check_failed_items,
         "all_failed_items": all_failed_items,
+        "decision_blockers_priority": decision_blockers_priority,
     }
 
 
@@ -3038,6 +3060,7 @@ async def _screen_ticker_candidate(
         "trigger_state": trigger_state,
         "screenshot_traps_context": screenshot_traps_context,
         "checklist": checklist,
+        "decision_blockers_priority": checklist.get("decision_blockers_priority", []),
     }
 
 
@@ -3161,7 +3184,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ab_patch_precheck_items_2026_04_03",
+        "build_tag": "ac_patch_decision_blockers_priority_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
