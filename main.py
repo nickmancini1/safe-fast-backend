@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.34")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.35")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.34"
+USER_AGENT = "safe-fast-backend/1.9.35"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -180,8 +180,8 @@ def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any
     if not candidate:
         return {
             "ok": False,
-            "status": "unconfirmed",
-            "why": "No candidate available.",
+            "status": "skipped_no_candidate",
+            "why": "No candidate available in this run, so liquidity evaluation was not attempted.",
         }
 
     label_ctx = _classify_liquidity(
@@ -299,8 +299,8 @@ def _build_iv_context(primary_candidate: Optional[Dict[str, Any]]) -> Dict[str, 
     if not primary_candidate:
         return {
             "ok": False,
-            "status": "unconfirmed",
-            "why": "No primary candidate is available for IV evaluation.",
+            "status": "skipped_no_candidate",
+            "why": "No candidate available in this run, so IV evaluation was not attempted.",
         }
 
     long_iv = _to_float(primary_candidate.get("long_iv"))
@@ -3374,7 +3374,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ak_patch_no_candidate_chart_consistency_2026_04_04",
+        "build_tag": "al_patch_no_candidate_liquidity_iv_consistency_safe_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
