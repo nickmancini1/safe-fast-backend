@@ -2783,6 +2783,7 @@ def _build_checklist_block(
         "pre_check_ok": len(pre_check_failed_items) == 0,
         "pre_check_failed_items": pre_check_failed_items,
         "all_failed_items": all_failed_items,
+        "decision_blockers_priority": all_failed_items,
     }
 
 
