@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.26")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.27")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.26"
+USER_AGENT = "safe-fast-backend/1.9.27"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2734,6 +2734,7 @@ def _build_checklist_block(
     primary_candidate: Optional[Dict[str, Any]],
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    screenshot_traps_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     ema_value = chart_check.get("ema50_1h") if chart_check else None
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
@@ -2753,10 +2754,26 @@ def _build_checklist_block(
 
     failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
 
+    pre_check_failed_items: List[str] = []
+    if screenshot_traps_context.get("hidden_left_level_pass") is False:
+        pre_check_failed_items.append("hidden_left_level")
+    noisy_chop = screenshot_traps_context.get("noisy_chop") or {}
+    if noisy_chop.get("status") == "possible" and noisy_chop.get("backend_chop_risk") is True:
+        pre_check_failed_items.append("noisy_chop")
+    volume_climax = screenshot_traps_context.get("volume_climax") or {}
+    if volume_climax.get("status") == "possible":
+        pre_check_failed_items.append("volume_climax")
+    if screenshot_traps_context.get("trap_summary") == "blocked" and not pre_check_failed_items:
+        pre_check_failed_items.append("screenshot_traps")
+
+    all_failed_items = pre_check_failed_items + failed_items
+
     return {
         "ok": True,
         "items": items,
         "failed_items": failed_items,
+        "pre_check_failed_items": pre_check_failed_items,
+        "all_failed_items": all_failed_items,
     }
 
 
@@ -2840,7 +2857,7 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
     trend_rank = 0 if structure.get("trend_label") == "Trend-aligned" else 1 if structure.get("trend_label") == "Countertrend" else 2
     liquidity_rank = 0 if liquidity.get("liquidity_pass") is True else 1 if liquidity.get("liquidity_pass") is False else 2
     trigger_rank = 0 if trigger_state.get("trigger_present") is True else 1 if trigger_state.get("ok") is True else 2
-    failed_count = len(checklist.get("failed_items", []))
+    failed_count = len(checklist.get("all_failed_items", checklist.get("failed_items", [])))
     room_ratio = -(structure.get("room_ratio") or -999999)
     risk_mid = primary.get("distance_from_target_risk_mid", 999999)
     ticker_rank = SYMBOL_ORDER.index(item["symbol"]) if item.get("symbol") in SYMBOL_ORDER else 999999
@@ -2877,7 +2894,7 @@ def _screened_other_candidates(screened: List[Dict[str, Any]], best_ticker: Opti
                 "structure_context": item.get("structure_context"),
                 "liquidity_context": item.get("liquidity_context"),
                 "trigger_state": item.get("trigger_state"),
-                "checklist_failed_items": item.get("checklist", {}).get("failed_items", []),
+                "checklist_failed_items": item.get("checklist", {}).get("all_failed_items", item.get("checklist", {}).get("failed_items", [])),
             }
         )
     return out
@@ -2903,7 +2920,7 @@ def _build_screened_best_context(
         "changed_from_engine_best": selected.get("symbol") != engine_best_ticker,
         "screened_final_verdict": selected.get("final_verdict"),
         "screened_reason": selected.get("reason"),
-        "screened_checklist_failed_items": (selected.get("checklist") or {}).get("failed_items", []),
+        "screened_checklist_failed_items": (selected.get("checklist") or {}).get("all_failed_items", (selected.get("checklist") or {}).get("failed_items", [])),
         "engine_best_final_verdict_after_screen": engine_pick.get("final_verdict") if engine_pick else None,
         "engine_best_reason_after_screen": engine_pick.get("reason") if engine_pick else None,
     }
@@ -2974,10 +2991,11 @@ async def _screen_ticker_candidate(
         primary_candidate=primary_candidate,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        screenshot_traps_context=screenshot_traps_context,
     )
 
     reason = summary.get("reason", "No summary available.")
-    failed_items = checklist.get("failed_items", [])
+    failed_items = checklist.get("all_failed_items", checklist.get("failed_items", []))
     if "liquidity_ok" in failed_items:
         reason = liquidity_context.get("why") or "Options liquidity is too wide for a clean debit spread entry."
     elif "clear_trigger" in failed_items:
@@ -3094,6 +3112,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         primary_candidate=primary_candidate,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        screenshot_traps_context=screenshot_traps_context,
     )
     selected_reason = selected.get("reason", summary_payload.get("reason", "No summary available.")) if selected else summary_payload.get("reason", "No summary available.")
 
@@ -3133,7 +3152,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "z_patch_trap_runtime_fix_2026_04_03",
+        "build_tag": "aa_patch_checklist_trap_sync_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3575,7 +3594,7 @@ def _build_journal_context_block(
         "final_verdict": final_verdict,
         "open_positions": request.open_positions,
         "weekly_trade_count": request.weekly_trade_count,
-        "failed_items": checklist.get("failed_items", []),
+        "failed_items": checklist.get("all_failed_items", checklist.get("failed_items", [])),
         "failed_reasons": failed_reasons,
         "required_fields_for_manual_log": [
             "ticker",
@@ -3630,7 +3649,7 @@ def _build_two_path_block(
             "invalidation_1h_ema50": ema,
         }
 
-    failed_items = set(checklist.get("failed_items", []))
+    failed_items = set(checklist.get("all_failed_items", checklist.get("failed_items", [])))
     if failed_items:
         ideal_parts: List[str] = []
         if "allowed_setup_type" in failed_items:
