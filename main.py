@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.32")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.33")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.32"
+USER_AGENT = "safe-fast-backend/1.9.33"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2430,6 +2430,12 @@ def _build_user_facing_block(
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
+    no_candidate_mode = liquidity_context.get("why") == "No candidate available."
+    base_invalidation_text = (
+        "No valid new entry from the current combined read."
+        if no_candidate_mode and not (chart_check and chart_check.get("ok"))
+        else base_invalidation_text
+    )
     trigger_state = trigger_state or {}
     primary_blocker_text = _priority_blocker_user_text(
         checklist=checklist,
@@ -2492,7 +2498,7 @@ def _build_user_facing_block(
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "invalidation": base_invalidation_text,
                 "setup_state": "NO TRADE",
                 "why": primary_blocker_text or blocking_reasons[0],
             }
@@ -2501,7 +2507,7 @@ def _build_user_facing_block(
             "good_idea_now": "WAIT",
             "ticker": ticker,
             "action": "wait for next regular session",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "invalidation": base_invalidation_text,
             "setup_state": "WAIT_MARKET_CLOSED",
             "why": f"Candidate exists, but the regular session is closed as of {market_context['as_of_et']}. Re-check next session before entry.",
         }
@@ -2513,7 +2519,7 @@ def _build_user_facing_block(
             "good_idea_now": "NO",
             "ticker": ticker,
             "action": "stand down",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "invalidation": base_invalidation_text,
             "setup_state": "NO TRADE",
             "why": macro_context.get("note") or "Major event risk is inside the expected hold window.",
         }
@@ -2523,7 +2529,7 @@ def _build_user_facing_block(
             "good_idea_now": "NO",
             "ticker": ticker,
             "action": "stand down",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "invalidation": base_invalidation_text,
             "setup_state": "NO TRADE",
             "why": f"Time/day filter fails: {time_day_gate.get('reason')}.",
         }
@@ -2533,7 +2539,7 @@ def _build_user_facing_block(
             "good_idea_now": "NO",
             "ticker": ticker,
             "action": "stand down",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "invalidation": base_invalidation_text,
             "setup_state": "NO TRADE",
             "why": liquidity_context.get("why") or "Options liquidity is too wide for a clean SAFE-FAST entry.",
         }
@@ -2553,7 +2559,7 @@ def _build_user_facing_block(
             "good_idea_now": "NO",
             "ticker": ticker,
             "action": "stand down",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "invalidation": base_invalidation_text,
             "setup_state": "NO TRADE",
             "why": primary_blocker_text,
         }
@@ -2564,7 +2570,7 @@ def _build_user_facing_block(
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "invalidation": base_invalidation_text,
                 "setup_state": "NO TRADE",
                 "why": _room_failure_user_text(structure_context),
             }
@@ -2573,7 +2579,7 @@ def _build_user_facing_block(
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "invalidation": base_invalidation_text,
                 "setup_state": "NO TRADE",
                 "why": "Wall thesis and strike placement do not match.",
             }
@@ -2582,7 +2588,7 @@ def _build_user_facing_block(
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "invalidation": base_invalidation_text,
                 "setup_state": "NO TRADE",
                 "why": "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
             }
@@ -2591,7 +2597,7 @@ def _build_user_facing_block(
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "invalidation": base_invalidation_text,
                 "setup_state": "NO TRADE",
                 "why": f"Setup type is {structure_context.get('setup_type')}, which is not tradable now.",
             }
@@ -2601,7 +2607,7 @@ def _build_user_facing_block(
         if chart_check_error:
             why = "Chart check failed in this run."
         invalidation_text = (
-            f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}."
+            base_invalidation_text
             if best_ticker and chart_check and chart_check.get("ok")
             else "No valid new entry from the current combined read."
         )
@@ -2618,7 +2624,7 @@ def _build_user_facing_block(
         "good_idea_now": "WAIT",
         "ticker": ticker,
         "action": "wait for full chart confirmation",
-        "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+        "invalidation": base_invalidation_text,
         "setup_state": "PENDING",
         "why": "Candidate engine is valid, but trigger/entry-zone timing still needs confirmation.",
     }
@@ -3331,7 +3337,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ai_patch_no_candidate_failed_reasons_consistency_2026_04_04",
+        "build_tag": "aj_patch_no_candidate_invalidation_consistency_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
