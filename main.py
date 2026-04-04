@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.35")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.34")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.35"
+USER_AGENT = "safe-fast-backend/1.9.34"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -182,6 +182,7 @@ def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any
             "ok": False,
             "status": "skipped_no_candidate",
             "why": "No candidate available in this run, so liquidity evaluation was not attempted.",
+            "liquidity_pass": None,
         }
 
     label_ctx = _classify_liquidity(
@@ -3374,7 +3375,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "al_patch_no_candidate_liquidity_iv_consistency_safe_2026_04_04",
+        "build_tag": "al_patch_no_candidate_liquidity_iv_consistency_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
