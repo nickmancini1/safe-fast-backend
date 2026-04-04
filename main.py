@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.27")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.28")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.27"
+USER_AGENT = "safe-fast-backend/1.9.28"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2754,16 +2754,23 @@ def _build_checklist_block(
 
     failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
 
-    pre_check_failed_items: List[str] = []
-    if screenshot_traps_context.get("hidden_left_level_pass") is False:
-        pre_check_failed_items.append("hidden_left_level")
+    hidden_left_level_clear = screenshot_traps_context.get("hidden_left_level_pass") is not False
     noisy_chop = screenshot_traps_context.get("noisy_chop") or {}
-    if noisy_chop.get("status") == "possible" and noisy_chop.get("backend_chop_risk") is True:
-        pre_check_failed_items.append("noisy_chop")
+    noisy_chop_clear = not (
+        noisy_chop.get("status") == "possible" and noisy_chop.get("backend_chop_risk") is True
+    )
     volume_climax = screenshot_traps_context.get("volume_climax") or {}
-    if volume_climax.get("status") == "possible":
-        pre_check_failed_items.append("volume_climax")
+    volume_climax_clear = volume_climax.get("status") != "possible"
+
+    pre_check_items = [
+        {"item": "hidden_left_level", "yes": hidden_left_level_clear},
+        {"item": "noisy_chop", "yes": noisy_chop_clear},
+        {"item": "volume_climax", "yes": volume_climax_clear},
+    ]
+
+    pre_check_failed_items = [row["item"] for row in pre_check_items if not row["yes"]]
     if screenshot_traps_context.get("trap_summary") == "blocked" and not pre_check_failed_items:
+        pre_check_items.append({"item": "screenshot_traps", "yes": False})
         pre_check_failed_items.append("screenshot_traps")
 
     all_failed_items = pre_check_failed_items + failed_items
@@ -2772,6 +2779,8 @@ def _build_checklist_block(
         "ok": True,
         "items": items,
         "failed_items": failed_items,
+        "pre_check_items": pre_check_items,
+        "pre_check_ok": len(pre_check_failed_items) == 0,
         "pre_check_failed_items": pre_check_failed_items,
         "all_failed_items": all_failed_items,
     }
@@ -3152,7 +3161,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "aa_patch_checklist_trap_sync_2026_04_03",
+        "build_tag": "ab_patch_precheck_items_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
