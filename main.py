@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.30")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.28")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.30"
+USER_AGENT = "safe-fast-backend/1.9.28"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2361,49 +2361,6 @@ def _room_failure_failed_reason_text(structure_context: Dict[str, Any]) -> str:
     return "room fails the SAFE-FAST rule"
 
 
-def _priority_blocker_user_text(
-    checklist: Optional[Dict[str, Any]],
-    structure_context: Dict[str, Any],
-    liquidity_context: Dict[str, Any],
-    trigger_state: Dict[str, Any],
-    screenshot_traps_context: Dict[str, Any],
-    chart_check_error: Optional[str] = None,
-) -> Optional[str]:
-    blocker_order = []
-    if checklist:
-        blocker_order = checklist.get("decision_blockers_priority") or checklist.get("all_failed_items") or checklist.get("failed_items") or []
-
-    for blocker in blocker_order:
-        if blocker in {"hidden_left_level", "noisy_chop", "volume_climax"}:
-            return _trap_failure_user_text(screenshot_traps_context)
-        if blocker == "allowed_setup_type":
-            return f"Setup type is {structure_context.get('setup_type')}, which is not tradable now."
-        if blocker == "twentyfour_hour_supportive":
-            return "24H context is not supportive for this setup."
-        if blocker == "one_hour_clean_around_ema":
-            return "1H structure around the 50 EMA is not clean enough."
-        if blocker == "clear_room":
-            return _room_failure_user_text(structure_context)
-        if blocker == "early_enough":
-            if structure_context.get("extension_state") == "extended":
-                return "Move is extended vs the 1H 50 EMA or too late relative to the wall."
-            return "Entry timing is too late for SAFE-FAST."
-        if blocker == "clear_trigger":
-            return trigger_state.get("why") or "No valid live trigger is present."
-        if blocker == "liquidity_ok":
-            return liquidity_context.get("why") or "Options liquidity is too wide for a clean SAFE-FAST entry."
-        if blocker == "invalidation_clear":
-            return "Invalidation is not clear enough for SAFE-FAST."
-        if blocker == "fits_risk":
-            return "Risk does not fit the SAFE-FAST budget."
-        if blocker == "open_trade_already":
-            return "You already have 1 open position. SAFE-FAST allows max 1 open trade total."
-
-    if chart_check_error:
-        return "Chart check failed in this run."
-    return None
-
-
 def _build_user_facing_block(
     request: OnDemandRequest,
     engine_status: str,
@@ -2418,20 +2375,9 @@ def _build_user_facing_block(
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
     screenshot_traps_context: Dict[str, Any],
-    checklist: Optional[Dict[str, Any]] = None,
-    trigger_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
-    trigger_state = trigger_state or {}
-    primary_blocker_text = _priority_blocker_user_text(
-        checklist=checklist,
-        structure_context=structure_context,
-        liquidity_context=liquidity_context,
-        trigger_state=trigger_state,
-        screenshot_traps_context=screenshot_traps_context,
-        chart_check_error=chart_check_error,
-    )
 
     if request.open_positions > 0:
         return {
@@ -2479,14 +2425,14 @@ def _build_user_facing_block(
         if _trap_blocks_trade(screenshot_traps_context):
             blocking_reasons.append(_trap_failure_user_text(screenshot_traps_context))
 
-        if primary_blocker_text or blocking_reasons:
+        if blocking_reasons:
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
-                "why": primary_blocker_text or blocking_reasons[0],
+                "why": blocking_reasons[0],
             }
 
         return {
@@ -2538,16 +2484,6 @@ def _build_user_facing_block(
             "invalidation": "No valid candidate engine setup is available.",
             "setup_state": "NO TRADE",
             "why": engine_reason,
-        }
-
-    if primary_blocker_text:
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-            "setup_state": "NO TRADE",
-            "why": primary_blocker_text,
         }
 
     if structure_context.get("ok"):
@@ -2839,27 +2775,6 @@ def _build_checklist_block(
 
     all_failed_items = pre_check_failed_items + failed_items
 
-    priority_order = [
-        "hidden_left_level",
-        "noisy_chop",
-        "volume_climax",
-        "allowed_setup_type",
-        "twentyfour_hour_supportive",
-        "one_hour_clean_around_ema",
-        "clear_room",
-        "early_enough",
-        "clear_trigger",
-        "liquidity_ok",
-        "invalidation_clear",
-        "fits_risk",
-        "open_trade_already",
-    ]
-    priority_rank = {name: idx for idx, name in enumerate(priority_order)}
-    decision_blockers_priority = sorted(
-        all_failed_items,
-        key=lambda item: (priority_rank.get(item, 999), item),
-    )
-
     return {
         "ok": True,
         "items": items,
@@ -2868,7 +2783,6 @@ def _build_checklist_block(
         "pre_check_ok": len(pre_check_failed_items) == 0,
         "pre_check_failed_items": pre_check_failed_items,
         "all_failed_items": all_failed_items,
-        "decision_blockers_priority": decision_blockers_priority,
     }
 
 
@@ -3091,17 +3005,7 @@ async def _screen_ticker_candidate(
 
     reason = summary.get("reason", "No summary available.")
     failed_items = checklist.get("all_failed_items", checklist.get("failed_items", []))
-    priority_reason = _priority_blocker_user_text(
-        checklist=checklist,
-        structure_context=structure_context,
-        liquidity_context=liquidity_context,
-        trigger_state=trigger_state,
-        screenshot_traps_context=screenshot_traps_context,
-        chart_check_error=chart_check_error,
-    )
-    if priority_reason:
-        reason = priority_reason
-    elif "liquidity_ok" in failed_items:
+    if "liquidity_ok" in failed_items:
         reason = liquidity_context.get("why") or "Options liquidity is too wide for a clean debit spread entry."
     elif "clear_trigger" in failed_items:
         reason = trigger_state.get("why") or "No valid live trigger is present."
@@ -3134,7 +3038,6 @@ async def _screen_ticker_candidate(
         "trigger_state": trigger_state,
         "screenshot_traps_context": screenshot_traps_context,
         "checklist": checklist,
-        "decision_blockers_priority": checklist.get("decision_blockers_priority", []),
     }
 
 
@@ -3253,14 +3156,12 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
         screenshot_traps_context=screenshot_traps_context,
-        checklist=checklist,
-        trigger_state=trigger_state,
     )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ad_patch_reason_priority_sync_2026_04_03",
+        "build_tag": "ab_patch_precheck_items_2026_04_03",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
