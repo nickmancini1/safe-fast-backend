@@ -3912,7 +3912,7 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
         return await _build_chart_check_payload(clean_symbol, token)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
-
+        
 
 @app.post("/safe-fast/on-demand")
 async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
