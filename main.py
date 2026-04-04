@@ -2872,6 +2872,7 @@ def _build_checklist_block(
     }
 
 
+
 def _failed_reason_messages(
     checklist: Dict[str, Any],
     time_day_gate: Dict[str, Any],
@@ -2883,44 +2884,82 @@ def _failed_reason_messages(
 ) -> List[str]:
     reasons: List[str] = []
 
-    # Normalize reasons so contextual failures are stated once.
-    mapping = {
+    blocker_order = (
+        checklist.get("decision_blockers_priority")
+        or checklist.get("all_failed_items")
+        or checklist.get("failed_items")
+        or []
+    )
+
+    trap_reason_map = {
+        "hidden_left_level": "hidden left-side level sits inside the room",
+        "noisy_chop": "noisy chop proxy is possible",
+        "volume_climax": "exhaustion proxy is possible",
+    }
+
+    standard_reason_map = {
         "allowed_setup_type": "setup type is not allowed",
         "twentyfour_hour_supportive": "24H context is not supportive",
         "one_hour_clean_around_ema": "1H structure around the 50 EMA is not clean",
         "clear_room": _room_failure_failed_reason_text(structure_context),
-        # early_enough is handled contextually below to avoid duplicate time/day wording
         "clear_trigger": "no valid live trigger is present",
-        # liquidity_ok is handled contextually below to avoid duplicate liquidity wording
         "invalidation_clear": "invalidation is not clear",
         "fits_risk": "risk does not fit the SAFE-FAST budget",
         "open_trade_already": "an open trade already exists",
     }
 
-    for item in checklist.get("failed_items", []):
-        msg = mapping.get(item)
+    gate_reason = time_day_gate.get("reason")
+
+    for blocker in blocker_order:
+        if blocker in trap_reason_map:
+            reasons.append(trap_reason_map[blocker])
+            continue
+
+        if blocker == "early_enough":
+            if not market_context.get("is_open"):
+                reasons.append("market is closed")
+            elif gate_reason == "past_monday_thursday_cutoff":
+                reasons.append("fresh entry is outside the SAFE-FAST time/day window")
+            elif gate_reason not in {None, "market_closed"}:
+                reasons.append(f"fresh entry blocked: {gate_reason}")
+            continue
+
+        if blocker == "liquidity_ok":
+            reasons.append(
+                liquidity_context.get("why")
+                or "Bid/ask widths or entry slippage are too wide for a clean SAFE-FAST debit spread entry."
+            )
+            continue
+
+        msg = standard_reason_map.get(blocker)
         if msg:
             reasons.append(msg)
-
-    gate_reason = time_day_gate.get("reason")
-    if not market_context.get("is_open"):
-        reasons.insert(0, "market is closed")
-    elif time_day_gate.get("fresh_entry_allowed") is False:
-        if gate_reason == "past_monday_thursday_cutoff":
-            reasons.insert(0, "fresh entry is outside the SAFE-FAST time/day window")
-        elif gate_reason not in {None, "market_closed"}:
-            reasons.insert(0, f"fresh entry blocked: {gate_reason}")
 
     if structure_context.get("extension_state") == "extended":
         reasons.append("move is extended versus the 1H 50 EMA")
 
+    if not market_context.get("is_open") and "market is closed" not in reasons:
+        reasons.append("market is closed")
+    elif time_day_gate.get("fresh_entry_allowed") is False:
+        if gate_reason == "past_monday_thursday_cutoff" and "fresh entry is outside the SAFE-FAST time/day window" not in reasons:
+            reasons.append("fresh entry is outside the SAFE-FAST time/day window")
+        elif gate_reason not in {None, "market_closed"}:
+            contextual_gate_reason = f"fresh entry blocked: {gate_reason}"
+            if contextual_gate_reason not in reasons:
+                reasons.append(contextual_gate_reason)
+
+    trap_reasons = _trap_failed_reason_messages(screenshot_traps_context)
+    for trap_reason in trap_reasons:
+        if trap_reason not in reasons:
+            reasons.append(trap_reason)
+
     if liquidity_context.get("liquidity_pass") is False:
-        reasons.append(
+        liquidity_reason = (
             liquidity_context.get("why")
             or "Bid/ask widths or entry slippage are too wide for a clean SAFE-FAST debit spread entry."
         )
-
-    reasons.extend(_trap_failed_reason_messages(screenshot_traps_context))
+        if liquidity_reason not in reasons:
+            reasons.append(liquidity_reason)
 
     # de-duplicate while preserving order
     out: List[str] = []
@@ -3260,7 +3299,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ae_patch_reason_priority_sync_fix_2026_04_04",
+        "build_tag": "af_patch_failed_reasons_priority_sync_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
