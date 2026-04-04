@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.33")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.34")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.33"
+USER_AGENT = "safe-fast-backend/1.9.34"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2142,6 +2142,12 @@ def _build_structure_context(
     chart_check: Optional[Dict[str, Any]],
     primary_candidate: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    if not primary_candidate:
+        return {
+            "ok": False,
+            "why": "no candidate available",
+        }
+
     if not chart_check or not chart_check.get("ok"):
         return {
             "ok": False,
@@ -2310,7 +2316,9 @@ def _build_chart_confirmation_block(
     structure_confirmed = bool(structure_context.get("ok"))
     confirmed = bool(one_hour_confirmed and structure_confirmed and not chart_check_error)
 
-    if chart_check_error:
+    if structure_context.get("why") == "no candidate available":
+        message = "No candidate available in this run, so chart confirmation was not attempted."
+    elif chart_check_error:
         message = "Chart check failed in this run."
     elif confirmed:
         message = "Chart confirmation fields are present in this run."
@@ -2643,6 +2651,25 @@ def _build_trigger_state(
     trigger_style = "close_above_recent_high" if option_type == "C" else "close_below_recent_low"
     market_open = bool(market_context.get("is_open"))
     fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
+
+    if structure_context.get("why") == "no candidate available":
+        return {
+            "ok": False,
+            "entry_state": "NO_CANDIDATE",
+            "trigger_present": False,
+            "trigger_style": trigger_style,
+            "trigger_level": None,
+            "current_close": None,
+            "price_vs_ema50_1h": None,
+            "price_vs_trigger": None,
+            "distance_to_trigger": None,
+            "crossed_trigger": False,
+            "structure_ready": False,
+            "market_open": market_open,
+            "fresh_entry_allowed": fresh_entry_allowed,
+            "entry_blockers": ["no_candidate"],
+            "why": "no_candidate",
+        }
 
     if not chart_check or not chart_check.get("ok"):
         return {
@@ -3300,11 +3327,21 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     selected_reason = selected.get("reason", summary_payload.get("reason", "No summary available.")) if selected else summary_payload.get("reason", "No summary available.")
 
     if request.include_chart_checks:
-        chart_check_block: Dict[str, Any] = chart_check if chart_check else {
-            "ok": False,
-            "symbol": best_ticker,
-            "error": chart_check_error or "Chart check unavailable in this run.",
-        }
+        if chart_check:
+            chart_check_block: Dict[str, Any] = chart_check
+        elif not primary_candidate:
+            chart_check_block = {
+                "ok": False,
+                "symbol": best_ticker,
+                "status": "skipped_no_candidate",
+                "message": "No candidate available in this run, so chart check was not attempted.",
+            }
+        else:
+            chart_check_block = {
+                "ok": False,
+                "symbol": best_ticker,
+                "error": chart_check_error or "Chart check unavailable in this run.",
+            }
     else:
         chart_check_block = {
             "ok": False,
@@ -3337,7 +3374,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "aj_patch_no_candidate_invalidation_consistency_2026_04_04",
+        "build_tag": "ak_patch_no_candidate_chart_consistency_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3912,7 +3949,7 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
         return await _build_chart_check_payload(clean_symbol, token)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
-        
+
 
 @app.post("/safe-fast/on-demand")
 async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
