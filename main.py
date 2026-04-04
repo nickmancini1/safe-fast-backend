@@ -3,21 +3,28 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import asdict, dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
-import numpy as np
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
+
 import pandas as pd
-import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-APP_TZ = ZoneInfo("America/New_York")
-BUILD_TAG = "ad_patch_reason_sync_2026_04_04"
+try:
+    import yfinance as yf
+except Exception:  # pragma: no cover
+    yf = None
+
+
+APP_TZ = ZoneInfo("America/New_York") if ZoneInfo is not None else None
+BUILD_TAG = "ae_patch_startup_harden_2026_04_04"
 ALLOWED_TICKERS = ["SPY", "QQQ", "IWM", "GLD"]
 
-ACCOUNT_SIZE = 1000.0
 RISK_MIN_DOLLARS = 250.0
 RISK_MAX_DOLLARS = 300.0
 RISK_HARD_MAX_DOLLARS = 400.0
@@ -28,11 +35,6 @@ DEFAULT_WIDTH_MIN = 5.0
 DEFAULT_WIDTH_MAX = 10.0
 
 EMA_PERIOD = 50
-LOOKBACK_BARS_1H = 240
-LOOKBACK_BARS_24H = 365
-
-ROOM_RATIO_REQUIRED = 2.0
-NEXT_POCKET_CLEAR_RATIO = 1.5
 
 EXTENSION_THRESHOLDS = {
     "SPY": 0.60,
@@ -40,8 +42,6 @@ EXTENSION_THRESHOLDS = {
     "IWM": 0.60,
     "GLD": 0.80,
 }
-
-DEFAULT_EVENT_BLOCK = False
 
 MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
@@ -148,14 +148,14 @@ class TargetContext:
 
 
 def now_et() -> datetime:
-    return datetime.now(tz=APP_TZ)
+    if APP_TZ is not None:
+        return datetime.now(tz=APP_TZ)
+    return datetime.now()
 
 
 def safe_float(value: Any) -> Optional[float]:
     try:
         if value is None:
-            return None
-        if isinstance(value, float) and math.isnan(value):
             return None
         out = float(value)
         if math.isnan(out):
@@ -174,54 +174,30 @@ def round_or_none(value: Optional[float], digits: int = 4) -> Optional[float]:
 def is_market_open(dt: datetime) -> bool:
     if dt.weekday() >= 5:
         return False
-    t = dt.timetz().replace(tzinfo=None)
-    return MARKET_OPEN <= t < MARKET_CLOSE
+    current = dt.timetz().replace(tzinfo=None)
+    return MARKET_OPEN <= current < MARKET_CLOSE
 
 
 def get_time_day_gate(dt: datetime) -> TimeDayGate:
     weekday = dt.weekday()
-    current_time = dt.timetz().replace(tzinfo=None)
+    current = dt.timetz().replace(tzinfo=None)
 
     if weekday >= 5:
-        return TimeDayGate(
-            fresh_entry_allowed=False,
-            reason="market_closed",
-            is_manage_only=False,
-        )
+        return TimeDayGate(False, "market_closed", False)
 
-    if current_time < MARKET_OPEN or current_time >= MARKET_CLOSE:
-        return TimeDayGate(
-            fresh_entry_allowed=False,
-            reason="market_closed",
-            is_manage_only=False,
-        )
+    if current < MARKET_OPEN or current >= MARKET_CLOSE:
+        return TimeDayGate(False, "market_closed", False)
 
     if weekday == 4:
-        if current_time >= FRIDAY_MANAGE_ONLY_CUTOFF:
-            return TimeDayGate(
-                fresh_entry_allowed=False,
-                reason="friday_manage_only",
-                is_manage_only=True,
-            )
-        if current_time >= FRIDAY_FRESH_ENTRY_CUTOFF:
-            return TimeDayGate(
-                fresh_entry_allowed=False,
-                reason="friday_fresh_entry_cutoff",
-                is_manage_only=False,
-            )
+        if current >= FRIDAY_MANAGE_ONLY_CUTOFF:
+            return TimeDayGate(False, "friday_manage_only", True)
+        if current >= FRIDAY_FRESH_ENTRY_CUTOFF:
+            return TimeDayGate(False, "friday_fresh_entry_cutoff", False)
     else:
-        if current_time >= MON_THU_FRESH_ENTRY_CUTOFF:
-            return TimeDayGate(
-                fresh_entry_allowed=False,
-                reason="late_day_fresh_entry_cutoff",
-                is_manage_only=False,
-            )
+        if current >= MON_THU_FRESH_ENTRY_CUTOFF:
+            return TimeDayGate(False, "late_day_fresh_entry_cutoff", False)
 
-    return TimeDayGate(
-        fresh_entry_allowed=True,
-        reason="ok",
-        is_manage_only=False,
-    )
+    return TimeDayGate(True, "ok", False)
 
 
 def market_context_from_dt(dt: datetime) -> MarketContext:
@@ -235,32 +211,22 @@ def market_context_from_dt(dt: datetime) -> MarketContext:
     )
 
 
-def download_history(
-    ticker: str,
-    interval: str,
-    period: str,
-    auto_adjust: bool = False,
-) -> pd.DataFrame:
-    try:
-        df = yf.download(
-            tickers=ticker,
-            interval=interval,
-            period=period,
-            progress=False,
-            auto_adjust=auto_adjust,
-            prepost=True,
-            threads=False,
-        )
-    except Exception:
-        return pd.DataFrame()
+def dependency_status() -> Dict[str, Any]:
+    return {
+        "yfinance_available": yf is not None,
+        "timezone_available": APP_TZ is not None,
+    }
 
+
+def normalize_history(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
     out = df.copy()
+
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [c[0] if isinstance(c, tuple) else c for c in out.columns]
+
     out = out.rename(
         columns={
             "Open": "open",
@@ -273,86 +239,222 @@ def download_history(
     )
     out.columns = [str(c).lower() for c in out.columns]
 
-    idx = out.index
-    if getattr(idx, "tz", None) is None:
-        try:
-            out.index = idx.tz_localize("UTC").tz_convert(APP_TZ)
-        except Exception:
-            try:
-                out.index = idx.tz_localize(APP_TZ)
-            except Exception:
-                pass
-    else:
-        try:
-            out.index = idx.tz_convert(APP_TZ)
-        except Exception:
-            pass
+    try:
+        idx = out.index
+        if getattr(idx, "tz", None) is None:
+            if APP_TZ is not None:
+                out.index = idx.tz_localize("UTC").tz_convert(APP_TZ)
+        else:
+            if APP_TZ is not None:
+                out.index = idx.tz_convert(APP_TZ)
+    except Exception:
+        pass
 
     return out.dropna(how="all")
+
+
+def download_history(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    if yf is None:
+        return pd.DataFrame()
+
+    try:
+        raw = yf.download(
+            tickers=ticker,
+            interval=interval,
+            period=period,
+            progress=False,
+            auto_adjust=False,
+            prepost=True,
+            threads=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    return normalize_history(raw)
 
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 
-def latest_completed_bar(df: pd.DataFrame) -> pd.Series:
-    if df.empty:
-        raise ValueError("empty dataframe")
-    return df.iloc[-1]
-
-
 def infer_24h_trend(df24h: pd.DataFrame) -> Tuple[str, bool]:
     if df24h.empty or "close" not in df24h.columns:
         return "unconfirmed", False
 
-    working = df24h.copy().dropna(subset=["close"])
+    working = df24h.dropna(subset=["close"]).copy()
     if len(working) < EMA_PERIOD + 5:
         return "unconfirmed", False
 
     working["ema50"] = ema(working["close"], EMA_PERIOD)
     latest = working.iloc[-1]
-    close_val = safe_float(latest.get("close"))
-    ema_val = safe_float(latest.get("ema50"))
 
-    if close_val is None or ema_val is None:
+    close_value = safe_float(latest.get("close"))
+    ema_value = safe_float(latest.get("ema50"))
+    if close_value is None or ema_value is None:
         return "unconfirmed", False
 
-    if close_val > ema_val:
+    if close_value > ema_value:
         return "bullish", True
-    if close_val < ema_val:
+    if close_value < ema_value:
         return "bearish", True
     return "mixed", False
 
 
+def build_fallback_payload(
+    ticker: str,
+    req: OnDemandRequest,
+    market_ctx: MarketContext,
+    tdg: TimeDayGate,
+    reason: str,
+) -> Dict[str, Any]:
+    liquidity_ctx = LiquidityContext(
+        chain_quality="unconfirmed",
+        bid_ask_ok=False,
+        spread_width_ok=False,
+        feasibility_ok=False,
+        estimated_debit=None,
+        width=None,
+        max_loss_dollars_1lot=None,
+    )
+    room_ctx = RoomContext(
+        first_wall=None,
+        next_pocket=None,
+        effective_wall=None,
+        room_basis="unconfirmed",
+        effective_room_distance=None,
+        room_required_for_pass=None,
+        room_shortfall=None,
+        room_ratio=None,
+        room_pass=False,
+        wall_thesis="UNCONFIRMED",
+    )
+    trap_ctx = TrapContext(
+        hidden_left_level=None,
+        hidden_left_level_pass=True,
+        noisy_chop="unconfirmed",
+        volume_climax="unconfirmed",
+        trap_summary="chart confirmation unavailable",
+        trap_flags=[],
+    )
+
+    market_closed = (not market_ctx.is_open) or (not tdg.fresh_entry_allowed)
+    blockers = ["market_closed"] if market_closed else []
+    blockers.append("data_unconfirmed")
+
+    checklist = ChecklistContext(
+        allowed_setup_type="NO",
+        supportive_24h="NO",
+        clean_1h_around_ema="NO",
+        clear_room="NO",
+        early_enough="NO",
+        clear_trigger="NO",
+        liquidity_ok="NO",
+        invalidation_clear="NO",
+        fits_risk="NO",
+        open_trade_already="YES" if req.open_positions > 0 else "NO",
+        pre_check_items=["hidden_left_level", "noisy_chop"],
+        pre_check_ok=False,
+        pre_check_failed_items=["data_unconfirmed"],
+        all_failed_items=blockers.copy(),
+        decision_blockers_priority=blockers.copy(),
+    )
+
+    return {
+        "ticker": ticker,
+        "signal_present": False,
+        "final_verdict": "NO_TRADE",
+        "action": "stand_down",
+        "setup_state": "NO TRADE",
+        "why": reason,
+        "market_context": asdict(market_ctx),
+        "time_day_gate": asdict(tdg),
+        "latest_close": None,
+        "ema50_1h": None,
+        "invalidation_anchor_1h_ema50": None,
+        "price_vs_ema50_1h": "unconfirmed",
+        "trend_24h": "unconfirmed",
+        "supportive_24h": False,
+        "room_context": asdict(room_ctx),
+        "extension_state": "unconfirmed",
+        "pct_from_ema": None,
+        "late_move": None,
+        "setup_type": "NOT_ALLOWED",
+        "allowed_setup": False,
+        "liquidity_context": asdict(liquidity_ctx),
+        "iv_context": {
+            "status": "unconfirmed",
+            "reason": "live_iv_unavailable",
+        },
+        "targets": asdict(TargetContext(None, None, None, None)),
+        "screenshot_traps_context": asdict(trap_ctx),
+        "checklist": asdict(checklist),
+        "user_facing": {
+            "ticker": ticker,
+            "action": "stand down",
+            "setup_state": "NO TRADE",
+            "why": reason,
+        },
+        "screened_best_context": {
+            "ticker": ticker,
+            "reason": reason,
+            "decision_blockers_priority": checklist.decision_blockers_priority,
+            "pre_check_failed_items": checklist.pre_check_failed_items,
+            "all_failed_items": checklist.all_failed_items,
+            "room_basis": room_ctx.room_basis,
+            "effective_wall": room_ctx.effective_wall,
+            "next_pocket": room_ctx.next_pocket,
+            "hidden_left_level": trap_ctx.hidden_left_level,
+            "noisy_chop": trap_ctx.noisy_chop,
+        },
+        "journal_context": {
+            "ticker": ticker,
+            "status": "No Trade",
+            "setup_type": "NOT_ALLOWED",
+            "trend_24h": "unconfirmed",
+            "latest_close": None,
+            "ema50_1h": None,
+            "room_basis": room_ctx.room_basis,
+            "first_wall": room_ctx.first_wall,
+            "next_pocket": room_ctx.next_pocket,
+            "effective_wall": room_ctx.effective_wall,
+            "room_ratio": room_ctx.room_ratio,
+            "pre_check_ok": checklist.pre_check_ok,
+            "pre_check_failed_items": checklist.pre_check_failed_items,
+            "all_failed_items": checklist.all_failed_items,
+            "decision_blockers_priority": checklist.decision_blockers_priority,
+            "trap_summary": trap_ctx.trap_summary,
+            "why_no_entry": reason,
+        },
+    }
+
+
 def last_1h_context(df1h: pd.DataFrame) -> Dict[str, Any]:
     if df1h.empty or "close" not in df1h.columns:
-        raise ValueError("missing 1h data")
+        raise ValueError("missing_1h_data")
 
-    working = df1h.copy().dropna(subset=["close"])
+    working = df1h.dropna(subset=["close"]).copy()
     if len(working) < EMA_PERIOD + 10:
-        raise ValueError("not enough 1h data")
+        raise ValueError("insufficient_1h_data")
+
+    for required in ["high", "low", "close"]:
+        if required not in working.columns:
+            raise ValueError(f"missing_{required}_column")
 
     working["ema50"] = ema(working["close"], EMA_PERIOD)
-    working["range"] = working["high"] - working["low"]
 
     latest = working.iloc[-1]
-    latest_close = safe_float(latest["close"])
-    ema50 = safe_float(latest["ema50"])
-    latest_high = safe_float(latest["high"])
-    latest_low = safe_float(latest["low"])
+    latest_close = safe_float(latest.get("close"))
+    ema50_1h = safe_float(latest.get("ema50"))
+    if latest_close is None or ema50_1h is None:
+        raise ValueError("bad_1h_values")
 
-    if latest_close is None or ema50 is None:
-        raise ValueError("bad 1h context")
-
-    price_vs_ema50_1h = "above" if latest_close > ema50 else "below" if latest_close < ema50 else "at"
-    pct_from_ema = abs((latest_close - ema50) / ema50) * 100 if ema50 else None
+    price_vs = "above" if latest_close > ema50_1h else "below" if latest_close < ema50_1h else "at"
+    pct_from_ema = abs((latest_close - ema50_1h) / ema50_1h) * 100 if ema50_1h else None
 
     return {
         "latest_close": latest_close,
-        "ema50_1h": ema50,
-        "latest_high": latest_high,
-        "latest_low": latest_low,
-        "price_vs_ema50_1h": price_vs_ema50_1h,
+        "ema50_1h": ema50_1h,
+        "price_vs_ema50_1h": price_vs,
         "pct_from_ema": pct_from_ema,
         "working": working,
     }
@@ -362,17 +464,20 @@ def get_recent_levels(df1h: pd.DataFrame) -> Dict[str, List[float]]:
     if df1h.empty:
         return {"resistance": [], "support": []}
 
-    working = df1h.copy().tail(5 * 7 * 24)
-    highs = working["high"].dropna().tolist() if "high" in working.columns else []
-    lows = working["low"].dropna().tolist() if "low" in working.columns else []
+    working = df1h.tail(5 * 7 * 24).copy()
 
-    resistance = sorted(set(round(float(x), 2) for x in highs[-50:])) if highs else []
-    support = sorted(set(round(float(x), 2) for x in lows[-50:])) if lows else []
+    resistance: List[float] = []
+    support: List[float] = []
+
+    if "high" in working.columns:
+        resistance = sorted(set(round(float(x), 2) for x in working["high"].dropna().tail(50).tolist()))
+    if "low" in working.columns:
+        support = sorted(set(round(float(x), 2) for x in working["low"].dropna().tail(50).tolist()))
+
     return {"resistance": resistance, "support": support}
 
 
 def nearest_wall_and_pocket(
-    ticker: str,
     latest_close: float,
     thesis_direction: str,
     invalidation: float,
@@ -393,26 +498,21 @@ def nearest_wall_and_pocket(
         higher_res = [x for x in resistance if x > latest_close]
         if higher_res:
             first_wall = higher_res[0]
-            if len(higher_res) > 1:
-                next_pocket = higher_res[1]
-        if next_pocket is not None:
-            effective_wall = next_pocket
-            room_basis = "next_pocket"
-            wall_thesis = "THROUGH_THE_WALL"
-        else:
-            effective_wall = first_wall
+        if len(higher_res) > 1:
+            next_pocket = higher_res[1]
     else:
         lower_sup = sorted([x for x in support if x < latest_close], reverse=True)
         if lower_sup:
             first_wall = lower_sup[0]
-            if len(lower_sup) > 1:
-                next_pocket = lower_sup[1]
-        if next_pocket is not None:
-            effective_wall = next_pocket
-            room_basis = "next_pocket"
-            wall_thesis = "THROUGH_THE_WALL"
-        else:
-            effective_wall = first_wall
+        if len(lower_sup) > 1:
+            next_pocket = lower_sup[1]
+
+    if next_pocket is not None:
+        effective_wall = next_pocket
+        room_basis = "next_pocket"
+        wall_thesis = "THROUGH_THE_WALL"
+    else:
+        effective_wall = first_wall
 
     effective_room_distance = None
     room_required_for_pass = None
@@ -420,15 +520,11 @@ def nearest_wall_and_pocket(
     room_ratio = None
     room_pass = False
 
-    if effective_wall is not None and invalidation_distance is not None:
+    if effective_wall is not None and invalidation_distance > 0:
         effective_room_distance = abs(effective_wall - latest_close)
         room_required_for_pass = 2.0 * invalidation_distance
         room_shortfall = effective_room_distance - room_required_for_pass
-        room_ratio = (
-            effective_room_distance / invalidation_distance
-            if invalidation_distance > 0
-            else None
-        )
+        room_ratio = effective_room_distance / invalidation_distance
         room_pass = effective_room_distance >= room_required_for_pass
 
     return RoomContext(
@@ -451,46 +547,46 @@ def detect_hidden_left_level(
     thesis_direction: str,
     room_ctx: RoomContext,
 ) -> Tuple[Optional[float], bool]:
-    if df1h.empty or "high" not in df1h.columns or "low" not in df1h.columns:
+    if df1h.empty:
         return None, True
 
-    working = df1h.copy().tail(5 * 7 * 24)
+    working = df1h.tail(5 * 7 * 24).copy()
+
     if thesis_direction == "long":
+        if "high" not in working.columns:
+            return None, True
         candidates = working["high"].dropna().tolist()
         in_room = [
             x for x in candidates
-            if x > latest_close and (
-                room_ctx.effective_wall is None or x < room_ctx.effective_wall
-            )
+            if x > latest_close and (room_ctx.effective_wall is None or x < room_ctx.effective_wall)
         ]
         if not in_room:
             return None, True
-        level = round(float(min(in_room)), 2)
-        return level, False
+        return round(float(min(in_room)), 2), False
 
+    if "low" not in working.columns:
+        return None, True
     candidates = working["low"].dropna().tolist()
     in_room = [
         x for x in candidates
-        if x < latest_close and (
-            room_ctx.effective_wall is None or x > room_ctx.effective_wall
-        )
+        if x < latest_close and (room_ctx.effective_wall is None or x > room_ctx.effective_wall)
     ]
     if not in_room:
         return None, True
-    level = round(float(max(in_room)), 2)
-    return level, False
+    return round(float(max(in_room)), 2), False
 
 
 def detect_noisy_chop(df1h: pd.DataFrame) -> str:
-    if df1h.empty or not {"high", "low", "close"}.issubset(df1h.columns):
+    if df1h.empty or not {"high", "low"}.issubset(df1h.columns):
         return "unconfirmed"
 
-    working = df1h.copy().tail(6)
+    working = df1h.tail(6).copy()
     if len(working) < 4:
         return "unconfirmed"
 
     overlap_count = 0
     rows = list(working.itertuples())
+
     for i in range(1, len(rows)):
         prev_high = safe_float(getattr(rows[i - 1], "high", None))
         prev_low = safe_float(getattr(rows[i - 1], "low", None))
@@ -509,10 +605,10 @@ def detect_noisy_chop(df1h: pd.DataFrame) -> str:
 
 
 def detect_volume_climax(df1h: pd.DataFrame) -> str:
-    if df1h.empty or not {"high", "low", "close"}.issubset(df1h.columns):
+    if df1h.empty or not {"high", "low"}.issubset(df1h.columns):
         return "unconfirmed"
 
-    working = df1h.copy().tail(20)
+    working = df1h.tail(20).copy()
     if len(working) < 5:
         return "unconfirmed"
 
@@ -523,7 +619,9 @@ def detect_volume_climax(df1h: pd.DataFrame) -> str:
     if latest_range is None or median_range is None or median_range <= 0:
         return "unconfirmed"
 
-    return "flagged_by_range_proxy" if latest_range > 2.2 * median_range else "not_flagged_by_range_proxy"
+    if latest_range > 2.2 * median_range:
+        return "flagged_by_range_proxy"
+    return "not_flagged_by_range_proxy"
 
 
 def evaluate_extension_state(ticker: str, pct_from_ema: Optional[float]) -> Tuple[str, bool]:
@@ -542,7 +640,6 @@ def classify_setup(
 ) -> Tuple[str, bool]:
     if extended or not room_pass:
         return "NOT_ALLOWED", False
-
     if trend_24h == "bullish" and price_vs_ema50_1h == "above":
         return "CONTINUATION", True
     if trend_24h == "bearish" and price_vs_ema50_1h == "below":
@@ -554,12 +651,11 @@ def classify_setup(
 
 def choose_candidate_spread(
     ticker: str,
-    latest_close: float,
-    option_type: str,
     width_min: float,
     width_max: float,
 ) -> LiquidityContext:
     width = 5.0 if width_min <= 5.0 <= width_max else float(width_min)
+
     if ticker == "SPY":
         debit = 2.77
         chain_quality = "acceptable"
@@ -573,6 +669,7 @@ def choose_candidate_spread(
 
     feasibility_ok = False
     max_loss = None
+
     if debit is not None:
         max_loss = debit * 100.0
         feasibility_ok = (1.60 * debit) <= width
@@ -635,17 +732,15 @@ def ordered_blockers(
     return blockers
 
 
-def user_facing_reason(
-    *,
-    blockers: List[str],
-    room_basis: str,
-) -> str:
+def user_facing_reason(*, blockers: List[str], room_basis: str) -> str:
     if "market_closed" in blockers:
         return "Market is closed."
     if "clear_room" in blockers:
         if room_basis == "next_pocket":
             return "Room to next pocket is too tight for SAFE-FAST."
-        return "Room to first wall is too tight for SAFE-FAST."
+        if room_basis == "first_wall":
+            return "Room to first wall is too tight for SAFE-FAST."
+        return "Room is unconfirmed."
     if "allowed_setup_type" in blockers:
         return "Setup type is not allowed."
     if "early_enough" in blockers:
@@ -696,14 +791,18 @@ def journal_context_payload(
     }
 
 
-def ticker_payload(
-    ticker: str,
-    req: OnDemandRequest,
-    market_ctx: MarketContext,
-    tdg: TimeDayGate,
-) -> Dict[str, Any]:
+def ticker_payload(ticker: str, req: OnDemandRequest, market_ctx: MarketContext, tdg: TimeDayGate) -> Dict[str, Any]:
     df1h = download_history(ticker, interval="60m", period="60d")
     df24h = download_history(ticker, interval="1d", period="2y")
+
+    if df1h.empty or df24h.empty:
+        return build_fallback_payload(
+            ticker=ticker,
+            req=req,
+            market_ctx=market_ctx,
+            tdg=tdg,
+            reason="Live chart feed unavailable. Candidate engine result only, chart confirmation still required.",
+        )
 
     ctx1h = last_1h_context(df1h)
     trend_24h, supportive_24h = infer_24h_trend(df24h)
@@ -718,7 +817,6 @@ def ticker_payload(
 
     levels = get_recent_levels(df1h)
     room_ctx = nearest_wall_and_pocket(
-        ticker=ticker,
         latest_close=latest_close,
         thesis_direction=thesis_direction,
         invalidation=invalidation,
@@ -733,7 +831,8 @@ def ticker_payload(
     )
     noisy_chop = detect_noisy_chop(df1h)
     volume_climax = detect_volume_climax(df1h)
-    trap_flags = []
+
+    trap_flags: List[str] = []
     if not hidden_left_pass:
         trap_flags.append("hidden_left_level")
     if noisy_chop == "possible":
@@ -741,7 +840,7 @@ def ticker_payload(
     if volume_climax == "flagged_by_range_proxy":
         trap_flags.append("volume_climax")
 
-    trap_summary_parts = []
+    trap_summary_parts: List[str] = []
     if not hidden_left_pass:
         trap_summary_parts.append("hidden left-side level inside room")
     if noisy_chop == "possible":
@@ -770,8 +869,6 @@ def ticker_payload(
 
     liquidity_ctx = choose_candidate_spread(
         ticker=ticker,
-        latest_close=latest_close,
-        option_type=req.option_type,
         width_min=req.width_min,
         width_max=req.width_max,
     )
@@ -789,10 +886,10 @@ def ticker_payload(
     )
     open_trade_already = req.open_positions > 0
     early_enough = not late_move
-    market_closed = not market_ctx.is_open or not tdg.fresh_entry_allowed
+    market_closed = (not market_ctx.is_open) or (not tdg.fresh_entry_allowed)
 
     pre_check_items = ["hidden_left_level", "noisy_chop"]
-    pre_check_failed_items = []
+    pre_check_failed_items: List[str] = []
     if not hidden_left_pass:
         pre_check_failed_items.append("hidden_left_level")
     if noisy_chop == "possible":
@@ -836,16 +933,12 @@ def ticker_payload(
         room_basis=room_ctx.room_basis,
     )
 
-    final_verdict = "NO_TRADE"
-    action = "stand_down"
-    setup_state = "NO TRADE"
-
-    out = {
+    return {
         "ticker": ticker,
         "signal_present": True,
-        "final_verdict": final_verdict,
-        "action": action,
-        "setup_state": setup_state,
+        "final_verdict": "NO_TRADE",
+        "action": "stand_down",
+        "setup_state": "NO TRADE",
         "why": reason,
         "market_context": asdict(market_ctx),
         "time_day_gate": asdict(tdg),
@@ -872,7 +965,7 @@ def ticker_payload(
         "user_facing": {
             "ticker": ticker,
             "action": "stand down",
-            "setup_state": setup_state,
+            "setup_state": "NO TRADE",
             "why": reason,
         },
         "screened_best_context": {
@@ -899,30 +992,43 @@ def ticker_payload(
             user_reason=reason,
         ),
     }
-    return out
 
 
 def best_ticker_from_candidates(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    def score(c: Dict[str, Any]) -> Tuple[int, float, float]:
-        checklist = c.get("checklist", {})
-        passed = sum(1 for v in checklist.values() if v == "YES")
-        room_ratio = safe_float(c.get("room_context", {}).get("room_ratio")) or 0.0
-        debit_penalty = -1.0 * (safe_float(c.get("liquidity_context", {}).get("estimated_debit")) or 999.0)
-        return (passed, room_ratio, debit_penalty)
+    def score(candidate: Dict[str, Any]) -> Tuple[int, float, float]:
+        checklist = candidate.get("checklist", {})
+        score_yes = 0
+        for key in [
+            "allowed_setup_type",
+            "supportive_24h",
+            "clean_1h_around_ema",
+            "clear_room",
+            "early_enough",
+            "clear_trigger",
+            "liquidity_ok",
+            "invalidation_clear",
+            "fits_risk",
+        ]:
+            if checklist.get(key) == "YES":
+                score_yes += 1
+        room_ratio = safe_float(candidate.get("room_context", {}).get("room_ratio")) or 0.0
+        debit_value = safe_float(candidate.get("liquidity_context", {}).get("estimated_debit"))
+        debit_penalty = -debit_value if debit_value is not None else -999.0
+        return (score_yes, room_ratio, debit_penalty)
 
     ranked = sorted(candidates, key=score, reverse=True)
     return ranked[0]
 
 
 def build_universe_summary(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    summary = {}
-    for c in candidates:
-        summary[c["ticker"]] = {
-            "final_verdict": c["final_verdict"],
-            "reason": c["why"],
-            "setup_type": c["setup_type"],
-            "decision_blockers_priority": c["checklist"]["decision_blockers_priority"],
-            "liquidity_quality": c["liquidity_context"]["chain_quality"],
+    summary: Dict[str, Any] = {}
+    for candidate in candidates:
+        summary[candidate["ticker"]] = {
+            "final_verdict": candidate["final_verdict"],
+            "reason": candidate["why"],
+            "setup_type": candidate["setup_type"],
+            "decision_blockers_priority": candidate["checklist"]["decision_blockers_priority"],
+            "liquidity_quality": candidate["liquidity_context"]["chain_quality"],
         }
     return summary
 
@@ -940,18 +1046,18 @@ def run_on_demand(req: OnDemandRequest) -> Dict[str, Any]:
 
     for ticker in ALLOWED_TICKERS:
         try:
-            payload = ticker_payload(
-                ticker=ticker,
-                req=req,
-                market_ctx=market_ctx,
-                tdg=tdg,
-            )
-            candidates.append(payload)
+            candidates.append(ticker_payload(ticker=ticker, req=req, market_ctx=market_ctx, tdg=tdg))
         except Exception as exc:
             errors[ticker] = str(exc)
-
-    if not candidates:
-        raise HTTPException(status_code=500, detail={"message": "No candidates built", "errors": errors})
+            candidates.append(
+                build_fallback_payload(
+                    ticker=ticker,
+                    req=req,
+                    market_ctx=market_ctx,
+                    tdg=tdg,
+                    reason=f"Ticker build failed: {str(exc)}",
+                )
+            )
 
     best = best_ticker_from_candidates(candidates)
     universe_summary = build_universe_summary(candidates)
@@ -968,20 +1074,20 @@ def run_on_demand(req: OnDemandRequest) -> Dict[str, Any]:
         "weekly_trade_count": req.weekly_trade_count,
     }
 
-    response = {
+    return {
         "build_tag": BUILD_TAG,
         "mode": "on_demand",
         "final_verdict": best["final_verdict"],
         "best_ticker": best["ticker"],
         "open_positions": req.open_positions,
         "weekly_trade_count": req.weekly_trade_count,
+        "dependency_status": dependency_status(),
         "simple_output": simple_output,
         "best_context": best,
         "universe_summary": universe_summary,
         "all_candidates": candidates,
         "errors": errors,
     }
-    return response
 
 
 @app.get("/")
@@ -990,11 +1096,7 @@ def root() -> Dict[str, Any]:
         "ok": True,
         "service": "safe-fast-backend",
         "build_tag": BUILD_TAG,
-        "routes": [
-            "/health",
-            "/safe-fast/on-demand",
-            "/on-demand",
-        ],
+        "routes": ["/health", "/safe-fast/on-demand", "/on-demand"],
     }
 
 
@@ -1004,13 +1106,13 @@ def health() -> Dict[str, Any]:
         "ok": True,
         "build_tag": BUILD_TAG,
         "timestamp_et": now_et().isoformat(),
+        "dependency_status": dependency_status(),
     }
 
 
 @app.get("/safe-fast/on-demand")
 def safe_fast_on_demand_get() -> Dict[str, Any]:
-    req = OnDemandRequest()
-    return run_on_demand(req)
+    return run_on_demand(OnDemandRequest())
 
 
 @app.post("/safe-fast/on-demand")
@@ -1020,8 +1122,7 @@ def safe_fast_on_demand_post(req: OnDemandRequest) -> Dict[str, Any]:
 
 @app.get("/on-demand")
 def on_demand_get() -> Dict[str, Any]:
-    req = OnDemandRequest()
-    return run_on_demand(req)
+    return run_on_demand(OnDemandRequest())
 
 
 @app.post("/on-demand")
