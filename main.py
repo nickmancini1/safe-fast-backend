@@ -1159,7 +1159,7 @@ async def _build_summary_compact_payload(
 
     ranked = _rank_ticker_summaries(ticker_summaries)
     best_summary = ranked[0] if ranked else None
-    best_ticker = best_summary["symbol"] if best_summary and best_summary["primary_candidate"] else None
+    best_ticker = best_summary["symbol"] if best_summary else None
     verdict = best_summary["verdict"] if best_summary else "NO_TRADE"
 
     return {
@@ -3299,7 +3299,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "af_patch_failed_reasons_priority_sync_2026_04_04",
+        "build_tag": "ag_patch_engine_best_ticker_consistency_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
