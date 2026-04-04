@@ -1,0 +1,138 @@
+name: Railway SAFE-FAST validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_file:
+        description: "Path to the candidate main.py file in the repo"
+        required: true
+        default: "candidates/main.py"
+      target_branch:
+        description: "Branch Railway auto-deploys from"
+        required: true
+        default: "railway-test"
+      baseline_file:
+        description: "Path to the known-good fallback main.py file in the repo"
+        required: true
+        default: "main.py"
+  push:
+    branches:
+      - railway-test
+
+permissions:
+  contents: write
+
+concurrency:
+  group: railway-safe-fast-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stage-candidate:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_branch }}
+
+      - name: Replace main.py with candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${{ github.event.inputs.candidate_file }}" "main.py"
+
+      - name: Commit candidate to Railway branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.py
+          if git diff --cached --quiet; then
+            echo "No main.py change detected."
+            exit 0
+          fi
+          git commit -m "stage candidate for Railway validation"
+          git push origin "HEAD:${{ github.event.inputs.target_branch }}"
+
+  validate-deploy:
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_branch || github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Wait for Railway to deploy
+        shell: bash
+        env:
+          APP_URL: ${{ secrets.SAFE_FAST_APP_URL }}
+          HEALTH_PATH: ${{ secrets.SAFE_FAST_HEALTH_PATH || '/health' }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys, time, urllib.request
+          app_url = os.environ["APP_URL"].rstrip("/")
+          health_path = os.environ.get("HEALTH_PATH", "/health")
+          url = f"{app_url}{health_path}"
+          deadline = time.time() + 600
+          last_error = None
+          while time.time() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as resp:
+                      body = resp.read().decode("utf-8", "replace")
+                      if resp.status == 200:
+                          print(body)
+                          sys.exit(0)
+              except Exception as exc:
+                  last_error = exc
+              time.sleep(10)
+          raise SystemExit(f"Railway health check never became ready: {last_error}")
+          PY
+
+      - name: Validate SAFE-FAST response
+        env:
+          SAFE_FAST_APP_URL: ${{ secrets.SAFE_FAST_APP_URL }}
+          SAFE_FAST_ENDPOINT_PATH: ${{ secrets.SAFE_FAST_ENDPOINT_PATH || '/safe-fast/on-demand' }}
+          SAFE_FAST_OPTION_TYPE: C
+          SAFE_FAST_OPEN_POSITIONS: "0"
+          SAFE_FAST_WEEKLY_TRADE_COUNT: "0"
+        run: |
+          python scripts/validate_safe_fast.py
+
+  rollback-on-failure:
+    runs-on: ubuntu-latest
+    needs: validate-deploy
+    if: failure()
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_branch || github.ref_name }}
+
+      - name: Restore known-good main.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${{ github.event.inputs.baseline_file || 'main.py' }}" "main.py"
+
+      - name: Commit rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.py
+          if git diff --cached --quiet; then
+            echo "Rollback produced no file change."
+            exit 0
+          fi
+          git commit -m "rollback failed Railway SAFE-FAST candidate"
+          git push origin "HEAD:${{ github.event.inputs.target_branch || github.ref_name }}"
