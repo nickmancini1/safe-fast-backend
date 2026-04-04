@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.36")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.35")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.36"
+USER_AGENT = "safe-fast-backend/1.9.35"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -3374,7 +3374,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ao_patch_no_candidate_context_action_2026_04_04",
+        "build_tag": "an_patch_no_candidate_context_reasons_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3408,9 +3408,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
                 trigger_state=trigger_state,
                 screenshot_traps_context=screenshot_traps_context,
             ),
-            market_context=market_context,
-            time_day_gate=time_day_gate,
-            user_facing=user_facing_block,
         ),
         "market_context": market_context,
         "macro_context": macro_context,
@@ -3883,9 +3880,6 @@ def _build_no_candidate_context(
     liquidity_context: Dict[str, Any],
     iv_context: Dict[str, Any],
     failed_reasons: List[str],
-    market_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
-    user_facing: Dict[str, Any],
 ) -> Dict[str, Any]:
     active = bool(
         summary_payload.get("selection_mode") == "none"
@@ -3904,10 +3898,6 @@ def _build_no_candidate_context(
         "liquidity_reason": liquidity_context.get("why") if active else None,
         "iv_status": iv_context.get("status") if active else None,
         "iv_reason": iv_context.get("why") if active else None,
-        "market_session": market_context.get("session") if active else None,
-        "time_day_gate_reason": time_day_gate.get("reason") if active else None,
-        "action": user_facing.get("action") if active else None,
-        "invalidation": user_facing.get("invalidation") if active else None,
         "failed_reasons": failed_reasons if active else [],
     }
 
