@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.31")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.32")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.31"
+USER_AGENT = "safe-fast-backend/1.9.32"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -2889,8 +2889,31 @@ def _failed_reason_messages(
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
     screenshot_traps_context: Dict[str, Any],
+    engine_reason: Optional[str] = None,
 ) -> List[str]:
     reasons: List[str] = []
+
+    if liquidity_context.get("why") == "No candidate available.":
+        no_candidate_reason = engine_reason or "No feasible candidates found for the current filters."
+        reasons.append(no_candidate_reason)
+
+        gate_reason = time_day_gate.get("reason")
+        if not market_context.get("is_open"):
+            reasons.append("market is closed")
+        elif time_day_gate.get("fresh_entry_allowed") is False:
+            if gate_reason == "past_monday_thursday_cutoff":
+                reasons.append("fresh entry is outside the SAFE-FAST time/day window")
+            elif gate_reason not in {None, "market_closed"}:
+                reasons.append(f"fresh entry blocked: {gate_reason}")
+
+        out: List[str] = []
+        seen = set()
+        for reason in reasons:
+            normalized = str(reason).strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                out.append(normalized)
+        return out
 
     blocker_order = (
         checklist.get("decision_blockers_priority")
@@ -3308,7 +3331,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ah_patch_no_candidate_reason_consistency_2026_04_04",
+        "build_tag": "ai_patch_no_candidate_failed_reasons_consistency_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3376,6 +3399,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
                 liquidity_context=liquidity_context,
                 trigger_state=trigger_state,
                 screenshot_traps_context=screenshot_traps_context,
+                engine_reason=selected_reason,
             ),
         ),
         "time_day_gate": time_day_gate,
@@ -3393,6 +3417,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             liquidity_context=liquidity_context,
             trigger_state=trigger_state,
             screenshot_traps_context=screenshot_traps_context,
+            engine_reason=selected_reason,
         ),
         "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
         "request": request.model_dump(),
