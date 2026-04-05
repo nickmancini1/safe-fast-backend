@@ -2628,10 +2628,43 @@ def _build_user_facing_block(
             "why": why,
         }
 
+    if trigger_state.get("entry_state") == "ACTIVE_NOW" and trigger_state.get("trigger_present") is True:
+        live_reason = "Mapped trigger is live now and SAFE-FAST gates pass."
+        if structure_context.get("trend_label"):
+            live_reason = f"{structure_context.get('trend_label')}, mapped trigger is live now and not blocked."
+        return {
+            "good_idea_now": "YES",
+            "ticker": ticker,
+            "action": "enter",
+            "invalidation": base_invalidation_text,
+            "setup_state": "ACTIVE NOW",
+            "why": live_reason,
+        }
+
+    if trigger_state.get("entry_state") == "PENDING_TRIGGER":
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "wait",
+            "invalidation": base_invalidation_text,
+            "setup_state": "PENDING",
+            "why": "Candidate engine is valid, but the live close trigger is not present yet.",
+        }
+
+    if trigger_state.get("entry_state") == "SIGNAL_PRESENT_BUT_BLOCKED":
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": base_invalidation_text,
+            "setup_state": "NO TRADE",
+            "why": primary_blocker_text or "Signal is present, but SAFE-FAST blockers still fail.",
+        }
+
     return {
-        "good_idea_now": "WAIT",
+        "good_idea_now": "NO",
         "ticker": ticker,
-        "action": "wait for full chart confirmation",
+        "action": "wait",
         "invalidation": base_invalidation_text,
         "setup_state": "PENDING",
         "why": "Candidate engine is valid, but trigger/entry-zone timing still needs confirmation.",
@@ -3374,7 +3407,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ao_patch_no_candidate_context_checklist_2026_04_04",
+        "build_tag": "ap_patch_candidate_context_live_map_2026_04_05",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3391,6 +3424,16 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             selected=selected,
             engine_best_ticker=summary_payload.get("best_ticker"),
             screened_candidates=screened_candidates,
+        ),
+        "candidate_context": _build_candidate_context(
+            best_ticker=best_ticker,
+            primary_candidate=primary_candidate,
+            backup_candidate=selected.get("backup_candidate") if selected else summary_payload.get("backup_candidate"),
+            chart_check=chart_check,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+            checklist=checklist_block,
+            user_facing=user_facing,
         ),
         "no_candidate_context": _build_no_candidate_context(
             summary_payload=summary_payload,
@@ -3869,6 +3912,49 @@ def _build_simple_output_block(
         "setup_state": user_facing.get("setup_state"),
         "why": user_facing.get("why"),
         "signal_present": signal_present,
+    }
+
+
+
+def _build_candidate_context(
+    best_ticker: Optional[str],
+    primary_candidate: Optional[Dict[str, Any]],
+    backup_candidate: Optional[Dict[str, Any]],
+    chart_check: Optional[Dict[str, Any]],
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    checklist: Dict[str, Any],
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    active = bool(best_ticker and primary_candidate)
+
+    return {
+        "active": active,
+        "ticker": best_ticker,
+        "good_idea_now": user_facing.get("good_idea_now") if active else "NO",
+        "action": user_facing.get("action") if active else "stand down",
+        "setup_state": user_facing.get("setup_state") if active else "NO TRADE",
+        "setup_type": structure_context.get("setup_type") if active else None,
+        "trend_label": structure_context.get("trend_label") if active else None,
+        "twentyfour_hour_supportive": structure_context.get("twentyfour_hour_supportive") if active else None,
+        "trigger_state": trigger_state.get("entry_state") if active else None,
+        "trigger_style": trigger_state.get("trigger_style") if active else None,
+        "trigger_level": trigger_state.get("trigger_level") if active else None,
+        "latest_close": chart_check.get("latest_close") if active and chart_check else None,
+        "ema50_1h": chart_check.get("ema50_1h") if active and chart_check else None,
+        "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h") if active and chart_check else None,
+        "primary_candidate": primary_candidate if active else None,
+        "backup_candidate": backup_candidate if active else None,
+        "checklist_failed_items": (
+            checklist.get("all_failed_items", checklist.get("failed_items", [])) if active else []
+        ),
+        "decision_blockers_priority": (
+            checklist.get("decision_blockers_priority", []) if active else []
+        ),
+        "note": (
+            "Entry-zone mapping is still unconfirmed in this build; use trigger_state and structure_context for live decision support."
+            if active else None
+        ),
     }
 
 
