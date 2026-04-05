@@ -4008,3 +4008,91 @@ def _build_two_path_block(
         room_note = structure_context.get("room_note")
         ideal_path = "Wait for next regular session. Re-check before entry."
         if room_note:
+            ideal_path = f"{ideal_path} {room_note}"
+        return {
+            "ideal_path": ideal_path,
+            "acceptable_path": "No entry while market is closed.",
+            "invalidation_1h_ema50": ema,
+        }
+
+    failed_items = set(checklist.get("all_failed_items", checklist.get("failed_items", [])))
+    if failed_items:
+        ideal_parts: List[str] = []
+        if "allowed_setup_type" in failed_items:
+            ideal_parts.append("allowed setup type")
+        if "twentyfour_hour_supportive" in failed_items:
+            ideal_parts.append("24H support")
+        if "clear_room" in failed_items:
+            ideal_parts.append("room pass")
+        if "early_enough" in failed_items:
+            ideal_parts.append("time/extension pass")
+        if "clear_trigger" in failed_items:
+            ideal_parts.append("live trigger")
+        ideal_text = "Need " + ", ".join(ideal_parts) + " before entry." if ideal_parts else "Need full gate pass before entry."
+        return {
+            "ideal_path": ideal_text,
+            "acceptable_path": "Stand down until all failed gates pass.",
+            "invalidation_1h_ema50": ema,
+        }
+
+    return {
+        "ideal_path": "Setup passes. Enter only if current bar behavior still confirms the trigger.",
+        "acceptable_path": "Take only the mapped entry with the 1H EMA invalidation active.",
+        "invalidation_1h_ema50": ema,
+    }
+
+
+
+@app.get("/")
+
+def root() -> Dict[str, Any]:
+    return {"status": "ok", "service": "safe-fast-backend"}
+
+
+@app.get("/health")
+def health() -> Dict[str, bool]:
+    return {"ok": True}
+
+
+@app.get("/tt/safe-fast-summary-compact")
+async def tt_safe_fast_summary_compact(
+    option_type: str = Query("C"),
+    min_dte: int = Query(14),
+    max_dte: int = Query(30),
+    near_limit: int = Query(16),
+    width_min: float = Query(5.0),
+    width_max: float = Query(10.0),
+    risk_min_dollars: float = Query(250.0),
+    risk_max_dollars: float = Query(300.0),
+    hard_max_dollars: float = Query(400.0),
+    allow_fallback: bool = Query(True),
+) -> Any:
+    token = await get_access_token()
+    return await _build_summary_compact_payload(
+        option_type=option_type,
+        min_dte=min_dte,
+        max_dte=max_dte,
+        near_limit=near_limit,
+        width_min=width_min,
+        width_max=width_max,
+        risk_min_dollars=risk_min_dollars,
+        risk_max_dollars=risk_max_dollars,
+        hard_max_dollars=hard_max_dollars,
+        allow_fallback=allow_fallback,
+        token=token,
+    )
+
+
+@app.get("/tt/safe-fast-chart-check")
+async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
+    clean_symbol = _clean_symbol(symbol)
+    token = await get_access_token()
+    try:
+        return await _build_chart_check_payload(clean_symbol, token)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/safe-fast/on-demand")
+async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
+    return await _build_on_demand_payload(request)
