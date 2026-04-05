@@ -3433,7 +3433,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             structure_context=structure_context,
             trigger_state=trigger_state,
             checklist=checklist_block,
-            user_facing=user_facing,
+            user_facing=user_facing_block,
         ),
         "no_candidate_context": _build_no_candidate_context(
             summary_payload=summary_payload,
