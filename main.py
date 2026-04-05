@@ -4045,7 +4045,7 @@ def _build_two_path_block(
     chart_check: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     ema = chart_check.get("ema50_1h") if chart_check else None
-
+    
     if market_context.get("is_open") is False:
         room_note = structure_context.get("room_note")
         ideal_path = "Wait for next regular session. Re-check before entry."
