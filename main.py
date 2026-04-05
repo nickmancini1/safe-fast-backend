@@ -3407,7 +3407,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ap_patch_candidate_context_live_map_2026_04_05",
+        "build_tag": "aq_patch_candidate_context_actionable_fields_2026_04_05",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3427,6 +3427,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         ),
         "candidate_context": _build_candidate_context(
             best_ticker=best_ticker,
+            selected_summary=selected if selected else None,
             primary_candidate=primary_candidate,
             backup_candidate=selected.get("backup_candidate") if selected else summary_payload.get("backup_candidate"),
             chart_check=chart_check,
@@ -3434,6 +3435,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             trigger_state=trigger_state,
             checklist=checklist_block,
             user_facing=user_facing_block,
+            targets=_build_targets_block(primary_candidate),
+            invalidation_level_1h_ema50=_build_invalidation_level(chart_check),
         ),
         "no_candidate_context": _build_no_candidate_context(
             summary_payload=summary_payload,
@@ -3918,6 +3921,7 @@ def _build_simple_output_block(
 
 def _build_candidate_context(
     best_ticker: Optional[str],
+    selected_summary: Optional[Dict[str, Any]],
     primary_candidate: Optional[Dict[str, Any]],
     backup_candidate: Optional[Dict[str, Any]],
     chart_check: Optional[Dict[str, Any]],
@@ -3925,8 +3929,45 @@ def _build_candidate_context(
     trigger_state: Dict[str, Any],
     checklist: Dict[str, Any],
     user_facing: Dict[str, Any],
+    targets: Dict[str, Any],
+    invalidation_level_1h_ema50: Optional[float],
 ) -> Dict[str, Any]:
     active = bool(best_ticker and primary_candidate)
+
+    options_block = None
+    levels_block = None
+    targets_block = None
+
+    if active:
+        options_block = {
+            "expiration_date": selected_summary.get("expiration_date") if selected_summary else None,
+            "days_to_expiration": selected_summary.get("days_to_expiration") if selected_summary else None,
+            "underlying_price": selected_summary.get("underlying_price") if selected_summary else None,
+            "long_strike": primary_candidate.get("long_strike"),
+            "short_strike": primary_candidate.get("short_strike"),
+            "width": primary_candidate.get("width"),
+            "est_debit": primary_candidate.get("est_debit"),
+            "max_loss_dollars_1lot": primary_candidate.get("max_loss_dollars_1lot"),
+            "max_profit_dollars_1lot": primary_candidate.get("max_profit_dollars_1lot"),
+        }
+        levels_block = {
+            "latest_close": chart_check.get("latest_close") if chart_check else None,
+            "ema50_1h": chart_check.get("ema50_1h") if chart_check else None,
+            "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h") if chart_check else None,
+            "first_wall": structure_context.get("first_wall"),
+            "next_pocket": structure_context.get("next_pocket"),
+            "effective_wall": structure_context.get("effective_wall"),
+            "room_ratio": structure_context.get("room_ratio"),
+            "room_note": structure_context.get("room_note"),
+            "wall_thesis": structure_context.get("wall_thesis"),
+            "invalidation_1h_ema50": invalidation_level_1h_ema50,
+        }
+        targets_block = {
+            "target_40_pct_value": targets.get("target_40_pct_value"),
+            "target_50_pct_value": targets.get("target_50_pct_value"),
+            "target_60_pct_value": targets.get("target_60_pct_value"),
+            "target_70_pct_value": targets.get("target_70_pct_value"),
+        }
 
     return {
         "active": active,
@@ -3940,9 +3981,9 @@ def _build_candidate_context(
         "trigger_state": trigger_state.get("entry_state") if active else None,
         "trigger_style": trigger_state.get("trigger_style") if active else None,
         "trigger_level": trigger_state.get("trigger_level") if active else None,
-        "latest_close": chart_check.get("latest_close") if active and chart_check else None,
-        "ema50_1h": chart_check.get("ema50_1h") if active and chart_check else None,
-        "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h") if active and chart_check else None,
+        "options": options_block,
+        "levels": levels_block,
+        "targets": targets_block,
         "primary_candidate": primary_candidate if active else None,
         "backup_candidate": backup_candidate if active else None,
         "checklist_failed_items": (
@@ -3951,8 +3992,9 @@ def _build_candidate_context(
         "decision_blockers_priority": (
             checklist.get("decision_blockers_priority", []) if active else []
         ),
+        "entry_zone_status": "unconfirmed" if active else None,
         "note": (
-            "Entry-zone mapping is still unconfirmed in this build; use trigger_state and structure_context for live decision support."
+            "Entry zones and trigger candle mapping are still unconfirmed in this build; use options, levels, targets, trigger_state, and structure_context for live decision support."
             if active else None
         ),
     }
