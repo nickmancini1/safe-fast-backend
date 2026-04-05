@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.9.35")
+app = FastAPI(title="SAFE-FAST Backend", version="1.9.37")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.9.35"
+USER_AGENT = "safe-fast-backend/1.9.37"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -3374,7 +3374,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "an_patch_no_candidate_context_reasons_2026_04_04",
+        "build_tag": "ao_patch_no_candidate_context_checklist_2026_04_04",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3399,6 +3399,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             structure_context=structure_context,
             liquidity_context=liquidity_context,
             iv_context=_build_iv_context(primary_candidate),
+            checklist=checklist_block,
             failed_reasons=_failed_reason_messages(
                 checklist=checklist_block,
                 time_day_gate=time_day_gate,
@@ -3879,6 +3880,7 @@ def _build_no_candidate_context(
     structure_context: Dict[str, Any],
     liquidity_context: Dict[str, Any],
     iv_context: Dict[str, Any],
+    checklist: Dict[str, Any],
     failed_reasons: List[str],
 ) -> Dict[str, Any]:
     active = bool(
@@ -3898,6 +3900,12 @@ def _build_no_candidate_context(
         "liquidity_reason": liquidity_context.get("why") if active else None,
         "iv_status": iv_context.get("status") if active else None,
         "iv_reason": iv_context.get("why") if active else None,
+        "checklist_failed_items": (
+            checklist.get("all_failed_items", checklist.get("failed_items", [])) if active else []
+        ),
+        "decision_blockers_priority": (
+            checklist.get("decision_blockers_priority", []) if active else []
+        ),
         "failed_reasons": failed_reasons if active else [],
     }
 
