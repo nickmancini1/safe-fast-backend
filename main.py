@@ -460,8 +460,8 @@ def _parse_month_day_year(raw: str, fallback_year: int) -> Optional[datetime.dat
     day_token = parts[1]
     if "-" in day_token:
         day_token = day_token.split("-")[0]
-    if "Ã¢ÂÂ" in day_token:
-        day_token = day_token.split("Ã¢ÂÂ")[0]
+    if "â" in day_token:
+        day_token = day_token.split("â")[0]
     day_token = re.sub(r"[^0-9]", "", day_token)
     if not day_token:
         return None
@@ -480,7 +480,7 @@ def _extract_dates_by_patterns(text: str, fallback_year: int) -> List[datetime.d
     pattern = re.compile(
         r"(January|February|March|April|May|June|July|August|September|October|November|December|"
         r"Jan\.?|Feb\.?|Mar\.?|Apr\.?|May|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)"
-        r"\s+\d{1,2}(?:\s*[-Ã¢ÂÂ]\s*\d{1,2})?(?:,\s*\d{4}|\s+\d{4})?",
+        r"\s+\d{1,2}(?:\s*[-â]\s*\d{1,2})?(?:,\s*\d{4}|\s+\d{4})?",
         re.IGNORECASE,
     )
     out: List[datetime.date] = []
@@ -4225,3 +4225,5 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
 
 
 @app.post("/safe-fast/on-demand")
+async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
+    return await _build_on_demand_payload(request)
