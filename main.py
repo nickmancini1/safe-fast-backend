@@ -2442,7 +2442,7 @@ def _build_user_facing_block(
     base_invalidation_text = (
         "No valid new entry from the current combined read."
         if no_candidate_mode and not (chart_check and chart_check.get("ok"))
-        else base_invalidation_text
+        else f"Exit on 1H close beyond the 50 EMA ({ema_text}) against the thesis."
     )
     trigger_state = trigger_state or {}
     primary_blocker_text = _priority_blocker_user_text(
