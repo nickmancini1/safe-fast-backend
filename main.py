@@ -3407,7 +3407,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "at_patch_candidate_context_availability_context_2026_04_05",
+        "build_tag": "au_patch_candidate_context_structure_filters_2026_04_05",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3447,6 +3447,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             market_context=market_context,
             time_day_gate=time_day_gate,
             macro_context=macro_context,
+            liquidity_context=liquidity_context,
+            iv_context=_build_iv_context(primary_candidate),
+            indicator_filter_context=indicator_filter_context,
+            chart_confirmation=chart_confirmation,
         ),
         "no_candidate_context": _build_no_candidate_context(
             summary_payload=summary_payload,
@@ -4023,6 +4027,10 @@ def _build_candidate_context(
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     macro_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+    indicator_filter_context: Dict[str, Any],
+    chart_confirmation: Dict[str, Any],
 ) -> Dict[str, Any]:
     active = bool(best_ticker and primary_candidate)
 
@@ -4042,6 +4050,29 @@ def _build_candidate_context(
         "macro_risk_level": macro_context.get("risk_level"),
         "major_event_today": macro_context.get("has_major_event_today"),
         "major_event_tomorrow": macro_context.get("has_major_event_tomorrow"),
+    }
+    confirmation_fields = chart_confirmation.get("fields", {}) if isinstance(chart_confirmation, dict) else {}
+    structure_block = {
+        "market_session": market_context.get("session"),
+        "latest_close": (chart_check or {}).get("latest_close"),
+        "ema50_1h": (chart_check or {}).get("ema50_1h"),
+        "price_vs_ema50_1h": (chart_check or {}).get("price_vs_ema50_1h"),
+        "twentyfour_hour_trend": (confirmation_fields.get("twentyfour_hour_trend", {}) or {}).get("value"),
+        "first_wall": structure_context.get("first_wall") or (confirmation_fields.get("first_wall", {}) or {}).get("value"),
+        "next_pocket": structure_context.get("next_pocket") or (confirmation_fields.get("next_pocket", {}) or {}).get("value"),
+        "room_ratio": structure_context.get("room_ratio") or (confirmation_fields.get("room_ratio", {}) or {}).get("value"),
+        "wall_thesis": structure_context.get("wall_thesis") or (confirmation_fields.get("wall_thesis", {}) or {}).get("value"),
+        "structure_ok": structure_context.get("ok"),
+    }
+    filters_block = {
+        "liquidity_status": liquidity_context.get("status"),
+        "liquidity_reason": liquidity_context.get("why"),
+        "iv_status": iv_context.get("status"),
+        "iv_reason": iv_context.get("why"),
+        "extension_state": indicator_filter_context.get("extension_state"),
+        "pct_from_ema": indicator_filter_context.get("pct_from_ema"),
+        "caution": indicator_filter_context.get("caution"),
+        "caution_flags": indicator_filter_context.get("caution_flags", []),
     }
 
     if active:
@@ -4125,6 +4156,8 @@ def _build_candidate_context(
             checklist.get("decision_blockers_priority", []) if active else []
         ),
         "entry_zone_status": (primary_entry_zone.get("status") if primary_entry_zone else "unconfirmed") if active else None,
+        "structure": structure_block,
+        "filters": filters_block,
         "execution": execution_block,
         "note": (
             "Entry zones and trigger candle mapping now use backend proxy values from EMA/trigger and recent candles; confirm against uploaded charts before entry."
