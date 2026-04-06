@@ -3407,7 +3407,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "ar_patch_candidate_context_entry_zones_2026_04_05",
+        "build_tag": "as_patch_candidate_context_execution_context_2026_04_05",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3437,6 +3437,16 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             user_facing=user_facing_block,
             targets=_build_targets_block(primary_candidate),
             invalidation_level_1h_ema50=_build_invalidation_level(chart_check),
+            two_path=_build_two_path_block(
+                market_context=market_context,
+                time_day_gate=time_day_gate,
+                structure_context=structure_context,
+                checklist=checklist_block,
+                chart_check=chart_check,
+            ),
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+            macro_context=macro_context,
         ),
         "no_candidate_context": _build_no_candidate_context(
             summary_payload=summary_payload,
@@ -4009,6 +4019,10 @@ def _build_candidate_context(
     user_facing: Dict[str, Any],
     targets: Dict[str, Any],
     invalidation_level_1h_ema50: Optional[float],
+    two_path: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    macro_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     active = bool(best_ticker and primary_candidate)
 
@@ -4018,6 +4032,17 @@ def _build_candidate_context(
     primary_entry_zone = None
     backup_entry_zone = None
     trigger_candle_window = None
+    execution_block = {
+        "ideal_path": two_path.get("ideal_path"),
+        "acceptable_path": two_path.get("acceptable_path"),
+        "invalidation_1h_ema50": two_path.get("invalidation_1h_ema50"),
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "time_day_gate_reason": time_day_gate.get("reason"),
+        "macro_risk_level": macro_context.get("risk_level"),
+        "major_event_today": macro_context.get("has_major_event_today"),
+        "major_event_tomorrow": macro_context.get("has_major_event_tomorrow"),
+    }
 
     if active:
         options_block = {
@@ -4082,6 +4107,7 @@ def _build_candidate_context(
             checklist.get("decision_blockers_priority", []) if active else []
         ),
         "entry_zone_status": (primary_entry_zone.get("status") if primary_entry_zone else "unconfirmed") if active else None,
+        "execution": execution_block,
         "note": (
             "Entry zones and trigger candle mapping now use backend proxy values from EMA/trigger and recent candles; confirm against uploaded charts before entry."
             if active else None
