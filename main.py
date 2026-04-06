@@ -3407,7 +3407,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "aq_patch_candidate_context_actionable_fields_2026_04_05",
+        "build_tag": "ar_patch_candidate_context_entry_zones_2026_04_05",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3931,6 +3931,71 @@ def _build_invalidation_level(chart_check: Optional[Dict[str, Any]]) -> Optional
         return None
 
 
+def _build_entry_zone_proxy(
+    chart_check: Optional[Dict[str, Any]],
+    trigger_state: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not chart_check:
+        return None
+    ema = chart_check.get("ema50_1h")
+    trigger = trigger_state.get("trigger_level")
+    if ema is None and trigger is None:
+        return None
+    values = [v for v in [ema, trigger] if isinstance(v, (int, float))]
+    if not values:
+        return None
+    low = min(values)
+    high = max(values)
+    return {
+        "low": round(low, 4),
+        "high": round(high, 4),
+        "basis": "ema50_to_trigger_proxy",
+        "status": "proxy",
+    }
+
+
+def _build_backup_entry_zone_proxy(
+    chart_check: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not chart_check:
+        return None
+    recent = chart_check.get("recent_candles") or []
+    lows = [c.get("low") for c in recent[-3:] if isinstance(c.get("low"), (int, float))]
+    highs = [c.get("high") for c in recent[-3:] if isinstance(c.get("high"), (int, float))]
+    if not lows and not highs:
+        return None
+    low = min(lows) if lows else None
+    high = max(highs) if highs else None
+    if low is None or high is None:
+        return None
+    return {
+        "low": round(low, 4),
+        "high": round(high, 4),
+        "basis": "recent_3_candle_proxy",
+        "status": "proxy",
+    }
+
+
+def _build_trigger_candle_window(chart_check: Optional[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    if not chart_check:
+        return None
+    recent = chart_check.get("recent_candles") or []
+    if not recent:
+        return None
+    window = recent[-3:]
+    out: List[Dict[str, Any]] = []
+    for candle in window:
+        out.append(
+            {
+                "open": _round_or_none(candle.get("open"), 4),
+                "high": _round_or_none(candle.get("high"), 4),
+                "low": _round_or_none(candle.get("low"), 4),
+                "close": _round_or_none(candle.get("close"), 4),
+                "time": candle.get("time") or candle.get("datetime") or candle.get("timestamp"),
+            }
+        )
+    return out
+
 
 def _build_candidate_context(
     best_ticker: Optional[str],
@@ -3950,6 +4015,9 @@ def _build_candidate_context(
     options_block = None
     levels_block = None
     targets_block = None
+    primary_entry_zone = None
+    backup_entry_zone = None
+    trigger_candle_window = None
 
     if active:
         options_block = {
@@ -3981,6 +4049,9 @@ def _build_candidate_context(
             "target_60_pct_value": targets.get("target_60_pct_value"),
             "target_70_pct_value": targets.get("target_70_pct_value"),
         }
+        primary_entry_zone = _build_entry_zone_proxy(chart_check, trigger_state)
+        backup_entry_zone = _build_backup_entry_zone_proxy(chart_check)
+        trigger_candle_window = _build_trigger_candle_window(chart_check)
 
     return {
         "active": active,
@@ -3999,15 +4070,20 @@ def _build_candidate_context(
         "targets": targets_block,
         "primary_candidate": primary_candidate if active else None,
         "backup_candidate": backup_candidate if active else None,
+        "primary_entry_zone": primary_entry_zone,
+        "backup_entry_zone": backup_entry_zone,
+        "invalidation": invalidation_level_1h_ema50 if active else None,
+        "action_if_hit": user_facing.get("action") if active else None,
+        "trigger_candle_window": trigger_candle_window,
         "checklist_failed_items": (
             checklist.get("all_failed_items", checklist.get("failed_items", [])) if active else []
         ),
         "decision_blockers_priority": (
             checklist.get("decision_blockers_priority", []) if active else []
         ),
-        "entry_zone_status": "unconfirmed" if active else None,
+        "entry_zone_status": (primary_entry_zone.get("status") if primary_entry_zone else "unconfirmed") if active else None,
         "note": (
-            "Entry zones and trigger candle mapping are still unconfirmed in this build; use options, levels, targets, trigger_state, and structure_context for live decision support."
+            "Entry zones and trigger candle mapping now use backend proxy values from EMA/trigger and recent candles; confirm against uploaded charts before entry."
             if active else None
         ),
     }
@@ -4149,5 +4225,3 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
 
 
 @app.post("/safe-fast/on-demand")
-async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
-    return await _build_on_demand_payload(request)
