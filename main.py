@@ -3919,6 +3919,19 @@ def _build_simple_output_block(
 
 
 
+
+
+def _build_invalidation_level(chart_check: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not chart_check:
+        return None
+    value = chart_check.get("ema50_1h")
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+
 def _build_candidate_context(
     best_ticker: Optional[str],
     selected_summary: Optional[Dict[str, Any]],
