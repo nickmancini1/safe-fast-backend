@@ -24,7 +24,7 @@ def _build_user_facing_block(
         if best_ticker and chart_check and chart_check.get("ok")
         else "No valid new entry from the current combined read."
     )
-
+    
     if no_candidate_mode and not (chart_check and chart_check.get("ok")):
         base_invalidation_text = "No valid new entry from the current combined read."
 
