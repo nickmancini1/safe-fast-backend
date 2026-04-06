@@ -3407,7 +3407,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "as_patch_candidate_context_execution_context_2026_04_05",
+        "build_tag": "at_patch_candidate_context_availability_context_2026_04_05",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4078,9 +4078,27 @@ def _build_candidate_context(
         backup_entry_zone = _build_backup_entry_zone_proxy(chart_check)
         trigger_candle_window = _build_trigger_candle_window(chart_check)
 
+    availability_reason = (
+        (selected_summary or {}).get("reason")
+        or structure_context.get("why")
+        or trigger_state.get("why")
+        or ("Candidate present." if active else "No feasible candidates found for the current filters.")
+    )
+    selection_mode = (selected_summary or {}).get("selection_mode")
+    chart_check_status = (chart_check or {}).get("status")
+    structure_status = structure_context.get("why") if not structure_context.get("ok", True) else "confirmed_or_available"
+    trigger_status = trigger_state.get("entry_state")
+    room_note = structure_context.get("room_note") if active else None
+
     return {
         "active": active,
         "ticker": best_ticker,
+        "availability_reason": availability_reason,
+        "selection_mode": selection_mode,
+        "chart_check_status": chart_check_status,
+        "structure_status": structure_status,
+        "trigger_status": trigger_status,
+        "room_note": room_note,
         "good_idea_now": user_facing.get("good_idea_now") if active else "NO",
         "action": user_facing.get("action") if active else "stand down",
         "setup_state": user_facing.get("setup_state") if active else "NO TRADE",
