@@ -3403,6 +3403,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         checklist=checklist_block,
         trigger_state=trigger_state,
     )
+    indicator_filter_context = _build_indicator_filter_context(
+        indicator_context=indicator_context,
+        structure_context=structure_context,
+    )
 
     return {
         "ok": True,
