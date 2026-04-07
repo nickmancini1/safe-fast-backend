@@ -1,3 +1,4 @@
+
 import asyncio
 
 import os
@@ -303,8 +304,8 @@ def _parse_month_day_year(raw: str, fallback_year: int) -> Optional[datetime.dat
     day_token = parts[1]
     if "-" in day_token:
         day_token = day_token.split("-")[0]
-    if "Ã¢Â€Â“" in day_token:
-        day_token = day_token.split("Ã¢Â€Â“")[0]
+    if "ÃƒÂ¢Ã‚â‚¬Ã‚â€œ" in day_token:
+        day_token = day_token.split("ÃƒÂ¢Ã‚â‚¬Ã‚â€œ")[0]
     day_token = re.sub(r"[^0-9]", "", day_token)
     if not day_token:
         return None
@@ -323,7 +324,7 @@ def _extract_dates_by_patterns(text: str, fallback_year: int) -> List[datetime.d
     pattern = re.compile(
         r"(January|February|March|April|May|June|July|August|September|October|November|December|"
         r"Jan\.?|Feb\.?|Mar\.?|Apr\.?|May|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)"
-        r"\s+\d{1,2}(?:\s*[-Ã¢Â€Â“]\s*\d{1,2})?(?:,\s*\d{4}|\s+\d{4})?",
+        r"\s+\d{1,2}(?:\s*[-ÃƒÂ¢Ã‚â‚¬Ã‚â€œ]\s*\d{1,2})?(?:,\s*\d{4}|\s+\d{4})?",
         re.IGNORECASE,
     )
     out: List[datetime.date] = []
@@ -1026,6 +1027,50 @@ def _calc_ema(values: List[float], length: int) -> Optional[float]:
         ema = ((value - ema) * multiplier) + ema
     return round(ema, 4)
 
+
+
+
+def _calc_atr(candles: List[Dict[str, Any]], length: int = 14) -> Optional[float]:
+    if not candles or length <= 0:
+        return None
+
+    valid: List[Dict[str, float]] = []
+    for candle in candles:
+        high = _to_float(candle.get("high"))
+        low = _to_float(candle.get("low"))
+        close = _to_float(candle.get("close"))
+        if high is None or low is None or close is None:
+            continue
+        valid.append({"high": high, "low": low, "close": close})
+
+    if len(valid) < 2:
+        return None
+
+    true_ranges: List[float] = []
+    prev_close = valid[0]["close"]
+
+    for candle in valid[1:]:
+        high = candle["high"]
+        low = candle["low"]
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        true_ranges.append(tr)
+        prev_close = candle["close"]
+
+    if not true_ranges:
+        return None
+
+    if len(true_ranges) < length:
+        return round(sum(true_ranges) / len(true_ranges), 4)
+
+    atr = sum(true_ranges[:length]) / length
+    for tr in true_ranges[length:]:
+        atr = ((atr * (length - 1)) + tr) / length
+
+    return round(atr, 4)
 
 def _candles_by_day_et(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
@@ -2599,5 +2644,7 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
 
 
 @app.post("/safe-fast/on-demand")
+
+
 async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
     return await _build_on_demand_payload(request)
