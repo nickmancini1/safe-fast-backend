@@ -187,146 +187,6 @@ def _build_iv_context() -> Dict[str, Any]:
     }
 
 
-def _calc_atr(candles: List[Dict[str, Any]], length: int = 14) -> Optional[float]:
-    if not candles or len(candles) < 2:
-        return None
-
-    true_ranges: List[float] = []
-    prev_close: Optional[float] = None
-    for candle in candles:
-        high = _to_float(candle.get("high"))
-        low = _to_float(candle.get("low"))
-        close = _to_float(candle.get("close"))
-        if high is None or low is None or close is None:
-            continue
-        if prev_close is None:
-            tr = high - low
-        else:
-            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        true_ranges.append(tr)
-        prev_close = close
-
-    if len(true_ranges) < length:
-        return None
-    return round(sum(true_ranges[-length:]) / length, 4)
-
-
-def _build_indicator_context(
-    best_ticker: Optional[str],
-    chart_check: Optional[Dict[str, Any]],
-    structure_context: Dict[str, Any],
-) -> Dict[str, Any]:
-    candles = chart_check.get("_all_candles", []) if chart_check else []
-    latest_close = _to_float(chart_check.get("latest_close")) if chart_check else None
-    atr14 = _calc_atr(candles, 14)
-    atr_pct = None
-    if atr14 is not None and latest_close not in (None, 0):
-        atr_pct = round((atr14 / latest_close) * 100, 3)
-
-    return {
-        "ok": True,
-        "design_goal": "background_only_supporting_indicators",
-        "note": "Indicators are supporting context only and do not override core SAFE-FAST structure rules.",
-        "ticker": best_ticker,
-        "atr": {
-            "status": "confirmed" if atr14 is not None else "unconfirmed",
-            "length": 14,
-            "atr_14_1h": atr14,
-            "atr_percent_of_price": atr_pct,
-        },
-        "ema_extension": {
-            "status": "confirmed" if structure_context.get("pct_from_ema") is not None else "unconfirmed",
-            "pct_from_ema": structure_context.get("pct_from_ema"),
-            "universal_extension_caution_pct": structure_context.get("universal_extension_caution_pct"),
-            "extension_caution_0_40_pct": structure_context.get("extension_caution_0_40_pct"),
-            "extension_state": structure_context.get("extension_state"),
-        },
-        "vwap": {
-            "status": "unconfirmed",
-            "why": "Current recovery build does not compute VWAP yet.",
-        },
-        "tick": {
-            "status": "unconfirmed",
-            "why": "TICK feed is not wired into this build yet.",
-        },
-        "vix": {
-            "status": "unconfirmed",
-            "why": "VIX feed is not wired into this build yet.",
-        },
-        "advance_decline": {
-            "status": "unconfirmed",
-            "why": "Advance/Decline breadth feed is not wired into this build yet.",
-        },
-    }
-
-
-def _build_indicator_filter_context(
-    indicator_context: Dict[str, Any],
-    structure_context: Dict[str, Any],
-) -> Dict[str, Any]:
-    atr_pct = _to_float(indicator_context.get("atr", {}).get("atr_percent_of_price"))
-    caution_flags: List[str] = []
-    if structure_context.get("extension_state") == "extended":
-        caution_flags.append("structure_extended")
-    if structure_context.get("extension_caution_0_40_pct") is True:
-        caution_flags.append("ema_extension_caution")
-    if atr_pct is not None and atr_pct >= 0.8:
-        caution_flags.append("atr_expanded")
-
-    return {
-        "ok": True,
-        "design_goal": "background_only_filtering",
-        "note": "Confirmed indicators may warn or filter in the background, but do not change the simple output format.",
-        "confirmed_inputs": [
-            name
-            for name, status in [
-                ("atr", indicator_context.get("atr", {}).get("status")),
-            ]
-            if status == "confirmed"
-        ],
-        "caution": bool(caution_flags),
-        "caution_flags": caution_flags,
-        "summary": "caution" if caution_flags else "neutral",
-        "blocks_trade_directly": False,
-    }
-
-
-def _build_volume_diagnostics_context(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
-    volume_fields = ["volume", "dayVolume", "totalVolume", "vol"]
-    if not candles:
-        return {
-            "ok": False,
-            "status": "no_candles",
-            "fields_checked": volume_fields,
-            "candle_count": 0,
-            "volume_field_counts": {field: 0 for field in volume_fields},
-            "usable_volume_fields": [],
-            "sample_preview": [],
-            "why": "No candle data is available for volume diagnostics.",
-        }
-
-    counts = {field: 0 for field in volume_fields}
-    preview = []
-    for candle in candles[:3]:
-        preview.append({field: candle.get(field) for field in volume_fields})
-    for candle in candles:
-        for field in volume_fields:
-            value = _to_float(candle.get(field))
-            if value is not None and value > 0:
-                counts[field] += 1
-    usable_fields = [field for field, count in counts.items() if count > 0]
-    return {
-        "ok": True,
-        "status": "usable_volume_found" if usable_fields else "no_usable_volume",
-        "fields_checked": volume_fields,
-        "candle_count": len(candles),
-        "volume_field_counts": counts,
-        "usable_volume_fields": usable_fields,
-        "sample_preview": preview,
-        "why": None if usable_fields else "No checked candle volume field contained usable positive values.",
-    }
-
-
 def _market_context_now() -> Dict[str, Any]:
     now_et = datetime.now(NY_TZ)
     is_weekday = now_et.weekday() < 5
@@ -2438,19 +2298,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     if chart_check_block.get("_all_candles") is not None:
         chart_check_block = {k: v for k, v in chart_check_block.items() if k != "_all_candles"}
 
-    indicator_context = _build_indicator_context(
-        best_ticker=best_ticker,
-        chart_check=chart_check,
-        structure_context=structure_context,
-    )
-    indicator_filter_context = _build_indicator_filter_context(
-        indicator_context=indicator_context,
-        structure_context=structure_context,
-    )
-    volume_diagnostics_context = _build_volume_diagnostics_context(
-        chart_check.get("_all_candles", []) if chart_check else []
-    )
-
     user_facing_block = _build_user_facing_block(
         request=request,
         engine_status=engine_status,
@@ -2476,7 +2323,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_indicator_and_volume_context_2026_04_06",
+        "build_tag": "schema_patch_simple_output_and_screened_context_2026_04_06",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -2495,9 +2342,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         ),
         "market_context": market_context,
         "macro_context": macro_context,
-        "indicator_context": indicator_context,
-        "indicator_filter_context": indicator_filter_context,
-        "volume_diagnostics_context": volume_diagnostics_context,
         "structure_context": structure_context,
         "time_day_gate": time_day_gate,
         "iv_context": _build_iv_context(),
