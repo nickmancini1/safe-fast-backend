@@ -1769,10 +1769,29 @@ def _build_checklist_block(
 
     failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
 
+    priority_order = [
+        "allowed_setup_type",
+        "twentyfour_hour_supportive",
+        "one_hour_clean_around_ema",
+        "clear_room",
+        "early_enough",
+        "clear_trigger",
+        "liquidity_ok",
+        "invalidation_clear",
+        "fits_risk",
+        "open_trade_already",
+    ]
+    priority_rank = {name: idx for idx, name in enumerate(priority_order)}
+    decision_blockers_priority = sorted(
+        failed_items,
+        key=lambda item: (priority_rank.get(item, 999), item),
+    )
+
     return {
         "ok": True,
         "items": items,
         "failed_items": failed_items,
+        "decision_blockers_priority": decision_blockers_priority,
     }
 
 
@@ -1976,6 +1995,103 @@ async def _screen_ticker_candidate(
     }
 
 
+def _build_candidate_context(
+    best_ticker: Optional[str],
+    selected_summary: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+    backup_candidate: Optional[Dict[str, Any]],
+    chart_check: Optional[Dict[str, Any]],
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    checklist: Dict[str, Any],
+    user_facing: Dict[str, Any],
+    targets: Dict[str, Any],
+    invalidation_level_1h_ema50: Optional[float],
+    two_path: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    macro_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    active = bool(best_ticker and primary_candidate)
+
+    options_block = None
+    levels_block = None
+    targets_block = None
+
+    if active:
+        options_block = {
+            "expiration_date": selected_summary.get("expiration_date") if selected_summary else None,
+            "days_to_expiration": selected_summary.get("days_to_expiration") if selected_summary else None,
+            "underlying_price": selected_summary.get("underlying_price") if selected_summary else None,
+            "long_strike": primary_candidate.get("long_strike"),
+            "short_strike": primary_candidate.get("short_strike"),
+            "width": primary_candidate.get("width"),
+            "est_debit": primary_candidate.get("est_debit"),
+            "max_loss_dollars_1lot": primary_candidate.get("max_loss_dollars_1lot"),
+            "max_profit_dollars_1lot": primary_candidate.get("max_profit_dollars_1lot"),
+        }
+        levels_block = {
+            "latest_close": chart_check.get("latest_close") if chart_check else None,
+            "ema50_1h": chart_check.get("ema50_1h") if chart_check else None,
+            "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h") if chart_check else None,
+            "first_wall": structure_context.get("first_wall"),
+            "next_pocket": structure_context.get("next_pocket"),
+            "room_to_first_wall": structure_context.get("room_to_first_wall"),
+            "room_ratio": structure_context.get("room_ratio"),
+            "wall_thesis": structure_context.get("wall_thesis"),
+            "invalidation_1h_ema50": invalidation_level_1h_ema50,
+        }
+        targets_block = {
+            "target_40_pct_value": targets.get("target_40_pct_value"),
+            "target_50_pct_value": targets.get("target_50_pct_value"),
+            "target_60_pct_value": targets.get("target_60_pct_value"),
+            "target_70_pct_value": targets.get("target_70_pct_value"),
+        }
+
+    availability_reason = (
+        (selected_summary or {}).get("reason")
+        or structure_context.get("why")
+        or trigger_state.get("why")
+        or ("Candidate present." if active else "No feasible candidates found for the current filters.")
+    )
+
+    return {
+        "active": active,
+        "ticker": best_ticker,
+        "availability_reason": availability_reason,
+        "good_idea_now": user_facing.get("good_idea_now") if active else "NO",
+        "action": user_facing.get("action") if active else "stand down",
+        "setup_state": user_facing.get("setup_state") if active else "NO TRADE",
+        "setup_type": structure_context.get("setup_type") if active else None,
+        "trend_label": structure_context.get("trend_label") if active else None,
+        "trigger_state": trigger_state.get("why") if active else None,
+        "trigger_style": trigger_state.get("trigger_style") if active else None,
+        "trigger_level": trigger_state.get("trigger_level") if active else None,
+        "options": options_block,
+        "levels": levels_block,
+        "targets": targets_block,
+        "primary_candidate": primary_candidate if active else None,
+        "backup_candidate": backup_candidate if active else None,
+        "invalidation": invalidation_level_1h_ema50 if active else None,
+        "checklist_failed_items": checklist.get("failed_items", []) if active else [],
+        "decision_blockers_priority": checklist.get("decision_blockers_priority", []) if active else [],
+        "execution": {
+            "ideal_path": two_path.get("ideal_path"),
+            "acceptable_path": two_path.get("acceptable_path"),
+            "invalidation_1h_ema50": two_path.get("invalidation_1h_ema50"),
+            "market_open": market_context.get("is_open"),
+            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+            "macro_risk_level": macro_context.get("risk_level"),
+            "major_event_today": macro_context.get("has_major_event_today"),
+            "major_event_tomorrow": macro_context.get("has_major_event_tomorrow"),
+        },
+        "note": (
+            "Candidate context restored in a compact form. Use it as the structured handoff block for the current best ticker."
+            if active else None
+        ),
+    }
+
+
 def _build_two_path_block(
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
@@ -2136,10 +2252,32 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     if chart_check_block.get("_all_candles") is not None:
         chart_check_block = {k: v for k, v in chart_check_block.items() if k != "_all_candles"}
 
+    user_facing_block = _build_user_facing_block(
+        request=request,
+        engine_status=engine_status,
+        final_verdict=final_verdict,
+        best_ticker=best_ticker,
+        chart_check=chart_check,
+        chart_check_error=chart_check_error,
+        engine_reason=selected_reason,
+        market_context=market_context,
+        macro_context=macro_context,
+        structure_context=structure_context,
+        time_day_gate=time_day_gate,
+        liquidity_context=liquidity_context,
+    )
+    two_path_block = _build_two_path_block(
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+        checklist=checklist_block,
+        chart_check=chart_check,
+    )
+
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "recovery_patch_two_path_and_caution_2026_04_06",
+        "build_tag": "schema_patch_candidate_context_and_blockers_2026_04_06",
         "source_of_truth": "candidate_engine",
         "engine_status": engine_status,
         "final_verdict": final_verdict,
@@ -2173,27 +2311,25 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             chart_check_error=chart_check_error,
             structure_context=structure_context,
         ),
-        "user_facing": _build_user_facing_block(
-            request=request,
-            engine_status=engine_status,
-            final_verdict=final_verdict,
+        "user_facing": user_facing_block,
+        "candidate_context": _build_candidate_context(
             best_ticker=best_ticker,
+            selected_summary=selected.get("summary") if selected else None,
+            primary_candidate=primary_candidate,
+            backup_candidate=selected.get("backup_candidate") if selected else summary_payload.get("backup_candidate"),
             chart_check=chart_check,
-            chart_check_error=chart_check_error,
-            engine_reason=selected_reason,
-            market_context=market_context,
-            macro_context=macro_context,
             structure_context=structure_context,
-            time_day_gate=time_day_gate,
-            liquidity_context=liquidity_context,
-        ),
-        "two_path": _build_two_path_block(
-            market_context=market_context,
-            time_day_gate=time_day_gate,
-            structure_context=structure_context,
+            trigger_state=trigger_state,
             checklist=checklist_block,
-            chart_check=chart_check,
+            user_facing=user_facing_block,
+            targets=_build_targets_block(primary_candidate),
+            invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
+            two_path=two_path_block,
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+            macro_context=macro_context,
         ),
+        "two_path": two_path_block,
     }
 
 
