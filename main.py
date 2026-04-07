@@ -1537,13 +1537,24 @@ def _build_chart_confirmation_block(
 ) -> Dict[str, Any]:
     one_hour_confirmed = bool(chart_check and chart_check.get("ok"))
     structure_confirmed = bool(structure_context.get("ok"))
-    message = (
-        "Candidate engine result only - chart confirmation still required. Chart check failed in this run."
-        if chart_check_error
-        else "Candidate engine result only - chart confirmation still required."
+    chart_confirmation_confirmed = bool(
+        request.include_chart_checks
+        and not chart_check_error
+        and one_hour_confirmed
+        and structure_confirmed
     )
+
+    if not request.include_chart_checks:
+        message = "Chart checks were not requested in this run."
+    elif chart_check_error:
+        message = "Candidate engine result only - chart confirmation still required. Chart check failed in this run."
+    elif chart_confirmation_confirmed:
+        message = "Chart confirmation available in this run."
+    else:
+        message = "Candidate engine result only - chart confirmation still required."
+
     return {
-        "confirmed": False,
+        "confirmed": chart_confirmation_confirmed,
         "message": message,
         "fields": {
             "one_hour_50_ema": _status_field(chart_check.get("ema50_1h") if chart_check else None, one_hour_confirmed),
