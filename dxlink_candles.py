@@ -9,6 +9,24 @@ import httpx
 import websockets
 
 
+CANDLE_FIELDS = [
+    "eventSymbol",
+    "time",
+    "sequence",
+    "count",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "vwap",
+    "bidVolume",
+    "askVolume",
+    "impVolatility",
+    "openInterest",
+]
+
+
 def _iso_from_ms(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
 
@@ -81,36 +99,59 @@ def _parse_candle_feed_data(message: Dict[str, Any]) -> List[Dict[str, Any]]:
     if event_type != "Candle" or not isinstance(values, list):
         return []
 
+    field_count = len(CANDLE_FIELDS)
     candles: List[Dict[str, Any]] = []
-    fields_per_candle = 6  # eventSymbol, time, open, high, low, close
 
-    for i in range(0, len(values), fields_per_candle):
-        chunk = values[i:i + fields_per_candle]
-        if len(chunk) < fields_per_candle:
+    for i in range(0, len(values), field_count):
+        chunk = values[i:i + field_count]
+        if len(chunk) < field_count:
             break
 
-        event_symbol, ts, open_, high, low, close = chunk
+        row = dict(zip(CANDLE_FIELDS, chunk))
 
-        ts_int = int(ts)
-        open_f = _to_float(open_)
-        high_f = _to_float(high)
-        low_f = _to_float(low)
-        close_f = _to_float(close)
+        ts = row.get("time")
+        if ts is None:
+            continue
+
+        try:
+            ts_int = int(ts)
+        except Exception:
+            continue
+
+        open_f = _to_float(row.get("open"))
+        high_f = _to_float(row.get("high"))
+        low_f = _to_float(row.get("low"))
+        close_f = _to_float(row.get("close"))
 
         if None in (open_f, high_f, low_f, close_f):
             continue
 
-        candles.append(
-            {
-                "event_symbol": str(event_symbol),
-                "time": ts_int,
-                "time_iso": _iso_from_ms(ts_int),
-                "open": open_f,
-                "high": high_f,
-                "low": low_f,
-                "close": close_f,
-            }
-        )
+        volume_f = _to_float(row.get("volume"))
+        vwap_f = _to_float(row.get("vwap"))
+        bid_volume_f = _to_float(row.get("bidVolume"))
+        ask_volume_f = _to_float(row.get("askVolume"))
+        imp_vol_f = _to_float(row.get("impVolatility"))
+        open_interest_f = _to_float(row.get("openInterest"))
+
+        candle = {
+            "event_symbol": str(row.get("eventSymbol")),
+            "time": ts_int,
+            "time_iso": _iso_from_ms(ts_int),
+            "sequence": row.get("sequence"),
+            "count": row.get("count"),
+            "open": open_f,
+            "high": high_f,
+            "low": low_f,
+            "close": close_f,
+            "volume": volume_f,
+            "vol": volume_f,
+            "vwap": vwap_f,
+            "bidVolume": bid_volume_f,
+            "askVolume": ask_volume_f,
+            "impVolatility": imp_vol_f,
+            "openInterest": open_interest_f,
+        }
+        candles.append(candle)
 
     return candles
 
@@ -184,7 +225,7 @@ async def get_1h_ema50_snapshot(
                 "channel": 0,
                 "keepaliveTimeout": 60,
                 "acceptKeepaliveTimeout": 60,
-                "version": "safe-fast-python-dxlink/0.2",
+                "version": "safe-fast-python-dxlink/0.3",
             },
         )
 
@@ -227,14 +268,7 @@ async def get_1h_ema50_snapshot(
                 "acceptAggregationPeriod": 1,
                 "acceptDataFormat": "COMPACT",
                 "acceptEventFields": {
-                    "Candle": [
-                        "eventSymbol",
-                        "time",
-                        "open",
-                        "high",
-                        "low",
-                        "close",
-                    ]
+                    "Candle": CANDLE_FIELDS,
                 },
             },
         )
