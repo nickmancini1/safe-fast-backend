@@ -1146,6 +1146,7 @@ def _is_chop(candles: List[Dict[str, Any]]) -> bool:
     return overlap_hits >= 3
 
 
+
 def _extension_state(
     symbol: str,
     latest_close: float,
@@ -1156,27 +1157,25 @@ def _extension_state(
     threshold = 0.008 if symbol == "GLD" else 0.006
     room_distance = abs(first_wall - latest_close) if first_wall is not None else None
     move_ratio = (abs(latest_close - ema50_1h) / room_distance) if room_distance not in (None, 0) else None
-    is_extended = bool(
-        (pct_from_ema_ratio is not None and pct_from_ema_ratio > threshold) or
-        (move_ratio is not None and move_ratio > 0.5)
-    )
     pct_from_ema = round(pct_from_ema_ratio * 100, 3) if pct_from_ema_ratio is not None else None
     universal_caution_pct = 0.40
     extension_caution_0_40_pct = bool(pct_from_ema is not None and pct_from_ema >= universal_caution_pct)
 
     return {
-        "state": "extended" if is_extended else "acceptable",
+        "state": "caution" if extension_caution_0_40_pct else "acceptable",
         "pct_from_ema": pct_from_ema,
         "move_to_wall_ratio": round(move_ratio, 3) if move_ratio is not None else None,
         "threshold_pct": round(threshold * 100, 3),
-        "late_move": is_extended,
+        "late_move": False,
         "universal_extension_caution_pct": universal_caution_pct,
         "extension_caution_0_40_pct": extension_caution_0_40_pct,
         "extension_caution_note": "0.40% from the 1H EMA is a caution only, not a hard blocker.",
+        "baseline_extension_threshold_pct": round(threshold * 100, 3),
     }
 
 
 def _wall_thesis(
+
     option_type: str,
     primary_candidate: Optional[Dict[str, Any]],
     first_wall: Optional[float],
@@ -1268,6 +1267,7 @@ def _setup_classifier(
     return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None}
 
 
+
 def _build_structure_context(
     symbol: str,
     option_type: str,
@@ -1303,7 +1303,7 @@ def _build_structure_context(
         room_ratio = wall_levels["room_distance"] / invalidation_distance
 
     room_pass = (room_ratio is not None and room_ratio >= 2.0)
-    extension_ctx = _extension_state(symbol, latest_close, ema50_1h, wall_levels.get("first_wall"))
+    base_extension_ctx = _extension_state(symbol, latest_close, ema50_1h, wall_levels.get("first_wall"))
     wall_ctx = _wall_thesis(
         option_type=option_type,
         primary_candidate=primary_candidate,
@@ -1311,6 +1311,78 @@ def _build_structure_context(
         next_pocket=wall_levels.get("next_pocket"),
         invalidation_distance=invalidation_distance,
     )
+
+    atr14 = _calc_atr(candles, 14)
+    atr_multiple_from_ema = None
+    if atr14 not in (None, 0) and invalidation_distance is not None:
+        atr_multiple_from_ema = round(invalidation_distance / atr14, 3)
+
+    recent = candles[-4:] if len(candles) >= 4 else candles
+    parabolic_exhaustion = False
+    if len(recent) >= 3:
+        closes = [_to_float(c.get("close")) for c in recent[-3:]]
+        highs = [_to_float(c.get("high")) for c in recent[-3:]]
+        lows = [_to_float(c.get("low")) for c in recent[-3:]]
+        if all(v is not None for v in closes + highs + lows):
+            ranges = [max(h - l, 0.0001) for h, l in zip(highs, lows)]
+            directional = closes[0] < closes[1] < closes[2] if option_type == "C" else closes[0] > closes[1] > closes[2]
+            range_expanding = ranges[-1] > ranges[-2] > 0
+            close_near_extreme = ((highs[-1] - closes[-1]) / ranges[-1] <= 0.15) if option_type == "C" else ((closes[-1] - lows[-1]) / ranges[-1] <= 0.15)
+            parabolic_exhaustion = bool(directional and range_expanding and close_near_extreme)
+
+    volume_climax_exhaustion = False
+    volume_values = []
+    for candle in candles[-8:]:
+        vol = _to_float(candle.get("volume"))
+        if vol is None:
+            vol = _to_float(candle.get("vol"))
+        if vol is not None and vol > 0:
+            volume_values.append(vol)
+    if len(volume_values) >= 6:
+        baseline_vol = sum(volume_values[:-1]) / max(len(volume_values[:-1]), 1)
+        volume_climax_exhaustion = bool(baseline_vol > 0 and volume_values[-1] >= baseline_vol * 1.8 and parabolic_exhaustion)
+
+    degraded_entry_quality = bool(base_extension_ctx.get("move_to_wall_ratio") is not None and base_extension_ctx.get("move_to_wall_ratio") > 0.5)
+    early_trigger_window_passed = bool(base_extension_ctx.get("pct_from_ema") is not None and base_extension_ctx.get("pct_from_ema") > base_extension_ctx.get("baseline_extension_threshold_pct", 999))
+    cramped_room = room_pass is False
+
+    extension_confirmer_flags = []
+    if cramped_room:
+        extension_confirmer_flags.append("cramped_room")
+    if parabolic_exhaustion:
+        extension_confirmer_flags.append("parabolic_exhaustion")
+    if volume_climax_exhaustion:
+        extension_confirmer_flags.append("volume_climax_exhaustion")
+    if degraded_entry_quality:
+        extension_confirmer_flags.append("degraded_entry_quality")
+    if early_trigger_window_passed:
+        extension_confirmer_flags.append("early_trigger_window_passed")
+
+    extension_confirmer_count = len(extension_confirmer_flags)
+    extension_material = bool(
+        (atr_multiple_from_ema is not None and atr_multiple_from_ema >= 1.0)
+        or early_trigger_window_passed
+        or (base_extension_ctx.get("move_to_wall_ratio") is not None and base_extension_ctx.get("move_to_wall_ratio") > 0.5)
+    )
+    extension_blocks_now = bool(extension_material and extension_confirmer_count >= 1)
+
+    extension_ctx = {
+        **base_extension_ctx,
+        "state": "extended" if extension_blocks_now else ("caution" if base_extension_ctx.get("extension_caution_0_40_pct") else "acceptable"),
+        "late_move": extension_blocks_now,
+        "atr_14_1h": atr14,
+        "atr_multiple_from_ema": atr_multiple_from_ema,
+        "parabolic_exhaustion": parabolic_exhaustion,
+        "volume_climax_exhaustion": volume_climax_exhaustion,
+        "degraded_entry_quality": degraded_entry_quality,
+        "early_trigger_window_passed": early_trigger_window_passed,
+        "extension_confirmer_flags": extension_confirmer_flags,
+        "extension_confirmer_count": extension_confirmer_count,
+        "extension_material": extension_material,
+        "extension_soft_flag": bool(base_extension_ctx.get("extension_caution_0_40_pct")),
+        "extension_blocks_now": extension_blocks_now,
+    }
+
     setup_ctx = _setup_classifier(
         option_type=option_type,
         chart_check=chart_check,
@@ -1341,6 +1413,17 @@ def _build_structure_context(
         "universal_extension_caution_pct": extension_ctx.get("universal_extension_caution_pct"),
         "extension_caution_0_40_pct": extension_ctx.get("extension_caution_0_40_pct"),
         "extension_caution_note": extension_ctx.get("extension_caution_note"),
+        "atr_14_1h": extension_ctx.get("atr_14_1h"),
+        "atr_multiple_from_ema": extension_ctx.get("atr_multiple_from_ema"),
+        "parabolic_exhaustion": extension_ctx.get("parabolic_exhaustion"),
+        "volume_climax_exhaustion": extension_ctx.get("volume_climax_exhaustion"),
+        "degraded_entry_quality": extension_ctx.get("degraded_entry_quality"),
+        "early_trigger_window_passed": extension_ctx.get("early_trigger_window_passed"),
+        "extension_confirmer_flags": extension_ctx.get("extension_confirmer_flags"),
+        "extension_confirmer_count": extension_ctx.get("extension_confirmer_count"),
+        "extension_material": extension_ctx.get("extension_material"),
+        "extension_soft_flag": extension_ctx.get("extension_soft_flag"),
+        "extension_blocks_now": extension_ctx.get("extension_blocks_now"),
         "iv_state": "unconfirmed",
         "setup_type": setup_ctx.get("setup_type"),
         "trend_label": setup_ctx.get("trend_label"),
@@ -1350,6 +1433,7 @@ def _build_structure_context(
 
 
 def _status_field(value: Any, confirmed: bool) -> Dict[str, Any]:
+
     return {"status": "confirmed" if confirmed else "unconfirmed", "value": value}
 
 
@@ -1741,6 +1825,7 @@ def _build_targets_block(primary_candidate: Optional[Dict[str, Any]]) -> Dict[st
     }
 
 
+
 def _build_checklist_block(
     request: OnDemandRequest,
     market_context: Dict[str, Any],
@@ -1768,7 +1853,6 @@ def _build_checklist_block(
     ]
 
     failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
-
     priority_order = [
         "allowed_setup_type",
         "twentyfour_hour_supportive",
@@ -1782,10 +1866,7 @@ def _build_checklist_block(
         "open_trade_already",
     ]
     priority_rank = {name: idx for idx, name in enumerate(priority_order)}
-    decision_blockers_priority = sorted(
-        failed_items,
-        key=lambda item: (priority_rank.get(item, 999), item),
-    )
+    decision_blockers_priority = sorted(failed_items, key=lambda item: (priority_rank.get(item, 999), item))
 
     return {
         "ok": True,
@@ -1796,6 +1877,7 @@ def _build_checklist_block(
 
 
 def _failed_reason_messages(
+
     checklist: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     market_context: Dict[str, Any],
@@ -2207,7 +2289,67 @@ def _build_two_path_block(
     }
 
 
+def _build_python_validation(
+    request: OnDemandRequest,
+    best_ticker: Optional[str],
+    primary_candidate: Optional[Dict[str, Any]],
+    targets: Dict[str, Any],
+    invalidation_level_1h_ema50: Optional[float],
+) -> Dict[str, Any]:
+    max_loss = _to_float((primary_candidate or {}).get("max_loss_dollars_1lot"))
+    return {
+        "ok": True,
+        "ticker": best_ticker,
+        "ticker_allowed": best_ticker in ALLOWED_SYMBOLS if best_ticker else False,
+        "risk_preferred_band_ok": bool(max_loss is not None and request.risk_min_dollars <= max_loss <= request.risk_max_dollars),
+        "risk_hard_max_ok": bool(max_loss is not None and max_loss <= request.hard_max_dollars),
+        "open_positions_ok_for_new_trade": request.open_positions == 0,
+        "max_one_open_position_rule": request.open_positions <= 1,
+        "max_loss_dollars_1lot": max_loss,
+        "targets_confirmed": bool(targets.get("ok")),
+        "target_40_pct_value": targets.get("target_40_pct_value"),
+        "target_50_pct_value": targets.get("target_50_pct_value"),
+        "target_60_pct_value": targets.get("target_60_pct_value"),
+        "target_70_pct_value": targets.get("target_70_pct_value"),
+        "exit_price_1h_ema50": invalidation_level_1h_ema50,
+    }
+
+
+def _build_ten_second_checklist(
+    request: OnDemandRequest,
+    checklist_block: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    item_map = {row.get("item"): bool(row.get("yes")) for row in checklist_block.get("items", [])}
+    questions = [
+        ("allowed_setup_type", "Is this one of the 3 allowed setup types?", item_map.get("allowed_setup_type")),
+        ("twentyfour_hour_supportive", "Is 24H trend/context supportive?", item_map.get("twentyfour_hour_supportive")),
+        ("one_hour_clean_around_ema", "Is 1H structure clean around 50 EMA?", item_map.get("one_hour_clean_around_ema")),
+        ("clear_room", "Do we have clear room to next level?", item_map.get("clear_room")),
+        ("early_enough", "Are we early enough, not overextended?", item_map.get("early_enough") and structure_context.get("extension_blocks_now") is not True),
+        ("iv_acceptable", "Is IV acceptable for a debit spread?", None if iv_context.get("status") == "unconfirmed" else bool(iv_context.get("ok"))),
+        ("clear_trigger", "Is there a clear entry trigger?", item_map.get("clear_trigger")),
+        ("invalidation_clear", "Is invalidation clear: 1H close beyond 50 EMA?", item_map.get("invalidation_clear")),
+        ("fits_risk", "Does this fit risk budget?", item_map.get("fits_risk")),
+        ("open_trade_already", "Do we already have an open trade?", request.open_positions > 0),
+    ]
+    return {
+        "ok": True,
+        "answers": [
+            {
+                "item": item,
+                "question": question,
+                "answer": "YES" if value is True else "NO" if value is False else "UNCONFIRMED",
+            }
+            for item, question, value in questions
+        ],
+        "failed_items": checklist_block.get("failed_items", []),
+    }
+
+
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
+
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
     time_day_gate = _time_day_gate(market_context)
@@ -2319,11 +2461,26 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         checklist=checklist_block,
         chart_check=chart_check,
     )
+    targets_block = _build_targets_block(primary_candidate)
+    iv_context = _build_iv_context()
+    python_validation_block = _build_python_validation(
+        request=request,
+        best_ticker=best_ticker,
+        primary_candidate=primary_candidate,
+        targets=targets_block,
+        invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
+    )
+    ten_second_checklist_block = _build_ten_second_checklist(
+        request=request,
+        checklist_block=checklist_block,
+        structure_context=structure_context,
+        iv_context=iv_context,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_simple_output_and_screened_context_2026_04_06",
+        "build_tag": "schema_patch_soft_extension_and_audit_blocks_2026_04_06",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -2344,10 +2501,12 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "macro_context": macro_context,
         "structure_context": structure_context,
         "time_day_gate": time_day_gate,
-        "iv_context": _build_iv_context(),
+        "iv_context": iv_context,
+        "python_validation": python_validation_block,
+        "ten_second_checklist": ten_second_checklist_block,
         "liquidity_context": liquidity_context,
         "trigger_state": trigger_state,
-        "targets": _build_targets_block(primary_candidate),
+        "targets": targets_block,
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
         "checklist": checklist_block,
         "failed_reasons": _failed_reason_messages(
@@ -2379,7 +2538,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             trigger_state=trigger_state,
             checklist=checklist_block,
             user_facing=user_facing_block,
-            targets=_build_targets_block(primary_candidate),
+            targets=targets_block,
             invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
             two_path=two_path_block,
             market_context=market_context,
