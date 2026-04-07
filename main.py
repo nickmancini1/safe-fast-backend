@@ -1899,6 +1899,52 @@ def _screened_other_candidates(screened: List[Dict[str, Any]], best_ticker: Opti
         )
     return out
 
+def _build_simple_output_block(
+    user_facing: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    signal_present = bool(trigger_state.get("trigger_present") is True)
+    return {
+        "design_goal": "complex_inputs_simple_outputs",
+        "good_idea_now": user_facing.get("good_idea_now"),
+        "ticker": user_facing.get("ticker"),
+        "action": user_facing.get("action"),
+        "invalidation": user_facing.get("invalidation"),
+        "setup_state": user_facing.get("setup_state"),
+        "why": user_facing.get("why"),
+        "signal_present": signal_present,
+    }
+
+
+def _build_screened_best_context(
+    selected: Optional[Dict[str, Any]],
+    engine_best_ticker: Optional[str],
+    screened_candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not selected:
+        return {"ok": False, "why": "no screened candidates"}
+
+    engine_pick = next(
+        (item for item in screened_candidates if item.get("symbol") == engine_best_ticker),
+        None,
+    )
+
+    selected_checklist = selected.get("checklist") or {}
+    engine_pick_reason = engine_pick.get("reason") if engine_pick else None
+    engine_pick_verdict = engine_pick.get("final_verdict") if engine_pick else None
+
+    return {
+        "ok": True,
+        "screened_best_ticker": selected.get("symbol"),
+        "engine_best_ticker": engine_best_ticker,
+        "changed_from_engine_best": selected.get("symbol") != engine_best_ticker,
+        "screened_final_verdict": selected.get("final_verdict"),
+        "screened_reason": selected.get("reason"),
+        "screened_checklist_failed_items": selected_checklist.get("failed_items", []),
+        "engine_best_final_verdict_after_screen": engine_pick_verdict,
+        "engine_best_reason_after_screen": engine_pick_reason,
+    }
+
 
 async def _screen_ticker_candidate(
     summary: Dict[str, Any],
@@ -2277,12 +2323,23 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_candidate_context_and_blockers_2026_04_06",
+        "build_tag": "schema_patch_simple_output_and_screened_context_2026_04_06",
         "source_of_truth": "candidate_engine",
+        "read_this_first": "simple_output",
         "engine_status": engine_status,
+        "candidate_engine_status": engine_status,
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
         "engine_best_ticker": summary_payload.get("best_ticker"),
+        "simple_output": _build_simple_output_block(
+            user_facing=user_facing_block,
+            trigger_state=trigger_state,
+        ),
+        "screened_best_context": _build_screened_best_context(
+            selected=selected,
+            engine_best_ticker=summary_payload.get("best_ticker"),
+            screened_candidates=screened_candidates,
+        ),
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
