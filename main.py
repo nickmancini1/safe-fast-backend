@@ -14,10 +14,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.1")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.2")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.1"
+USER_AGENT = "safe-fast-backend/1.8.2"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -545,6 +545,88 @@ def _build_execution_quality_context(
     }
 
 
+
+
+def _build_wall_thesis_fit_context(
+    option_type: str,
+    structure_context: Dict[str, Any],
+    primary_candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    wall_thesis = structure_context.get("wall_thesis")
+    first_wall = _to_float(structure_context.get("first_wall"))
+    next_pocket = _to_float(structure_context.get("next_pocket"))
+    long_strike = _to_float(primary_candidate.get("long_strike")) if primary_candidate else None
+    short_strike = _to_float(primary_candidate.get("short_strike")) if primary_candidate else None
+
+    tolerance = None
+    if first_wall is not None:
+        tolerance = max(abs(first_wall) * 0.0015, 0.10)
+
+    short_strike_vs_first_wall = None
+    if short_strike is not None and first_wall is not None and tolerance is not None:
+        if abs(short_strike - first_wall) <= tolerance:
+            short_strike_vs_first_wall = "on_wall_zone"
+        elif option_type == "C":
+            short_strike_vs_first_wall = "beyond_first_wall" if short_strike > first_wall else "inside_first_wall"
+        else:
+            short_strike_vs_first_wall = "beyond_first_wall" if short_strike < first_wall else "inside_first_wall"
+
+    short_strike_on_magnet_level = None
+    if short_strike is not None:
+        magnet_hits = []
+        for level in (first_wall, next_pocket):
+            if level is None:
+                continue
+            local_tol = max(abs(level) * 0.0015, 0.10)
+            if abs(short_strike - level) <= local_tol:
+                magnet_hits.append(level)
+        short_strike_on_magnet_level = bool(magnet_hits) if magnet_hits else False
+
+    requires_breakout = wall_thesis == "THROUGH_THE_WALL"
+
+    if primary_candidate is None:
+        status = "unconfirmed"
+        why = "Wall-thesis fit is unconfirmed because no primary candidate is available."
+    elif wall_thesis not in {"TO_THE_WALL", "THROUGH_THE_WALL"}:
+        status = "unconfirmed"
+        why = "Wall thesis is still unconfirmed from the available structure inputs."
+    elif short_strike is None or first_wall is None:
+        status = "unconfirmed"
+        why = "Wall-thesis fit is unconfirmed because strike or wall data is missing."
+    elif wall_thesis == "TO_THE_WALL":
+        if short_strike_on_magnet_level:
+            status = "fail"
+            why = "TO_THE_WALL fails because the short strike sits on a magnet level."
+        elif short_strike_vs_first_wall != "beyond_first_wall":
+            status = "fail"
+            why = "TO_THE_WALL fails because the short strike is not beyond the first wall."
+        else:
+            status = "pass"
+            why = "TO_THE_WALL fits because the short strike sits beyond the first wall without sitting on it."
+    else:
+        if next_pocket is None:
+            status = "fail"
+            why = "THROUGH_THE_WALL fails because no clear next pocket is mapped beyond the first wall."
+        elif short_strike_vs_first_wall not in {"on_wall_zone", "beyond_first_wall"}:
+            status = "fail"
+            why = "THROUGH_THE_WALL fails because the short strike is not positioned for a breakout path."
+        else:
+            status = "pass"
+            why = "THROUGH_THE_WALL fits because breakout continuation into the next pocket is mapped."
+
+    return {
+        "wall_thesis": wall_thesis,
+        "long_strike": long_strike,
+        "short_strike": short_strike,
+        "first_wall": structure_context.get("first_wall"),
+        "next_pocket": structure_context.get("next_pocket"),
+        "short_strike_vs_first_wall": short_strike_vs_first_wall,
+        "requires_breakout": requires_breakout,
+        "short_strike_on_magnet_level": short_strike_on_magnet_level,
+        "wall_thesis_fit_status": status,
+        "why_wall_thesis_fit_passes_or_fails": why,
+    }
+
 def _build_options_structure_context(
     request: OnDemandRequest,
     selected_summary: Optional[Dict[str, Any]],
@@ -685,6 +767,11 @@ def _build_live_map_block(
         primary_candidate=primary_candidate,
         liquidity_context=liquidity_context,
     )
+    wall_thesis_fit = _build_wall_thesis_fit_context(
+        option_type=option_type,
+        structure_context=structure_context,
+        primary_candidate=primary_candidate,
+    )
     return {
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
@@ -699,6 +786,7 @@ def _build_live_map_block(
         "extension_quality": extension_quality,
         "execution_quality": execution_quality,
         "options_structure": options_structure,
+        "wall_thesis_fit": wall_thesis_fit,
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
@@ -2955,6 +3043,7 @@ def _build_candidate_context(
     extension_quality = None
     execution_quality = None
     options_structure = None
+    wall_thesis_fit = None
 
     if active:
         entry_zones = _derive_entry_zones(
@@ -2988,6 +3077,11 @@ def _build_candidate_context(
             selected_summary=selected_summary,
             primary_candidate=primary_candidate,
             liquidity_context=liquidity_context,
+        )
+        wall_thesis_fit = _build_wall_thesis_fit_context(
+            option_type=option_type,
+            structure_context=structure_context,
+            primary_candidate=primary_candidate,
         )
         primary_entry_zone = entry_zones.get("primary_entry_zone")
         backup_entry_zone = entry_zones.get("backup_entry_zone")
@@ -3047,6 +3141,8 @@ def _build_candidate_context(
         "room_wall": room_wall if active else None,
         "extension_quality": extension_quality if active else None,
         "execution_quality": execution_quality if active else None,
+        "options_structure": options_structure if active else None,
+        "wall_thesis_fit": wall_thesis_fit if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
