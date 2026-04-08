@@ -184,15 +184,148 @@ def _derive_entry_zones(
     }
 
 
+def _relation_to_ema(candle: Optional[Dict[str, Any]], ema50_1h: Optional[float]) -> Optional[str]:
+    if not candle or ema50_1h is None:
+        return None
+
+    close_value = _to_float(candle.get("close"))
+    high_value = _to_float(candle.get("high"))
+    low_value = _to_float(candle.get("low"))
+
+    if close_value is None:
+        return None
+    if close_value > ema50_1h:
+        return "above"
+    if close_value < ema50_1h:
+        return "below"
+    if high_value is not None and low_value is not None and low_value <= ema50_1h <= high_value:
+        return "inside"
+    return "at"
+
+def _build_trigger_detail_context(
+    option_type: str,
+    chart_check: Optional[Dict[str, Any]],
+    trigger_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "trigger_candle": None,
+            "current_bar_behavior": {
+                "status": "unconfirmed",
+                "why": "chart_unavailable",
+            },
+        }
+
+    recent = chart_check.get("recent_candles") or []
+    if not recent:
+        return {
+            "trigger_candle": None,
+            "current_bar_behavior": {
+                "status": "unconfirmed",
+                "why": "no_recent_candles",
+            },
+        }
+
+    current_candle = recent[-1]
+    prior_candle = recent[-2] if len(recent) >= 2 else None
+    ema50_1h = _to_float(chart_check.get("ema50_1h"))
+    trigger_level = _to_float(trigger_state.get("trigger_level"))
+    trigger_present = bool(trigger_state.get("trigger_present"))
+    structure_ready = trigger_state.get("structure_ready")
+    price_side = chart_check.get("price_vs_ema50_1h")
+    current_close = _to_float(current_candle.get("close"))
+    current_high = _to_float(current_candle.get("high"))
+    current_low = _to_float(current_candle.get("low"))
+
+    if option_type == "C":
+        if trigger_level is not None and current_close is not None and current_close > trigger_level and structure_ready:
+            behavior_label = "breaking_above_trigger"
+        elif trigger_level is not None and current_high is not None and current_high >= trigger_level:
+            behavior_label = "testing_trigger_but_not_confirmed"
+        elif price_side == "above" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
+            behavior_label = "ema_retest_holding_above"
+        elif price_side == "above":
+            behavior_label = "above_ema_but_below_trigger"
+        else:
+            behavior_label = "below_ema_or_not_ready"
+    else:
+        if trigger_level is not None and current_close is not None and current_close < trigger_level and structure_ready:
+            behavior_label = "breaking_below_trigger"
+        elif trigger_level is not None and current_low is not None and current_low <= trigger_level:
+            behavior_label = "testing_trigger_but_not_confirmed"
+        elif price_side == "below" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
+            behavior_label = "ema_retest_holding_below"
+        elif price_side == "below":
+            behavior_label = "below_ema_but_above_trigger"
+        else:
+            behavior_label = "above_ema_or_not_ready"
+
+    trigger_candle_source = "current_bar" if trigger_present else "most_recent_completed_candle"
+    trigger_candle_ref = current_candle if trigger_present or prior_candle is None else prior_candle
+    trigger_candle_close = _to_float(trigger_candle_ref.get("close")) if trigger_candle_ref else None
+
+    qualifies_as_trigger_candle = False
+    if trigger_candle_ref and trigger_level is not None and trigger_candle_close is not None:
+        if option_type == "C":
+            qualifies_as_trigger_candle = trigger_candle_close > trigger_level
+        else:
+            qualifies_as_trigger_candle = trigger_candle_close < trigger_level
+
+    trigger_candle = None
+    if trigger_candle_ref:
+        trigger_candle = {
+            "source": trigger_candle_source,
+            "time_iso": trigger_candle_ref.get("time_iso"),
+            "open": _round_or_none(_to_float(trigger_candle_ref.get("open")), 4),
+            "high": _round_or_none(_to_float(trigger_candle_ref.get("high")), 4),
+            "low": _round_or_none(_to_float(trigger_candle_ref.get("low")), 4),
+            "close": _round_or_none(_to_float(trigger_candle_ref.get("close")), 4),
+            "relation_to_trigger_level": (
+                "above" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close > trigger_level
+                else "below" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close < trigger_level
+                else "at" if trigger_level is not None and trigger_candle_close is not None
+                else None
+            ),
+            "relation_to_ema50_1h": _relation_to_ema(trigger_candle_ref, ema50_1h),
+            "qualifies_as_trigger_candle": qualifies_as_trigger_candle,
+        }
+
+    current_bar_behavior = {
+        "status": "confirmed",
+        "label": behavior_label,
+        "time_iso": current_candle.get("time_iso"),
+        "open": _round_or_none(_to_float(current_candle.get("open")), 4),
+        "high": _round_or_none(current_high, 4),
+        "low": _round_or_none(current_low, 4),
+        "close": _round_or_none(current_close, 4),
+        "price_vs_ema50_1h": price_side,
+        "trigger_level": _round_or_none(trigger_level, 4),
+        "trigger_present": trigger_present,
+        "structure_ready": structure_ready,
+        "why": trigger_state.get("why"),
+    }
+
+    return {
+        "trigger_candle": trigger_candle,
+        "current_bar_behavior": current_bar_behavior,
+    }
+
 def _build_live_map_block(
     ticker: Optional[str],
+    option_type: str,
     primary_entry_zone: Optional[Dict[str, Any]],
     backup_entry_zone: Optional[Dict[str, Any]],
     trigger_state: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
     invalidation_level_1h_ema50: Optional[float],
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
 ) -> Dict[str, Any]:
+    trigger_detail = _build_trigger_detail_context(
+        option_type=option_type,
+        chart_check=chart_check,
+        trigger_state=trigger_state,
+    )
     return {
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
@@ -200,6 +333,8 @@ def _build_live_map_block(
         "trigger_style": trigger_state.get("trigger_style"),
         "trigger_level": trigger_state.get("trigger_level"),
         "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_candle": trigger_detail.get("trigger_candle"),
+        "current_bar_behavior": trigger_detail.get("current_bar_behavior"),
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
@@ -2445,6 +2580,8 @@ def _build_candidate_context(
     targets_block = None
     primary_entry_zone = None
     backup_entry_zone = None
+    trigger_candle = None
+    current_bar_behavior = None
 
     if active:
         entry_zones = _derive_entry_zones(
@@ -2453,8 +2590,15 @@ def _build_candidate_context(
             structure_context=structure_context,
             trigger_state=trigger_state,
         )
+        trigger_detail = _build_trigger_detail_context(
+            option_type=option_type,
+            chart_check=chart_check,
+            trigger_state=trigger_state,
+        )
         primary_entry_zone = entry_zones.get("primary_entry_zone")
         backup_entry_zone = entry_zones.get("backup_entry_zone")
+        trigger_candle = trigger_detail.get("trigger_candle")
+        current_bar_behavior = trigger_detail.get("current_bar_behavior")
         options_block = {
             "expiration_date": selected_summary.get("expiration_date") if selected_summary else None,
             "days_to_expiration": selected_summary.get("days_to_expiration") if selected_summary else None,
@@ -2503,6 +2647,8 @@ def _build_candidate_context(
         "trigger_state": trigger_state.get("why") if active else None,
         "trigger_style": trigger_state.get("trigger_style") if active else None,
         "trigger_level": trigger_state.get("trigger_level") if active else None,
+        "trigger_candle": trigger_candle if active else None,
+        "current_bar_behavior": current_bar_behavior if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
@@ -2822,6 +2968,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         },
         "live_map": _build_live_map_block(
             ticker=best_ticker,
+            option_type=clean_option_type,
             primary_entry_zone=_derive_entry_zones(
                 option_type=clean_option_type,
                 chart_check=chart_check,
@@ -2835,6 +2982,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
                 trigger_state=trigger_state,
             ).get("backup_entry_zone") if best_ticker and primary_candidate else None,
             trigger_state=trigger_state,
+            chart_check=chart_check,
             invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
             market_context=market_context,
             time_day_gate=time_day_gate,
