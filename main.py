@@ -310,6 +310,95 @@ def _build_trigger_detail_context(
         "current_bar_behavior": current_bar_behavior,
     }
 
+
+def _build_setup_route_context(
+    option_type: str,
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    intended_setup_type = structure_context.get("setup_type")
+    allowed_setup = structure_context.get("allowed_setup")
+    chop_risk = bool(structure_context.get("chop_risk"))
+    extension_state = structure_context.get("extension_state")
+    room_pass = structure_context.get("room_pass")
+    wall_pass = structure_context.get("wall_pass")
+    trigger_present = bool(trigger_state.get("trigger_present"))
+    structure_ready = bool(trigger_state.get("structure_ready"))
+    price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
+
+    if intended_setup_type == "Clean Fast Break":
+        retest_quality = "breakout_path" if not chop_risk else "messy_breakout"
+    elif intended_setup_type in {"Ideal", "Continuation"}:
+        if chop_risk:
+            retest_quality = "messy_retest"
+        elif extension_state == "extended":
+            retest_quality = "late_retest"
+        elif price_side in {"above", "below"}:
+            retest_quality = "clean_retest"
+        else:
+            retest_quality = "unconfirmed_retest"
+    else:
+        if chop_risk:
+            retest_quality = "messy_retest"
+        elif extension_state == "extended":
+            retest_quality = "late_retest"
+        else:
+            retest_quality = "not_applicable"
+
+    fast_entry_allowed = bool(
+        intended_setup_type == "Clean Fast Break"
+        and allowed_setup is True
+        and room_pass is True
+        and wall_pass is not False
+        and extension_state != "extended"
+        and structure_ready
+        and trigger_present
+    )
+
+    if intended_setup_type == "Clean Fast Break":
+        next_bar_confirmation_required = not fast_entry_allowed
+    elif intended_setup_type in {"Ideal", "Continuation"}:
+        next_bar_confirmation_required = True
+    else:
+        next_bar_confirmation_required = None
+
+    if allowed_setup is True and room_pass is True and wall_pass is not False and extension_state != "extended":
+        if fast_entry_allowed:
+            setup_route_status = "pass_fast_entry"
+            why = "Clean Fast Break conditions are aligned and fast-entry is allowed."
+        elif next_bar_confirmation_required:
+            setup_route_status = "pending_confirmation"
+            why = "Setup route is valid, but next-bar or close confirmation is still required."
+        else:
+            setup_route_status = "pass"
+            why = "Setup route passes the current SAFE-FAST route checks."
+    elif allowed_setup is False:
+        setup_route_status = "fail"
+        why = "Setup type is not one of the allowed SAFE-FAST routes."
+    elif room_pass is False:
+        setup_route_status = "fail"
+        why = "Room to the first wall is too tight for this setup route."
+    elif wall_pass is False:
+        setup_route_status = "fail"
+        why = "Wall thesis does not support this setup route."
+    elif extension_state == "extended":
+        setup_route_status = "fail"
+        why = "Setup route is too extended or too late versus the 1H 50 EMA."
+    else:
+        setup_route_status = "unconfirmed"
+        why = "Setup route is still unconfirmed from the available chart context."
+
+    return {
+        "intended_setup_type": intended_setup_type,
+        "retest_quality": retest_quality,
+        "fast_entry_allowed": fast_entry_allowed,
+        "next_bar_confirmation_required": next_bar_confirmation_required,
+        "setup_route_status": setup_route_status,
+        "why_setup_route_passes_or_fails": why,
+    }
+
+
 def _build_live_map_block(
     ticker: Optional[str],
     option_type: str,
@@ -317,6 +406,7 @@ def _build_live_map_block(
     backup_entry_zone: Optional[Dict[str, Any]],
     trigger_state: Dict[str, Any],
     chart_check: Optional[Dict[str, Any]],
+    structure_context: Dict[str, Any],
     invalidation_level_1h_ema50: Optional[float],
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
@@ -325,6 +415,12 @@ def _build_live_map_block(
         option_type=option_type,
         chart_check=chart_check,
         trigger_state=trigger_state,
+    )
+    setup_route = _build_setup_route_context(
+        option_type=option_type,
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        chart_check=chart_check,
     )
     return {
         "ticker": ticker,
@@ -335,10 +431,12 @@ def _build_live_map_block(
         "trigger_present": trigger_state.get("trigger_present"),
         "trigger_candle": trigger_detail.get("trigger_candle"),
         "current_bar_behavior": trigger_detail.get("current_bar_behavior"),
+        "setup_route": setup_route,
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
     }
+
 
 
 def _calc_pct_of_mid(bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> Optional[float]:
@@ -2582,6 +2680,7 @@ def _build_candidate_context(
     backup_entry_zone = None
     trigger_candle = None
     current_bar_behavior = None
+    setup_route = None
 
     if active:
         entry_zones = _derive_entry_zones(
@@ -2594,6 +2693,12 @@ def _build_candidate_context(
             option_type=option_type,
             chart_check=chart_check,
             trigger_state=trigger_state,
+        )
+        setup_route = _build_setup_route_context(
+            option_type=option_type,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+            chart_check=chart_check,
         )
         primary_entry_zone = entry_zones.get("primary_entry_zone")
         backup_entry_zone = entry_zones.get("backup_entry_zone")
@@ -2649,6 +2754,7 @@ def _build_candidate_context(
         "trigger_level": trigger_state.get("trigger_level") if active else None,
         "trigger_candle": trigger_candle if active else None,
         "current_bar_behavior": current_bar_behavior if active else None,
+        "setup_route": setup_route if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
@@ -2674,6 +2780,7 @@ def _build_candidate_context(
             if active else None
         ),
     }
+
 
 
 def _build_two_path_block(
@@ -2983,6 +3090,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             ).get("backup_entry_zone") if best_ticker and primary_candidate else None,
             trigger_state=trigger_state,
             chart_check=chart_check,
+            structure_context=structure_context,
             invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
             market_context=market_context,
             time_day_gate=time_day_gate,
