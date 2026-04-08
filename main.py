@@ -14,10 +14,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.4")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.1")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.4"
+USER_AGENT = "safe-fast-backend/1.8.1"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -97,1027 +97,6 @@ def _round_or_none(value: Optional[float], places: int = 4) -> Optional[float]:
     if value is None:
         return None
     return round(value, places)
-
-
-def _build_price_zone(
-    low: Optional[float],
-    high: Optional[float],
-    label: str,
-    source: str,
-) -> Optional[Dict[str, Any]]:
-    if low is None or high is None:
-        return None
-    zone_low = min(low, high)
-    zone_high = max(low, high)
-    return {
-        "label": label,
-        "low": round(zone_low, 4),
-        "high": round(zone_high, 4),
-        "source": source,
-    }
-
-
-def _derive_entry_zones(
-    option_type: str,
-    chart_check: Optional[Dict[str, Any]],
-    structure_context: Dict[str, Any],
-    trigger_state: Dict[str, Any],
-) -> Dict[str, Any]:
-    if not chart_check or not chart_check.get("ok"):
-        return {
-            "primary_entry_zone": None,
-            "backup_entry_zone": None,
-        }
-
-    ema50_1h = _to_float(chart_check.get("ema50_1h"))
-    latest_close = _to_float(chart_check.get("latest_close"))
-    first_wall = _to_float(structure_context.get("first_wall"))
-    room_to_first_wall = _to_float(structure_context.get("room_to_first_wall"))
-    atr_14_1h = _to_float(structure_context.get("atr_14_1h"))
-    trigger_level = _to_float(trigger_state.get("trigger_level"))
-
-    zone_half_width = None
-    if atr_14_1h is not None and atr_14_1h > 0:
-        zone_half_width = max(atr_14_1h * 0.15, 0.10)
-    elif latest_close is not None and latest_close > 0:
-        zone_half_width = max(latest_close * 0.0015, 0.10)
-    else:
-        zone_half_width = 0.10
-
-    primary_entry_zone = None
-    if ema50_1h is not None:
-        primary_entry_zone = _build_price_zone(
-            ema50_1h - zone_half_width,
-            ema50_1h + zone_half_width,
-            "ema_retest_zone",
-            "ema50_1h_anchor",
-        )
-
-    backup_entry_zone = None
-    if trigger_level is not None:
-        backup_entry_zone = _build_price_zone(
-            trigger_level - zone_half_width,
-            trigger_level + zone_half_width,
-            "trigger_retest_zone",
-            "trigger_level_anchor",
-        )
-    elif first_wall is not None:
-        wall_buffer = max(zone_half_width, (room_to_first_wall or 0.0) * 0.5)
-        if option_type == "C":
-            backup_entry_zone = _build_price_zone(
-                first_wall - wall_buffer,
-                first_wall,
-                "first_wall_retest_zone",
-                "first_wall_anchor",
-            )
-        else:
-            backup_entry_zone = _build_price_zone(
-                first_wall,
-                first_wall + wall_buffer,
-                "first_wall_retest_zone",
-                "first_wall_anchor",
-            )
-
-    return {
-        "primary_entry_zone": primary_entry_zone,
-        "backup_entry_zone": backup_entry_zone,
-    }
-
-
-def _relation_to_ema(candle: Optional[Dict[str, Any]], ema50_1h: Optional[float]) -> Optional[str]:
-    if not candle or ema50_1h is None:
-        return None
-
-    close_value = _to_float(candle.get("close"))
-    high_value = _to_float(candle.get("high"))
-    low_value = _to_float(candle.get("low"))
-
-    if close_value is None:
-        return None
-    if close_value > ema50_1h:
-        return "above"
-    if close_value < ema50_1h:
-        return "below"
-    if high_value is not None and low_value is not None and low_value <= ema50_1h <= high_value:
-        return "inside"
-    return "at"
-
-def _build_trigger_detail_context(
-    option_type: str,
-    chart_check: Optional[Dict[str, Any]],
-    trigger_state: Dict[str, Any],
-) -> Dict[str, Any]:
-    if not chart_check or not chart_check.get("ok"):
-        return {
-            "trigger_candle": None,
-            "current_bar_behavior": {
-                "status": "unconfirmed",
-                "why": "chart_unavailable",
-            },
-        }
-
-    recent = chart_check.get("recent_candles") or []
-    if not recent:
-        return {
-            "trigger_candle": None,
-            "current_bar_behavior": {
-                "status": "unconfirmed",
-                "why": "no_recent_candles",
-            },
-        }
-
-    current_candle = recent[-1]
-    prior_candle = recent[-2] if len(recent) >= 2 else None
-    ema50_1h = _to_float(chart_check.get("ema50_1h"))
-    trigger_level = _to_float(trigger_state.get("trigger_level"))
-    trigger_present = bool(trigger_state.get("trigger_present"))
-    structure_ready = trigger_state.get("structure_ready")
-    price_side = chart_check.get("price_vs_ema50_1h")
-    current_close = _to_float(current_candle.get("close"))
-    current_high = _to_float(current_candle.get("high"))
-    current_low = _to_float(current_candle.get("low"))
-
-    if option_type == "C":
-        if trigger_level is not None and current_close is not None and current_close > trigger_level and structure_ready:
-            behavior_label = "breaking_above_trigger"
-        elif trigger_level is not None and current_high is not None and current_high >= trigger_level:
-            behavior_label = "testing_trigger_but_not_confirmed"
-        elif price_side == "above" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
-            behavior_label = "ema_retest_holding_above"
-        elif price_side == "above":
-            behavior_label = "above_ema_but_below_trigger"
-        else:
-            behavior_label = "below_ema_or_not_ready"
-    else:
-        if trigger_level is not None and current_close is not None and current_close < trigger_level and structure_ready:
-            behavior_label = "breaking_below_trigger"
-        elif trigger_level is not None and current_low is not None and current_low <= trigger_level:
-            behavior_label = "testing_trigger_but_not_confirmed"
-        elif price_side == "below" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
-            behavior_label = "ema_retest_holding_below"
-        elif price_side == "below":
-            behavior_label = "below_ema_but_above_trigger"
-        else:
-            behavior_label = "above_ema_or_not_ready"
-
-    trigger_candle_source = "current_bar" if trigger_present else "most_recent_completed_candle"
-    trigger_candle_ref = current_candle if trigger_present or prior_candle is None else prior_candle
-    trigger_candle_close = _to_float(trigger_candle_ref.get("close")) if trigger_candle_ref else None
-
-    qualifies_as_trigger_candle = False
-    if trigger_candle_ref and trigger_level is not None and trigger_candle_close is not None:
-        if option_type == "C":
-            qualifies_as_trigger_candle = trigger_candle_close > trigger_level
-        else:
-            qualifies_as_trigger_candle = trigger_candle_close < trigger_level
-
-    trigger_candle = None
-    if trigger_candle_ref:
-        trigger_candle = {
-            "source": trigger_candle_source,
-            "time_iso": trigger_candle_ref.get("time_iso"),
-            "open": _round_or_none(_to_float(trigger_candle_ref.get("open")), 4),
-            "high": _round_or_none(_to_float(trigger_candle_ref.get("high")), 4),
-            "low": _round_or_none(_to_float(trigger_candle_ref.get("low")), 4),
-            "close": _round_or_none(_to_float(trigger_candle_ref.get("close")), 4),
-            "relation_to_trigger_level": (
-                "above" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close > trigger_level
-                else "below" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close < trigger_level
-                else "at" if trigger_level is not None and trigger_candle_close is not None
-                else None
-            ),
-            "relation_to_ema50_1h": _relation_to_ema(trigger_candle_ref, ema50_1h),
-            "qualifies_as_trigger_candle": qualifies_as_trigger_candle,
-        }
-
-    current_bar_behavior = {
-        "status": "confirmed",
-        "label": behavior_label,
-        "time_iso": current_candle.get("time_iso"),
-        "open": _round_or_none(_to_float(current_candle.get("open")), 4),
-        "high": _round_or_none(current_high, 4),
-        "low": _round_or_none(current_low, 4),
-        "close": _round_or_none(current_close, 4),
-        "price_vs_ema50_1h": price_side,
-        "trigger_level": _round_or_none(trigger_level, 4),
-        "trigger_present": trigger_present,
-        "structure_ready": structure_ready,
-        "why": trigger_state.get("why"),
-    }
-
-    return {
-        "trigger_candle": trigger_candle,
-        "current_bar_behavior": current_bar_behavior,
-    }
-
-
-
-def _summarize_trigger_scan_candle(
-    candle: Optional[Dict[str, Any]],
-    ema50_1h: Optional[float],
-) -> Optional[Dict[str, Any]]:
-    if not candle:
-        return None
-    return {
-        "time_iso": candle.get("time_iso"),
-        "open": _round_or_none(_to_float(candle.get("open")), 4),
-        "high": _round_or_none(_to_float(candle.get("high")), 4),
-        "low": _round_or_none(_to_float(candle.get("low")), 4),
-        "close": _round_or_none(_to_float(candle.get("close")), 4),
-        "relation_to_ema50_1h": _relation_to_ema(candle, ema50_1h),
-    }
-
-
-def _evaluate_trigger_scan_candle(
-    option_type: str,
-    candle: Optional[Dict[str, Any]],
-    reference_candles: List[Dict[str, Any]],
-    ema50_1h: Optional[float],
-    structure_ready: Optional[bool],
-    market_open: bool,
-    fresh_entry_allowed: bool,
-    gate_reason: Optional[str],
-) -> Dict[str, Any]:
-    if not candle:
-        return {
-            "status": "unconfirmed",
-            "why": "candle_unavailable",
-        }
-
-    if len(reference_candles) < 3:
-        return {
-            "time_iso": candle.get("time_iso"),
-            "open": _round_or_none(_to_float(candle.get("open")), 4),
-            "high": _round_or_none(_to_float(candle.get("high")), 4),
-            "low": _round_or_none(_to_float(candle.get("low")), 4),
-            "close": _round_or_none(_to_float(candle.get("close")), 4),
-            "reference_window_size": len(reference_candles),
-            "reference_trigger_level": None,
-            "relation_to_trigger_level": None,
-            "relation_to_ema50_1h": _relation_to_ema(candle, ema50_1h),
-            "raw_cross_pass": False,
-            "ema_side_pass": False,
-            "raw_chart_trigger_pass": False,
-            "structure_ready": structure_ready,
-            "gated_trigger_pass": False,
-            "status": "unconfirmed",
-            "why": "insufficient_reference_candles",
-        }
-
-    close_value = _to_float(candle.get("close"))
-    if option_type == "C":
-        trigger_level = max((_to_float(ref.get("high")) for ref in reference_candles if _to_float(ref.get("high")) is not None), default=None)
-        raw_cross_pass = bool(trigger_level is not None and close_value is not None and close_value > trigger_level)
-        relation_to_trigger = (
-            "above" if trigger_level is not None and close_value is not None and close_value > trigger_level
-            else "below" if trigger_level is not None and close_value is not None and close_value < trigger_level
-            else "at" if trigger_level is not None and close_value is not None
-            else None
-        )
-        ema_side_pass = bool(close_value is not None and ema50_1h is not None and close_value > ema50_1h)
-    else:
-        trigger_level = min((_to_float(ref.get("low")) for ref in reference_candles if _to_float(ref.get("low")) is not None), default=None)
-        raw_cross_pass = bool(trigger_level is not None and close_value is not None and close_value < trigger_level)
-        relation_to_trigger = (
-            "below" if trigger_level is not None and close_value is not None and close_value < trigger_level
-            else "above" if trigger_level is not None and close_value is not None and close_value > trigger_level
-            else "at" if trigger_level is not None and close_value is not None
-            else None
-        )
-        ema_side_pass = bool(close_value is not None and ema50_1h is not None and close_value < ema50_1h)
-
-    raw_chart_trigger_pass = bool(raw_cross_pass and ema_side_pass)
-    gated_trigger_pass = bool(
-        raw_chart_trigger_pass
-        and structure_ready is True
-        and market_open
-        and fresh_entry_allowed
-    )
-
-    if gated_trigger_pass:
-        status = "pass"
-        why = "Trigger conditions pass on this candle."
-    elif not market_open:
-        status = "fail"
-        why = "market_closed"
-    elif not fresh_entry_allowed:
-        status = "fail"
-        why = gate_reason or "time_day_gate_blocked"
-    elif structure_ready is False:
-        status = "fail"
-        why = "structure_not_ready"
-    elif not ema_side_pass:
-        status = "fail"
-        why = "wrong_side_of_ema"
-    elif not raw_cross_pass:
-        status = "fail"
-        why = "close_trigger_not_hit"
-    else:
-        status = "unconfirmed"
-        why = "trigger_unconfirmed"
-
-    return {
-        "time_iso": candle.get("time_iso"),
-        "open": _round_or_none(_to_float(candle.get("open")), 4),
-        "high": _round_or_none(_to_float(candle.get("high")), 4),
-        "low": _round_or_none(_to_float(candle.get("low")), 4),
-        "close": _round_or_none(close_value, 4),
-        "reference_window_size": len(reference_candles),
-        "reference_trigger_level": _round_or_none(trigger_level, 4),
-        "relation_to_trigger_level": relation_to_trigger,
-        "relation_to_ema50_1h": _relation_to_ema(candle, ema50_1h),
-        "raw_cross_pass": raw_cross_pass,
-        "ema_side_pass": ema_side_pass,
-        "raw_chart_trigger_pass": raw_chart_trigger_pass,
-        "structure_ready": structure_ready,
-        "gated_trigger_pass": gated_trigger_pass,
-        "status": status,
-        "why": why,
-    }
-
-
-def _build_trigger_scan_context(
-    option_type: str,
-    chart_check: Optional[Dict[str, Any]],
-    trigger_state: Dict[str, Any],
-    market_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
-) -> Dict[str, Any]:
-    if not chart_check or not chart_check.get("ok"):
-        return {
-            "scan_basis": "current_bar_plus_last_3_completed_1h_candles",
-            "required_completed_candle_count": 3,
-            "trigger_style": trigger_state.get("trigger_style"),
-            "market_open": market_context.get("is_open"),
-            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
-            "current_bar": {
-                "status": "unconfirmed",
-                "why": "chart_unavailable",
-            },
-            "most_recent_completed_candle": {
-                "status": "unconfirmed",
-                "why": "chart_unavailable",
-            },
-            "current_bar_reference_candles": [],
-            "completed_candle_reference_candles": [],
-            "trigger_scan_status": "unconfirmed",
-            "why_trigger_scan_passes_or_fails": "Trigger scan is unconfirmed because chart data is unavailable.",
-        }
-
-    recent = chart_check.get("recent_candles") or []
-    ema50_1h = _to_float(chart_check.get("ema50_1h"))
-    market_open = bool(market_context.get("is_open"))
-    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
-    gate_reason = trigger_state.get("why")
-    structure_ready = trigger_state.get("structure_ready")
-
-    current_bar = recent[-1] if recent else None
-    most_recent_completed = recent[-2] if len(recent) >= 2 else None
-    current_bar_refs = recent[-4:-1] if len(recent) >= 4 else recent[:-1]
-    completed_refs = recent[-5:-2] if len(recent) >= 5 else recent[:-2]
-
-    current_bar_eval = _evaluate_trigger_scan_candle(
-        option_type=option_type,
-        candle=current_bar,
-        reference_candles=current_bar_refs,
-        ema50_1h=ema50_1h,
-        structure_ready=structure_ready,
-        market_open=market_open,
-        fresh_entry_allowed=fresh_entry_allowed,
-        gate_reason=gate_reason,
-    )
-    completed_eval = _evaluate_trigger_scan_candle(
-        option_type=option_type,
-        candle=most_recent_completed,
-        reference_candles=completed_refs,
-        ema50_1h=ema50_1h,
-        structure_ready=structure_ready,
-        market_open=market_open,
-        fresh_entry_allowed=fresh_entry_allowed,
-        gate_reason=gate_reason,
-    )
-
-    if current_bar_eval.get("gated_trigger_pass"):
-        trigger_scan_status = "pass_current_bar"
-        why = "SAFE-FAST trigger conditions pass on the current 1H bar."
-    elif completed_eval.get("gated_trigger_pass"):
-        trigger_scan_status = "pass_most_recent_completed_candle"
-        why = "SAFE-FAST trigger conditions passed on the most recent completed 1H candle."
-    elif not market_open:
-        trigger_scan_status = "fail"
-        why = "Market is closed, so trigger scan cannot produce a live entry."
-    elif not fresh_entry_allowed:
-        trigger_scan_status = "fail"
-        why = gate_reason or "Fresh entry is outside the SAFE-FAST time/day window."
-    elif structure_ready is False:
-        trigger_scan_status = "fail"
-        why = "Structure is not ready for a SAFE-FAST trigger."
-    elif current_bar_eval.get("raw_chart_trigger_pass") or completed_eval.get("raw_chart_trigger_pass"):
-        trigger_scan_status = "fail"
-        why = "A raw chart trigger appeared, but SAFE-FAST gating still blocks it."
-    elif current_bar_eval.get("status") == "unconfirmed" and completed_eval.get("status") == "unconfirmed":
-        trigger_scan_status = "unconfirmed"
-        why = "Trigger scan is still unconfirmed from the available candles."
-    else:
-        trigger_scan_status = "fail"
-        why = "No SAFE-FAST trigger condition is currently satisfied."
-
-    return {
-        "scan_basis": "current_bar_plus_last_3_completed_1h_candles",
-        "required_completed_candle_count": 3,
-        "trigger_style": trigger_state.get("trigger_style"),
-        "market_open": market_open,
-        "fresh_entry_allowed": fresh_entry_allowed,
-        "structure_ready": structure_ready,
-        "current_bar": current_bar_eval,
-        "most_recent_completed_candle": completed_eval,
-        "current_bar_reference_candles": [
-            _summarize_trigger_scan_candle(candle, ema50_1h) for candle in current_bar_refs
-        ],
-        "completed_candle_reference_candles": [
-            _summarize_trigger_scan_candle(candle, ema50_1h) for candle in completed_refs
-        ],
-        "trigger_scan_status": trigger_scan_status,
-        "why_trigger_scan_passes_or_fails": why,
-    }
-
-
-def _build_setup_route_context(
-    option_type: str,
-    structure_context: Dict[str, Any],
-    trigger_state: Dict[str, Any],
-    chart_check: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    intended_setup_type = structure_context.get("setup_type")
-    allowed_setup = structure_context.get("allowed_setup")
-    chop_risk = bool(structure_context.get("chop_risk"))
-    extension_state = structure_context.get("extension_state")
-    room_pass = structure_context.get("room_pass")
-    wall_pass = structure_context.get("wall_pass")
-    trigger_present = bool(trigger_state.get("trigger_present"))
-    structure_ready = bool(trigger_state.get("structure_ready"))
-    price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
-    allowed_setup_types = {"Ideal", "Clean Fast Break", "Continuation"}
-    route_type_allowed = intended_setup_type in allowed_setup_types
-
-    if intended_setup_type == "Clean Fast Break":
-        retest_quality = "breakout_path" if not chop_risk else "messy_breakout"
-    elif intended_setup_type in {"Ideal", "Continuation"}:
-        if chop_risk:
-            retest_quality = "messy_retest"
-        elif extension_state == "extended":
-            retest_quality = "late_retest"
-        elif price_side in {"above", "below"}:
-            retest_quality = "clean_retest"
-        else:
-            retest_quality = "unconfirmed_retest"
-    else:
-        if chop_risk:
-            retest_quality = "messy_retest"
-        elif extension_state == "extended":
-            retest_quality = "late_retest"
-        else:
-            retest_quality = "not_applicable"
-
-    fast_entry_allowed = bool(
-        intended_setup_type == "Clean Fast Break"
-        and allowed_setup is True
-        and room_pass is True
-        and wall_pass is not False
-        and extension_state != "extended"
-        and structure_ready
-        and trigger_present
-    )
-
-    if intended_setup_type == "Clean Fast Break":
-        next_bar_confirmation_required = not fast_entry_allowed
-    elif intended_setup_type in {"Ideal", "Continuation"}:
-        next_bar_confirmation_required = True
-    else:
-        next_bar_confirmation_required = None
-
-    if (
-        route_type_allowed
-        and allowed_setup is True
-        and room_pass is True
-        and wall_pass is not False
-        and extension_state != "extended"
-    ):
-        if fast_entry_allowed:
-            setup_route_status = "pass_fast_entry"
-            why = "Clean Fast Break conditions are aligned and fast-entry is allowed."
-        elif next_bar_confirmation_required:
-            setup_route_status = "pending_confirmation"
-            why = "Setup route is valid, but next-bar or close confirmation is still required."
-        else:
-            setup_route_status = "pass"
-            why = "Setup route passes the current SAFE-FAST route checks."
-    elif route_type_allowed is False:
-        setup_route_status = "fail"
-        why = "Setup type is not one of the allowed SAFE-FAST routes."
-    elif room_pass is False:
-        setup_route_status = "fail"
-        why = "Room to the first wall is too tight for this setup route."
-    elif wall_pass is False:
-        setup_route_status = "fail"
-        why = "Wall thesis does not support this setup route."
-    elif extension_state == "extended":
-        setup_route_status = "fail"
-        why = "Setup route is too extended or too late versus the 1H 50 EMA."
-    elif allowed_setup is False:
-        setup_route_status = "fail"
-        why = "This is an allowed SAFE-FAST route class, but the current structure does not qualify it as a valid setup."
-    else:
-        setup_route_status = "unconfirmed"
-        why = "Setup route is still unconfirmed from the available chart context."
-
-    return {
-        "intended_setup_type": intended_setup_type,
-        "retest_quality": retest_quality,
-        "fast_entry_allowed": fast_entry_allowed,
-        "next_bar_confirmation_required": next_bar_confirmation_required,
-        "setup_route_status": setup_route_status,
-        "why_setup_route_passes_or_fails": why,
-    }
-
-
-def _build_room_wall_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
-    room_pass = structure_context.get("room_pass")
-    wall_pass = structure_context.get("wall_pass")
-    wall_thesis = structure_context.get("wall_thesis")
-    extension_blocks_now = structure_context.get("extension_blocks_now")
-
-    if room_pass is False:
-        room_wall_status = "fail"
-        why = "Room to the first wall is too tight for SAFE-FAST."
-    elif wall_pass is False:
-        room_wall_status = "fail"
-        why = "Wall thesis does not support the current path."
-    elif room_pass is True and wall_pass is True:
-        room_wall_status = "pass"
-        if wall_thesis == "TO_THE_WALL":
-            why = "Room and wall context are aligned only up to the first wall."
-        else:
-            why = "Room and wall context are aligned for the current path."
-    else:
-        room_wall_status = "unconfirmed"
-        why = "Room/wall context is still unconfirmed from the available chart inputs."
-
-    return {
-        "first_wall": structure_context.get("first_wall"),
-        "next_pocket": structure_context.get("next_pocket"),
-        "room_to_first_wall": structure_context.get("room_to_first_wall"),
-        "room_ratio": structure_context.get("room_ratio"),
-        "next_pocket_room_ratio": structure_context.get("next_pocket_room_ratio"),
-        "room_pass": room_pass,
-        "wall_thesis": wall_thesis,
-        "wall_pass": wall_pass,
-        "extension_blocks_now": extension_blocks_now,
-        "room_wall_status": room_wall_status,
-        "why_room_or_wall_passes_or_fails": why,
-    }
-
-
-def _build_extension_quality_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
-    extension_state = structure_context.get("extension_state")
-    late_move = structure_context.get("late_move")
-    extension_material = structure_context.get("extension_material")
-    extension_soft_flag = structure_context.get("extension_soft_flag")
-    extension_blocks_now = structure_context.get("extension_blocks_now")
-    degraded_entry_quality = structure_context.get("degraded_entry_quality")
-    early_trigger_window_passed = structure_context.get("early_trigger_window_passed")
-    extension_confirmer_flags = structure_context.get("extension_confirmer_flags")
-    extension_confirmer_count = structure_context.get("extension_confirmer_count")
-
-    if extension_blocks_now is True:
-        extension_quality_status = "fail"
-        why = "Move is materially extended for SAFE-FAST right now."
-    elif extension_state == "extended" or late_move is True or extension_material is True:
-        if extension_soft_flag is True:
-            extension_quality_status = "caution"
-            why = "Extension is elevated, but treated as a soft caution rather than a hard blocker."
-        else:
-            extension_quality_status = "caution"
-            why = "Extension is elevated and needs confirmation from cleaner structure."
-    elif extension_state is None and late_move is None:
-        extension_quality_status = "unconfirmed"
-        why = "Extension quality is still unconfirmed from the available chart inputs."
-    else:
-        extension_quality_status = "pass"
-        why = "Extension quality is not currently blocking the setup."
-
-    return {
-        "extension_state": extension_state,
-        "late_move": late_move,
-        "pct_from_ema": structure_context.get("pct_from_ema"),
-        "atr_multiple_from_ema": structure_context.get("atr_multiple_from_ema"),
-        "degraded_entry_quality": degraded_entry_quality,
-        "early_trigger_window_passed": early_trigger_window_passed,
-        "extension_confirmer_flags": extension_confirmer_flags,
-        "extension_confirmer_count": extension_confirmer_count,
-        "extension_material": extension_material,
-        "extension_soft_flag": extension_soft_flag,
-        "extension_blocks_now": extension_blocks_now,
-        "extension_quality_status": extension_quality_status,
-        "why_extension_passes_or_fails": why,
-    }
-
-
-
-def _build_execution_quality_context(
-    market_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
-    macro_context: Dict[str, Any],
-    iv_context: Dict[str, Any],
-    liquidity_context: Dict[str, Any],
-) -> Dict[str, Any]:
-    market_open = bool(market_context.get("is_open"))
-    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
-    liquidity_pass = liquidity_context.get("liquidity_pass")
-    liquidity_status = liquidity_context.get("status")
-    iv_status = iv_context.get("status")
-    has_major_event_today = bool(macro_context.get("has_major_event_today"))
-    has_major_event_tomorrow = bool(macro_context.get("has_major_event_tomorrow"))
-    macro_risk_level = macro_context.get("risk_level")
-
-    if not market_open or not fresh_entry_allowed:
-        execution_quality_status = "fail"
-        why = "Fresh entries are not allowed right now."
-    elif liquidity_pass is False:
-        execution_quality_status = "fail"
-        why = liquidity_context.get("why") or "Liquidity is too weak for a clean SAFE-FAST entry."
-    elif has_major_event_today:
-        execution_quality_status = "caution"
-        why = "A major macro event is in play today, so execution quality needs extra caution."
-    elif has_major_event_tomorrow:
-        execution_quality_status = "caution"
-        why = "A major macro event is in play tomorrow, so execution quality needs extra caution."
-    elif iv_status == "unconfirmed":
-        execution_quality_status = "caution"
-        why = "IV is still unconfirmed in this build, even though time window and liquidity are acceptable."
-    elif liquidity_pass is True:
-        execution_quality_status = "pass"
-        why = "Time window and liquidity are acceptable for execution."
-    else:
-        execution_quality_status = "unconfirmed"
-        why = "Execution quality is still unconfirmed from the available inputs."
-
-    return {
-        "market_open": market_open,
-        "fresh_entry_allowed": fresh_entry_allowed,
-        "macro_risk_level": macro_risk_level,
-        "has_major_event_today": has_major_event_today,
-        "has_major_event_tomorrow": has_major_event_tomorrow,
-        "iv_status": iv_status,
-        "liquidity_status": liquidity_status,
-        "liquidity_pass": liquidity_pass,
-        "execution_quality_status": execution_quality_status,
-        "why_execution_quality_passes_or_fails": why,
-    }
-
-
-
-
-
-def _build_event_gate_context(
-    macro_context: Dict[str, Any],
-    market_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
-) -> Dict[str, Any]:
-    market_open = bool(market_context.get("is_open"))
-    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
-    has_major_event_today = bool(macro_context.get("has_major_event_today"))
-    has_major_event_tomorrow = bool(macro_context.get("has_major_event_tomorrow"))
-    events = macro_context.get("events") or []
-    risk_level = macro_context.get("risk_level")
-    note = macro_context.get("note")
-
-    if not market_open:
-        event_gate_status = "unconfirmed"
-        why = "Market is closed, so the live event gate is not actionable right now."
-    elif has_major_event_today:
-        event_gate_status = "fail"
-        why = "A major macro event is in play today, so the SAFE-FAST event gate fails unless explicitly approved."
-    elif has_major_event_tomorrow:
-        event_gate_status = "caution"
-        why = "A major macro event is tomorrow, so overnight hold risk needs extra caution."
-    elif not fresh_entry_allowed:
-        event_gate_status = "caution"
-        why = "No major macro event blocks the map, but the fresh-entry window is already closed."
-    else:
-        event_gate_status = "pass"
-        why = "No major macro event is blocking the SAFE-FAST event gate right now."
-
-    return {
-        "market_open": market_open,
-        "fresh_entry_allowed": fresh_entry_allowed,
-        "has_major_event_today": has_major_event_today,
-        "has_major_event_tomorrow": has_major_event_tomorrow,
-        "events": events,
-        "risk_level": risk_level,
-        "event_gate_status": event_gate_status,
-        "why_event_gate_passes_or_fails": why,
-        "note": note,
-    }
-
-
-def _build_wall_thesis_fit_context(
-    option_type: str,
-    structure_context: Dict[str, Any],
-    primary_candidate: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    wall_thesis = structure_context.get("wall_thesis")
-    first_wall = _to_float(structure_context.get("first_wall"))
-    next_pocket = _to_float(structure_context.get("next_pocket"))
-    long_strike = _to_float(primary_candidate.get("long_strike")) if primary_candidate else None
-    short_strike = _to_float(primary_candidate.get("short_strike")) if primary_candidate else None
-
-    tolerance = None
-    if first_wall is not None:
-        tolerance = max(abs(first_wall) * 0.0015, 0.10)
-
-    short_strike_vs_first_wall = None
-    if short_strike is not None and first_wall is not None and tolerance is not None:
-        if abs(short_strike - first_wall) <= tolerance:
-            short_strike_vs_first_wall = "on_wall_zone"
-        elif option_type == "C":
-            short_strike_vs_first_wall = "beyond_first_wall" if short_strike > first_wall else "inside_first_wall"
-        else:
-            short_strike_vs_first_wall = "beyond_first_wall" if short_strike < first_wall else "inside_first_wall"
-
-    short_strike_on_magnet_level = None
-    if short_strike is not None:
-        magnet_hits = []
-        for level in (first_wall, next_pocket):
-            if level is None:
-                continue
-            local_tol = max(abs(level) * 0.0015, 0.10)
-            if abs(short_strike - level) <= local_tol:
-                magnet_hits.append(level)
-        short_strike_on_magnet_level = bool(magnet_hits) if magnet_hits else False
-
-    requires_breakout = wall_thesis == "THROUGH_THE_WALL"
-
-    if primary_candidate is None:
-        status = "unconfirmed"
-        why = "Wall-thesis fit is unconfirmed because no primary candidate is available."
-    elif wall_thesis not in {"TO_THE_WALL", "THROUGH_THE_WALL"}:
-        status = "unconfirmed"
-        why = "Wall thesis is still unconfirmed from the available structure inputs."
-    elif short_strike is None or first_wall is None:
-        status = "unconfirmed"
-        why = "Wall-thesis fit is unconfirmed because strike or wall data is missing."
-    elif wall_thesis == "TO_THE_WALL":
-        if short_strike_on_magnet_level:
-            status = "fail"
-            why = "TO_THE_WALL fails because the short strike sits on a magnet level."
-        elif short_strike_vs_first_wall != "beyond_first_wall":
-            status = "fail"
-            why = "TO_THE_WALL fails because the short strike is not beyond the first wall."
-        else:
-            status = "pass"
-            why = "TO_THE_WALL fits because the short strike sits beyond the first wall without sitting on it."
-    else:
-        if next_pocket is None:
-            status = "fail"
-            why = "THROUGH_THE_WALL fails because no clear next pocket is mapped beyond the first wall."
-        elif short_strike_vs_first_wall not in {"on_wall_zone", "beyond_first_wall"}:
-            status = "fail"
-            why = "THROUGH_THE_WALL fails because the short strike is not positioned for a breakout path."
-        else:
-            status = "pass"
-            why = "THROUGH_THE_WALL fits because breakout continuation into the next pocket is mapped."
-
-    return {
-        "wall_thesis": wall_thesis,
-        "long_strike": long_strike,
-        "short_strike": short_strike,
-        "first_wall": structure_context.get("first_wall"),
-        "next_pocket": structure_context.get("next_pocket"),
-        "short_strike_vs_first_wall": short_strike_vs_first_wall,
-        "requires_breakout": requires_breakout,
-        "short_strike_on_magnet_level": short_strike_on_magnet_level,
-        "wall_thesis_fit_status": status,
-        "why_wall_thesis_fit_passes_or_fails": why,
-    }
-
-
-
-def _build_adx_filter_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
-    adx_value = _to_float(structure_context.get("adx_value_1h"))
-    adx_trend = structure_context.get("adx_trend")
-    chop_risk_from_adx = structure_context.get("chop_risk_from_adx")
-
-    adx_override_blocked_by: List[str] = [
-        "price",
-        "room",
-        "late_move",
-        "wall_placement",
-        "risk",
-        "trigger_rules",
-    ]
-
-    if adx_value is None:
-        status = "unconfirmed"
-        why = "ADX is not available from the current candle set, so the secondary ADX filter remains unconfirmed."
-    elif chop_risk_from_adx is True:
-        status = "caution"
-        why = "ADX is secondary only. Current ADX implies chop risk, but it does not override primary SAFE-FAST blockers."
-    else:
-        status = "pass"
-        why = "ADX does not currently add extra chop risk, but it remains secondary to primary SAFE-FAST rules."
-
-    return {
-        "adx_value_1h": adx_value,
-        "adx_trend": adx_trend,
-        "chop_risk_from_adx": chop_risk_from_adx,
-        "adx_override_blocked_by": adx_override_blocked_by,
-        "adx_filter_status": status,
-        "why_adx_passes_or_fails": why,
-    }
-
-
-def _build_options_structure_context(
-    request: OnDemandRequest,
-    selected_summary: Optional[Dict[str, Any]],
-    primary_candidate: Optional[Dict[str, Any]],
-    liquidity_context: Dict[str, Any],
-) -> Dict[str, Any]:
-    expiration_date = selected_summary.get("expiration_date") if selected_summary else None
-    days_to_expiration = selected_summary.get("days_to_expiration") if selected_summary else None
-    width = primary_candidate.get("width") if primary_candidate else None
-    est_debit = primary_candidate.get("est_debit") if primary_candidate else None
-    max_loss = primary_candidate.get("max_loss_dollars_1lot") if primary_candidate else None
-    max_profit = primary_candidate.get("max_profit_dollars_1lot") if primary_candidate else None
-    risk_reward = primary_candidate.get("risk_reward") if primary_candidate else None
-    feasibility_pass = primary_candidate.get("feasibility_pass") if primary_candidate else None
-    fits_risk_budget = primary_candidate.get("fits_risk_budget") if primary_candidate else None
-    liquidity_pass = liquidity_context.get("liquidity_pass")
-    liquidity_status = liquidity_context.get("status")
-
-    dte_rule_pass = None
-    if isinstance(days_to_expiration, (int, float)):
-        dte_rule_pass = request.min_dte <= float(days_to_expiration) <= request.max_dte
-
-    width_rule_pass = None
-    if isinstance(width, (int, float)):
-        width_rule_pass = request.width_min <= float(width) <= request.width_max
-
-    debit_feasibility_rule_pass = None
-    if isinstance(est_debit, (int, float)) and isinstance(width, (int, float)):
-        debit_feasibility_rule_pass = (1.60 * float(est_debit)) <= float(width)
-
-    preferred_risk_band_pass = None
-    if isinstance(max_loss, (int, float)):
-        preferred_risk_band_pass = request.risk_min_dollars <= float(max_loss) <= request.risk_max_dollars
-
-    hard_risk_cap_pass = None
-    if isinstance(max_loss, (int, float)):
-        hard_risk_cap_pass = float(max_loss) <= request.hard_max_dollars
-
-    if primary_candidate is None:
-        options_structure_status = "unconfirmed"
-        why = "Options structure is unconfirmed because no primary candidate is available."
-    elif feasibility_pass is False:
-        options_structure_status = "fail"
-        why = "Candidate fails the defined-risk debit spread feasibility rule."
-    elif debit_feasibility_rule_pass is False:
-        options_structure_status = "fail"
-        why = "Candidate fails the 1.60 x debit <= width feasibility rule."
-    elif fits_risk_budget is False or hard_risk_cap_pass is False:
-        options_structure_status = "fail"
-        why = "Candidate does not fit the SAFE-FAST risk budget."
-    elif dte_rule_pass is False:
-        options_structure_status = "fail"
-        why = "Candidate is outside the SAFE-FAST DTE window."
-    elif width_rule_pass is False:
-        options_structure_status = "fail"
-        why = "Candidate is outside the SAFE-FAST width range."
-    elif liquidity_pass is False:
-        options_structure_status = "fail"
-        why = liquidity_context.get("why") or "Options structure is not liquid enough for a clean entry."
-    elif (
-        feasibility_pass is True
-        and debit_feasibility_rule_pass is True
-        and fits_risk_budget is True
-        and dte_rule_pass is True
-        and width_rule_pass is True
-        and liquidity_pass is True
-    ):
-        options_structure_status = "pass"
-        why = "Options structure fits DTE, width, risk, feasibility, and liquidity rules."
-    else:
-        options_structure_status = "caution"
-        why = "Options structure is mostly aligned, but one or more checks remain unconfirmed."
-
-    return {
-        "expiration_date": expiration_date,
-        "days_to_expiration": days_to_expiration,
-        "width": width,
-        "est_debit": est_debit,
-        "max_loss_dollars_1lot": max_loss,
-        "max_profit_dollars_1lot": max_profit,
-        "risk_reward": risk_reward,
-        "feasibility_pass": feasibility_pass,
-        "fits_risk_budget": fits_risk_budget,
-        "preferred_risk_band_pass": preferred_risk_band_pass,
-        "hard_risk_cap_pass": hard_risk_cap_pass,
-        "dte_rule_pass": dte_rule_pass,
-        "width_rule_pass": width_rule_pass,
-        "debit_feasibility_rule_pass": debit_feasibility_rule_pass,
-        "liquidity_status": liquidity_status,
-        "liquidity_pass": liquidity_pass,
-        "options_structure_status": options_structure_status,
-        "why_options_structure_passes_or_fails": why,
-    }
-
-
-
-def _build_live_map_block(
-    ticker: Optional[str],
-    option_type: str,
-    primary_entry_zone: Optional[Dict[str, Any]],
-    backup_entry_zone: Optional[Dict[str, Any]],
-    trigger_state: Dict[str, Any],
-    chart_check: Optional[Dict[str, Any]],
-    structure_context: Dict[str, Any],
-    invalidation_level_1h_ema50: Optional[float],
-    market_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
-    macro_context: Dict[str, Any],
-    iv_context: Dict[str, Any],
-    liquidity_context: Dict[str, Any],
-    selected_summary: Optional[Dict[str, Any]],
-    primary_candidate: Optional[Dict[str, Any]],
-    request: OnDemandRequest,
-) -> Dict[str, Any]:
-    trigger_detail = _build_trigger_detail_context(
-        option_type=option_type,
-        chart_check=chart_check,
-        trigger_state=trigger_state,
-    )
-    setup_route = _build_setup_route_context(
-        option_type=option_type,
-        structure_context=structure_context,
-        trigger_state=trigger_state,
-        chart_check=chart_check,
-    )
-    room_wall = _build_room_wall_context(structure_context)
-    extension_quality = _build_extension_quality_context(structure_context)
-    execution_quality = _build_execution_quality_context(
-        market_context=market_context,
-        time_day_gate=time_day_gate,
-        macro_context=macro_context,
-        iv_context=iv_context,
-        liquidity_context=liquidity_context,
-    )
-    event_gate = _build_event_gate_context(
-        macro_context=macro_context,
-        market_context=market_context,
-        time_day_gate=time_day_gate,
-    )
-    options_structure = _build_options_structure_context(
-        request=request,
-        selected_summary=selected_summary,
-        primary_candidate=primary_candidate,
-        liquidity_context=liquidity_context,
-    )
-    wall_thesis_fit = _build_wall_thesis_fit_context(
-        option_type=option_type,
-        structure_context=structure_context,
-        primary_candidate=primary_candidate,
-    )
-    adx_filter = _build_adx_filter_context(structure_context)
-    trigger_scan = _build_trigger_scan_context(
-        option_type=option_type,
-        chart_check=chart_check,
-        trigger_state=trigger_state,
-        market_context=market_context,
-        time_day_gate=time_day_gate,
-    )
-    return {
-        "ticker": ticker,
-        "primary_entry_zone": primary_entry_zone,
-        "backup_entry_zone": backup_entry_zone,
-        "trigger_style": trigger_state.get("trigger_style"),
-        "trigger_level": trigger_state.get("trigger_level"),
-        "trigger_present": trigger_state.get("trigger_present"),
-        "trigger_candle": trigger_detail.get("trigger_candle"),
-        "current_bar_behavior": trigger_detail.get("current_bar_behavior"),
-        "setup_route": setup_route,
-        "room_wall": room_wall,
-        "extension_quality": extension_quality,
-        "execution_quality": execution_quality,
-        "event_gate": event_gate,
-        "options_structure": options_structure,
-        "wall_thesis_fit": wall_thesis_fit,
-        "adx_filter": adx_filter,
-        "trigger_scan": trigger_scan,
-        "invalidation_1h_ema50": invalidation_level_1h_ema50,
-        "market_open": market_context.get("is_open"),
-        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
-    }
-
 
 
 def _calc_pct_of_mid(bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> Optional[float]:
@@ -1791,41 +770,28 @@ def _generate_debit_spread_candidates(
     return candidates
 
 
-def _candidate_liquidity_pass(candidate: Dict[str, Any]) -> bool:
-    liquidity_ctx = _classify_liquidity(
-        candidate.get("entry_slippage_vs_mid"),
-        candidate.get("long_leg_width_pct_of_mid"),
-        candidate.get("short_leg_width_pct_of_mid"),
-    )
-    return liquidity_ctx.get("liquidity_pass") is True
-
-
-
 def _select_shortlist(all_candidates: List[Dict[str, Any]], allow_fallback: bool) -> Dict[str, Any]:
     preferred = [c for c in all_candidates if c["feasibility_pass"] and c["fits_risk_budget"]]
     fallback = [c for c in all_candidates if c["feasibility_pass"] and c["within_hard_max"]]
 
-    preferred_liquid = [c for c in preferred if _candidate_liquidity_pass(c)]
-    fallback_liquid = [c for c in fallback if _candidate_liquidity_pass(c)]
-
-    if preferred_liquid:
-        selected = preferred_liquid
+    if preferred:
+        selected = preferred
         selection_mode = "preferred"
-        reason = "Using candidates that pass feasibility, preferred risk band, hard max, and liquidity."
-    elif allow_fallback and fallback_liquid:
-        selected = fallback_liquid
+        reason = "Using candidates that pass feasibility, preferred risk band, and hard max."
+    elif allow_fallback and fallback:
+        selected = fallback
         selection_mode = "fallback"
-        reason = "No preferred liquid candidates found. Using feasible liquid candidates that still stay under hard max."
+        reason = "No preferred candidates found. Using feasible candidates that still stay under hard max."
     else:
         selected = []
         selection_mode = "none"
-        reason = "No feasible liquid candidates found for the current filters."
+        reason = "No feasible candidates found for the current filters."
 
     return {
         "selection_mode": selection_mode,
         "reason": reason,
-        "preferred_count": len(preferred_liquid),
-        "fallback_count": len(fallback_liquid),
+        "preferred_count": len(preferred),
+        "fallback_count": len(fallback),
         "primary_candidate": selected[0] if len(selected) >= 1 else None,
         "backup_candidate": selected[1] if len(selected) >= 2 else None,
     }
@@ -1871,46 +837,6 @@ def _compact_ticker_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
         "reason": summary.get("reason"),
         "primary_candidate": _compact_candidate(summary.get("primary_candidate")),
         "backup_candidate": _compact_candidate(summary.get("backup_candidate")),
-    }
-
-
-def _apply_engine_liquidity_gate(ticker_summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
-    liquidity_ready: List[Dict[str, Any]] = []
-    liquidity_failed_symbols: List[str] = []
-    liquidity_unconfirmed_symbols: List[str] = []
-
-    for summary in ticker_summaries:
-        primary_candidate = summary.get("primary_candidate")
-        liquidity_block = _build_liquidity_block(primary_candidate)
-
-        summary["engine_liquidity_context"] = liquidity_block
-        summary["engine_liquidity_pass"] = liquidity_block.get("liquidity_pass")
-
-        if primary_candidate is None:
-            continue
-
-        if liquidity_block.get("liquidity_pass") is True:
-            liquidity_ready.append(summary)
-        elif liquidity_block.get("liquidity_pass") is False:
-            liquidity_failed_symbols.append(summary.get("symbol"))
-        else:
-            liquidity_unconfirmed_symbols.append(summary.get("symbol"))
-
-    if liquidity_ready:
-        return {
-            "ranked_summaries": _rank_ticker_summaries(liquidity_ready),
-            "liquidity_gate_applied": True,
-            "liquidity_gate_reason": "Liquidity-failed candidates were removed before engine best-ticker selection.",
-            "liquidity_failed_symbols": liquidity_failed_symbols,
-            "liquidity_unconfirmed_symbols": liquidity_unconfirmed_symbols,
-        }
-
-    return {
-        "ranked_summaries": _rank_ticker_summaries(ticker_summaries),
-        "liquidity_gate_applied": False,
-        "liquidity_gate_reason": "No liquidity-passing candidates were available, so the engine fell back to the original ranked list.",
-        "liquidity_failed_symbols": liquidity_failed_symbols,
-        "liquidity_unconfirmed_symbols": liquidity_unconfirmed_symbols,
     }
 
 
@@ -2041,23 +967,16 @@ async def _build_summary_compact_payload(
         )
         ticker_summaries.append(summary)
 
-    engine_gate = _apply_engine_liquidity_gate(ticker_summaries)
-    ranked = engine_gate["ranked_summaries"]
+    ranked = _rank_ticker_summaries(ticker_summaries)
     best_summary = ranked[0] if ranked else None
-    best_ticker = best_summary["symbol"] if best_summary and best_summary.get("primary_candidate") else None
+    best_ticker = best_summary["symbol"] if best_summary and best_summary["primary_candidate"] else None
     verdict = best_summary["verdict"] if best_summary else "NO_TRADE"
 
     return {
         "ok": True,
         "verdict": verdict,
         "best_ticker": best_ticker,
-        "candidate_sort_reason": {
-            **_candidate_sort_reason_from_best(best_summary),
-            "liquidity_gate_applied": engine_gate["liquidity_gate_applied"],
-            "liquidity_gate_reason": engine_gate["liquidity_gate_reason"],
-            "liquidity_failed_symbols": engine_gate["liquidity_failed_symbols"],
-            "liquidity_unconfirmed_symbols": engine_gate["liquidity_unconfirmed_symbols"],
-        },
+        "candidate_sort_reason": _candidate_sort_reason_from_best(best_summary),
         "selection_mode": best_summary["selection_mode"] if best_summary else "none",
         "reason": best_summary["reason"] if best_summary else "No summary available.",
         "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
@@ -2076,73 +995,6 @@ def _candidate_sort_reason_from_best(best_summary: Optional[Dict[str, Any]]) -> 
         "feasibility_pass": primary.get("feasibility_pass"),
         "fits_risk_budget": primary.get("fits_risk_budget"),
     }
-
-
-def _normalize_engine_verdict_for_session(
-    verdict: Optional[str],
-    has_primary_candidate: bool,
-    market_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
-) -> str:
-    current = verdict or "NO_TRADE"
-
-    if not has_primary_candidate:
-        return "NO_TRADE"
-
-    if current != "ACTIVE_NOW":
-        return current
-
-    if not market_context.get("is_open"):
-        return "PENDING"
-
-    if not time_day_gate.get("fresh_entry_allowed"):
-        return "PENDING"
-
-    return current
-
-
-def _normalize_engine_summary_for_session(
-    summary_payload: Dict[str, Any],
-    market_context: Dict[str, Any],
-    time_day_gate: Dict[str, Any],
-) -> Dict[str, Any]:
-    normalized = {**summary_payload}
-    original_summaries = summary_payload.get("ticker_summaries", [])
-    normalized_summaries: List[Dict[str, Any]] = []
-
-    for summary in original_summaries:
-        updated = {**summary}
-        updated["verdict"] = _normalize_engine_verdict_for_session(
-            verdict=summary.get("verdict"),
-            has_primary_candidate=bool(summary.get("primary_candidate")),
-            market_context=market_context,
-            time_day_gate=time_day_gate,
-        )
-        normalized_summaries.append(updated)
-
-    normalized["ticker_summaries"] = normalized_summaries
-
-    best_ticker = normalized.get("best_ticker")
-    best_summary = next(
-        (summary for summary in normalized_summaries if summary.get("symbol") == best_ticker),
-        None,
-    )
-
-    if best_summary:
-        normalized["verdict"] = best_summary.get("verdict", "NO_TRADE")
-        normalized["reason"] = best_summary.get("reason", normalized.get("reason"))
-        normalized["selection_mode"] = best_summary.get("selection_mode", normalized.get("selection_mode", "none"))
-        normalized["primary_candidate"] = best_summary.get("primary_candidate")
-        normalized["backup_candidate"] = best_summary.get("backup_candidate")
-    else:
-        normalized["verdict"] = _normalize_engine_verdict_for_session(
-            verdict=summary_payload.get("verdict"),
-            has_primary_candidate=bool(summary_payload.get("primary_candidate")),
-            market_context=market_context,
-            time_day_gate=time_day_gate,
-        )
-
-    return normalized
 
 
 async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
@@ -2242,143 +1094,6 @@ def _candles_by_day_et(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             grouped[day_key]["close"] = candle["close"]
 
     return [grouped[day] for day in ordered_days]
-
-def _calc_adx(candles: List[Dict[str, Any]], length: int = 14) -> Dict[str, Any]:
-    """
-    Wilder-style 1H ADX. Secondary only.
-    Returns a compact block suitable for doctrine display without overriding
-    primary SAFE-FAST blockers like room, trigger, wall placement, risk, or extension.
-    """
-    if not candles or length <= 0:
-        return {
-            "adx_value_1h": None,
-            "plus_di_1h": None,
-            "minus_di_1h": None,
-            "adx_trend": "unconfirmed",
-            "chop_risk_from_adx": None,
-        }
-
-    valid: List[Dict[str, float]] = []
-    for candle in candles:
-        high = _to_float(candle.get("high"))
-        low = _to_float(candle.get("low"))
-        close = _to_float(candle.get("close"))
-        if high is None or low is None or close is None:
-            continue
-        valid.append({"high": high, "low": low, "close": close})
-
-    if len(valid) < (length * 2 + 2):
-        return {
-            "adx_value_1h": None,
-            "plus_di_1h": None,
-            "minus_di_1h": None,
-            "adx_trend": "unconfirmed",
-            "chop_risk_from_adx": None,
-        }
-
-    trs: List[float] = []
-    plus_dm_values: List[float] = []
-    minus_dm_values: List[float] = []
-
-    for i in range(1, len(valid)):
-        current = valid[i]
-        prev = valid[i - 1]
-
-        up_move = current["high"] - prev["high"]
-        down_move = prev["low"] - current["low"]
-
-        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
-        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
-
-        tr = max(
-            current["high"] - current["low"],
-            abs(current["high"] - prev["close"]),
-            abs(current["low"] - prev["close"]),
-        )
-
-        trs.append(tr)
-        plus_dm_values.append(plus_dm)
-        minus_dm_values.append(minus_dm)
-
-    if len(trs) < (length + 1):
-        return {
-            "adx_value_1h": None,
-            "plus_di_1h": None,
-            "minus_di_1h": None,
-            "adx_trend": "unconfirmed",
-            "chop_risk_from_adx": None,
-        }
-
-    tr14 = sum(trs[:length])
-    plus_dm14 = sum(plus_dm_values[:length])
-    minus_dm14 = sum(minus_dm_values[:length])
-
-    dx_values: List[float] = []
-    plus_di = minus_di = None
-
-    for i in range(length, len(trs)):
-        if i > length:
-            tr14 = tr14 - (tr14 / length) + trs[i]
-            plus_dm14 = plus_dm14 - (plus_dm14 / length) + plus_dm_values[i]
-            minus_dm14 = minus_dm14 - (minus_dm14 / length) + minus_dm_values[i]
-
-        if tr14 <= 0:
-            plus_di = 0.0
-            minus_di = 0.0
-            dx = 0.0
-        else:
-            plus_di = 100.0 * (plus_dm14 / tr14)
-            minus_di = 100.0 * (minus_dm14 / tr14)
-            denom = plus_di + minus_di
-            dx = 0.0 if denom <= 0 else 100.0 * abs(plus_di - minus_di) / denom
-
-        dx_values.append(dx)
-
-    if not dx_values:
-        return {
-            "adx_value_1h": None,
-            "plus_di_1h": round(plus_di, 3) if plus_di is not None else None,
-            "minus_di_1h": round(minus_di, 3) if minus_di is not None else None,
-            "adx_trend": "unconfirmed",
-            "chop_risk_from_adx": None,
-        }
-
-    if len(dx_values) < length:
-        adx_series = [sum(dx_values) / len(dx_values)]
-    else:
-        first_adx = sum(dx_values[:length]) / length
-        adx_series = [first_adx]
-        for dx in dx_values[length:]:
-            adx_series.append(((adx_series[-1] * (length - 1)) + dx) / length)
-
-    adx_value = adx_series[-1] if adx_series else None
-    adx_prev = adx_series[-2] if len(adx_series) >= 2 else None
-
-    if adx_value is None:
-        adx_trend = "unconfirmed"
-    elif adx_prev is None:
-        adx_trend = "flat"
-    else:
-        delta = adx_value - adx_prev
-        if delta > 0.25:
-            adx_trend = "rising"
-        elif delta < -0.25:
-            adx_trend = "falling"
-        else:
-            adx_trend = "flat"
-
-    chop_risk_from_adx = None
-    if adx_value is not None:
-        chop_risk_from_adx = bool(adx_value < 18 or adx_trend in {"flat", "falling"})
-
-    return {
-        "adx_value_1h": round(adx_value, 3) if adx_value is not None else None,
-        "plus_di_1h": round(plus_di, 3) if plus_di is not None else None,
-        "minus_di_1h": round(minus_di, 3) if minus_di is not None else None,
-        "adx_trend": adx_trend,
-        "chop_risk_from_adx": chop_risk_from_adx,
-    }
-
 
 
 def _condense_levels(levels: List[float], tolerance: float, descending: bool = False) -> List[float]:
@@ -2643,7 +1358,6 @@ def _build_structure_context(
     )
 
     atr14 = _calc_atr(candles, 14)
-    adx_ctx = _calc_adx(candles, 14)
     atr_multiple_from_ema = None
     if atr14 not in (None, 0) and invalidation_distance is not None:
         atr_multiple_from_ema = round(invalidation_distance / atr14, 3)
@@ -2760,11 +1474,6 @@ def _build_structure_context(
         "trend_label": setup_ctx.get("trend_label"),
         "allowed_setup": setup_ctx.get("allowed_setup"),
         "chop_risk": _is_chop(candles),
-        "adx_value_1h": adx_ctx.get("adx_value_1h"),
-        "plus_di_1h": adx_ctx.get("plus_di_1h"),
-        "minus_di_1h": adx_ctx.get("minus_di_1h"),
-        "adx_trend": adx_ctx.get("adx_trend"),
-        "chop_risk_from_adx": adx_ctx.get("chop_risk_from_adx"),
     }
 
 
@@ -2828,19 +1537,13 @@ def _build_chart_confirmation_block(
 ) -> Dict[str, Any]:
     one_hour_confirmed = bool(chart_check and chart_check.get("ok"))
     structure_confirmed = bool(structure_context.get("ok"))
-    confirmed = bool(one_hour_confirmed and structure_confirmed and not chart_check_error)
-
-    if confirmed:
-        message = "Chart confirmation available from this run."
-    elif chart_check_error:
-        message = "Candidate engine result only - chart confirmation still required. Chart check failed in this run."
-    elif one_hour_confirmed and not structure_confirmed:
-        message = "Candidate engine result only - structure confirmation still required."
-    else:
-        message = "Candidate engine result only - chart confirmation still required."
-
+    message = (
+        "Candidate engine result only - chart confirmation still required. Chart check failed in this run."
+        if chart_check_error
+        else "Candidate engine result only - chart confirmation still required."
+    )
     return {
-        "confirmed": confirmed,
+        "confirmed": False,
         "message": message,
         "fields": {
             "one_hour_50_ema": _status_field(chart_check.get("ema50_1h") if chart_check else None, one_hour_confirmed),
@@ -3323,18 +2026,6 @@ def _screened_other_candidates(screened: List[Dict[str, Any]], best_ticker: Opti
         )
     return out
 
-
-def _select_screened_best_candidate(screened_candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not screened_candidates:
-        return None
-
-    with_primary = [item for item in screened_candidates if item.get("primary_candidate")]
-    if with_primary:
-        return with_primary[0]
-
-    return screened_candidates[0]
-
-
 def _build_simple_output_block(
     user_facing: Dict[str, Any],
     trigger_state: Dict[str, Any],
@@ -3479,7 +2170,6 @@ async def _screen_ticker_candidate(
 
 def _build_candidate_context(
     best_ticker: Optional[str],
-    option_type: str,
     selected_summary: Optional[Dict[str, Any]],
     primary_candidate: Optional[Dict[str, Any]],
     backup_candidate: Optional[Dict[str, Any]],
@@ -3494,84 +2184,14 @@ def _build_candidate_context(
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     macro_context: Dict[str, Any],
-    iv_context: Dict[str, Any],
-    liquidity_context: Dict[str, Any],
-    request: OnDemandRequest,
 ) -> Dict[str, Any]:
     active = bool(best_ticker and primary_candidate)
 
     options_block = None
     levels_block = None
     targets_block = None
-    primary_entry_zone = None
-    backup_entry_zone = None
-    trigger_candle = None
-    current_bar_behavior = None
-    setup_route = None
-    room_wall = None
-    extension_quality = None
-    execution_quality = None
-    event_gate = None
-    options_structure = None
-    wall_thesis_fit = None
-    adx_filter = None
-    trigger_scan = None
 
     if active:
-        entry_zones = _derive_entry_zones(
-            option_type=option_type,
-            chart_check=chart_check,
-            structure_context=structure_context,
-            trigger_state=trigger_state,
-        )
-        trigger_detail = _build_trigger_detail_context(
-            option_type=option_type,
-            chart_check=chart_check,
-            trigger_state=trigger_state,
-        )
-        setup_route = _build_setup_route_context(
-            option_type=option_type,
-            structure_context=structure_context,
-            trigger_state=trigger_state,
-            chart_check=chart_check,
-        )
-        room_wall = _build_room_wall_context(structure_context)
-        extension_quality = _build_extension_quality_context(structure_context)
-        execution_quality = _build_execution_quality_context(
-            market_context=market_context,
-            time_day_gate=time_day_gate,
-            macro_context=macro_context,
-            iv_context=iv_context,
-            liquidity_context=liquidity_context,
-        )
-        event_gate = _build_event_gate_context(
-            macro_context=macro_context,
-            market_context=market_context,
-            time_day_gate=time_day_gate,
-        )
-        options_structure = _build_options_structure_context(
-            request=request,
-            selected_summary=selected_summary,
-            primary_candidate=primary_candidate,
-            liquidity_context=liquidity_context,
-        )
-        wall_thesis_fit = _build_wall_thesis_fit_context(
-            option_type=option_type,
-            structure_context=structure_context,
-            primary_candidate=primary_candidate,
-        )
-        adx_filter = _build_adx_filter_context(structure_context)
-        trigger_scan = _build_trigger_scan_context(
-            option_type=option_type,
-            chart_check=chart_check,
-            trigger_state=trigger_state,
-            market_context=market_context,
-            time_day_gate=time_day_gate,
-        )
-        primary_entry_zone = entry_zones.get("primary_entry_zone")
-        backup_entry_zone = entry_zones.get("backup_entry_zone")
-        trigger_candle = trigger_detail.get("trigger_candle")
-        current_bar_behavior = trigger_detail.get("current_bar_behavior")
         options_block = {
             "expiration_date": selected_summary.get("expiration_date") if selected_summary else None,
             "days_to_expiration": selected_summary.get("days_to_expiration") if selected_summary else None,
@@ -3620,19 +2240,6 @@ def _build_candidate_context(
         "trigger_state": trigger_state.get("why") if active else None,
         "trigger_style": trigger_state.get("trigger_style") if active else None,
         "trigger_level": trigger_state.get("trigger_level") if active else None,
-        "trigger_candle": trigger_candle if active else None,
-        "current_bar_behavior": current_bar_behavior if active else None,
-        "setup_route": setup_route if active else None,
-        "room_wall": room_wall if active else None,
-        "extension_quality": extension_quality if active else None,
-        "execution_quality": execution_quality if active else None,
-        "event_gate": event_gate if active else None,
-        "options_structure": options_structure if active else None,
-        "wall_thesis_fit": wall_thesis_fit if active else None,
-        "adx_filter": adx_filter if active else None,
-        "trigger_scan": trigger_scan if active else None,
-        "primary_entry_zone": primary_entry_zone if active else None,
-        "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
         "levels": levels_block,
         "targets": targets_block,
@@ -3656,7 +2263,6 @@ def _build_candidate_context(
             if active else None
         ),
     }
-
 
 
 def _build_two_path_block(
@@ -3813,11 +2419,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         allow_fallback=request.allow_fallback,
         token=token,
     )
-    summary_payload = _normalize_engine_summary_for_session(
-        summary_payload=summary_payload,
-        market_context=market_context,
-        time_day_gate=time_day_gate,
-    )
 
     screened_candidates = list(
         await asyncio.gather(
@@ -3838,10 +2439,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     )
 
     screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
-    selected = _select_screened_best_candidate(screened_candidates)
+    selected = screened_candidates[0] if screened_candidates else None
 
-    best_ticker = selected.get("symbol") if selected and selected.get("primary_candidate") else summary_payload.get("best_ticker")
-    engine_status = summary_payload.get("verdict", "NO_TRADE")
+    best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
+    engine_status = selected.get("engine_verdict", "NO_TRADE") if selected else summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
     primary_candidate = selected.get("primary_candidate") if selected else summary_payload.get("primary_candidate")
     chart_check = selected.get("chart_check") if selected else None
@@ -3921,15 +2522,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         iv_context=iv_context,
     )
 
-    raw_engine_winner_ticker = summary_payload.get("best_ticker")
-    raw_engine_winner_status = summary_payload.get("verdict")
-    screened_live_winner_ticker = best_ticker
-    screened_live_winner_final_verdict = final_verdict
-    changed_after_screening = raw_engine_winner_ticker != screened_live_winner_ticker
-    why_changed_after_screening = (
-        selected_reason if changed_after_screening else None
-    )
-
     return {
         "ok": True,
         "mode": "on_demand",
@@ -3941,42 +2533,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
         "engine_best_ticker": summary_payload.get("best_ticker"),
-        "winner_context": {
-            "raw_engine_winner_ticker": raw_engine_winner_ticker,
-            "raw_engine_winner_status": raw_engine_winner_status,
-            "screened_live_winner_ticker": screened_live_winner_ticker,
-            "screened_live_winner_final_verdict": screened_live_winner_final_verdict,
-            "changed_after_screening": changed_after_screening,
-            "why_changed_after_screening": why_changed_after_screening,
-        },
-        "live_map": _build_live_map_block(
-            ticker=best_ticker,
-            option_type=clean_option_type,
-            primary_entry_zone=_derive_entry_zones(
-                option_type=clean_option_type,
-                chart_check=chart_check,
-                structure_context=structure_context,
-                trigger_state=trigger_state,
-            ).get("primary_entry_zone") if best_ticker and primary_candidate else None,
-            backup_entry_zone=_derive_entry_zones(
-                option_type=clean_option_type,
-                chart_check=chart_check,
-                structure_context=structure_context,
-                trigger_state=trigger_state,
-            ).get("backup_entry_zone") if best_ticker and primary_candidate else None,
-            trigger_state=trigger_state,
-            chart_check=chart_check,
-            structure_context=structure_context,
-            invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
-            market_context=market_context,
-            time_day_gate=time_day_gate,
-            macro_context=macro_context,
-            iv_context=iv_context,
-            liquidity_context=liquidity_context,
-            selected_summary=selected.get("summary") if selected else None,
-            primary_candidate=primary_candidate,
-            request=request,
-        ),
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
@@ -3989,7 +2545,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
-        "adx_context": _build_adx_filter_context(structure_context),
         "time_day_gate": time_day_gate,
         "iv_context": iv_context,
         "python_validation": python_validation_block,
@@ -4020,7 +2575,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "user_facing": user_facing_block,
         "candidate_context": _build_candidate_context(
             best_ticker=best_ticker,
-            option_type=clean_option_type,
             selected_summary=selected.get("summary") if selected else None,
             primary_candidate=primary_candidate,
             backup_candidate=selected.get("backup_candidate") if selected else summary_payload.get("backup_candidate"),
@@ -4035,9 +2589,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             market_context=market_context,
             time_day_gate=time_day_gate,
             macro_context=macro_context,
-            iv_context=iv_context,
-            liquidity_context=liquidity_context,
-            request=request,
         ),
         "two_path": two_path_block,
     }
