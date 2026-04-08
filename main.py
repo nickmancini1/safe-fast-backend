@@ -14,10 +14,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.3")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.4")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.3"
+USER_AGENT = "safe-fast-backend/1.8.4"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -308,6 +308,237 @@ def _build_trigger_detail_context(
     return {
         "trigger_candle": trigger_candle,
         "current_bar_behavior": current_bar_behavior,
+    }
+
+
+
+def _summarize_trigger_scan_candle(
+    candle: Optional[Dict[str, Any]],
+    ema50_1h: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    if not candle:
+        return None
+    return {
+        "time_iso": candle.get("time_iso"),
+        "open": _round_or_none(_to_float(candle.get("open")), 4),
+        "high": _round_or_none(_to_float(candle.get("high")), 4),
+        "low": _round_or_none(_to_float(candle.get("low")), 4),
+        "close": _round_or_none(_to_float(candle.get("close")), 4),
+        "relation_to_ema50_1h": _relation_to_ema(candle, ema50_1h),
+    }
+
+
+def _evaluate_trigger_scan_candle(
+    option_type: str,
+    candle: Optional[Dict[str, Any]],
+    reference_candles: List[Dict[str, Any]],
+    ema50_1h: Optional[float],
+    structure_ready: Optional[bool],
+    market_open: bool,
+    fresh_entry_allowed: bool,
+    gate_reason: Optional[str],
+) -> Dict[str, Any]:
+    if not candle:
+        return {
+            "status": "unconfirmed",
+            "why": "candle_unavailable",
+        }
+
+    if len(reference_candles) < 3:
+        return {
+            "time_iso": candle.get("time_iso"),
+            "open": _round_or_none(_to_float(candle.get("open")), 4),
+            "high": _round_or_none(_to_float(candle.get("high")), 4),
+            "low": _round_or_none(_to_float(candle.get("low")), 4),
+            "close": _round_or_none(_to_float(candle.get("close")), 4),
+            "reference_window_size": len(reference_candles),
+            "reference_trigger_level": None,
+            "relation_to_trigger_level": None,
+            "relation_to_ema50_1h": _relation_to_ema(candle, ema50_1h),
+            "raw_cross_pass": False,
+            "ema_side_pass": False,
+            "raw_chart_trigger_pass": False,
+            "structure_ready": structure_ready,
+            "gated_trigger_pass": False,
+            "status": "unconfirmed",
+            "why": "insufficient_reference_candles",
+        }
+
+    close_value = _to_float(candle.get("close"))
+    if option_type == "C":
+        trigger_level = max((_to_float(ref.get("high")) for ref in reference_candles if _to_float(ref.get("high")) is not None), default=None)
+        raw_cross_pass = bool(trigger_level is not None and close_value is not None and close_value > trigger_level)
+        relation_to_trigger = (
+            "above" if trigger_level is not None and close_value is not None and close_value > trigger_level
+            else "below" if trigger_level is not None and close_value is not None and close_value < trigger_level
+            else "at" if trigger_level is not None and close_value is not None
+            else None
+        )
+        ema_side_pass = bool(close_value is not None and ema50_1h is not None and close_value > ema50_1h)
+    else:
+        trigger_level = min((_to_float(ref.get("low")) for ref in reference_candles if _to_float(ref.get("low")) is not None), default=None)
+        raw_cross_pass = bool(trigger_level is not None and close_value is not None and close_value < trigger_level)
+        relation_to_trigger = (
+            "below" if trigger_level is not None and close_value is not None and close_value < trigger_level
+            else "above" if trigger_level is not None and close_value is not None and close_value > trigger_level
+            else "at" if trigger_level is not None and close_value is not None
+            else None
+        )
+        ema_side_pass = bool(close_value is not None and ema50_1h is not None and close_value < ema50_1h)
+
+    raw_chart_trigger_pass = bool(raw_cross_pass and ema_side_pass)
+    gated_trigger_pass = bool(
+        raw_chart_trigger_pass
+        and structure_ready is True
+        and market_open
+        and fresh_entry_allowed
+    )
+
+    if gated_trigger_pass:
+        status = "pass"
+        why = "Trigger conditions pass on this candle."
+    elif not market_open:
+        status = "fail"
+        why = "market_closed"
+    elif not fresh_entry_allowed:
+        status = "fail"
+        why = gate_reason or "time_day_gate_blocked"
+    elif structure_ready is False:
+        status = "fail"
+        why = "structure_not_ready"
+    elif not ema_side_pass:
+        status = "fail"
+        why = "wrong_side_of_ema"
+    elif not raw_cross_pass:
+        status = "fail"
+        why = "close_trigger_not_hit"
+    else:
+        status = "unconfirmed"
+        why = "trigger_unconfirmed"
+
+    return {
+        "time_iso": candle.get("time_iso"),
+        "open": _round_or_none(_to_float(candle.get("open")), 4),
+        "high": _round_or_none(_to_float(candle.get("high")), 4),
+        "low": _round_or_none(_to_float(candle.get("low")), 4),
+        "close": _round_or_none(close_value, 4),
+        "reference_window_size": len(reference_candles),
+        "reference_trigger_level": _round_or_none(trigger_level, 4),
+        "relation_to_trigger_level": relation_to_trigger,
+        "relation_to_ema50_1h": _relation_to_ema(candle, ema50_1h),
+        "raw_cross_pass": raw_cross_pass,
+        "ema_side_pass": ema_side_pass,
+        "raw_chart_trigger_pass": raw_chart_trigger_pass,
+        "structure_ready": structure_ready,
+        "gated_trigger_pass": gated_trigger_pass,
+        "status": status,
+        "why": why,
+    }
+
+
+def _build_trigger_scan_context(
+    option_type: str,
+    chart_check: Optional[Dict[str, Any]],
+    trigger_state: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "scan_basis": "current_bar_plus_last_3_completed_1h_candles",
+            "required_completed_candle_count": 3,
+            "trigger_style": trigger_state.get("trigger_style"),
+            "market_open": market_context.get("is_open"),
+            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+            "current_bar": {
+                "status": "unconfirmed",
+                "why": "chart_unavailable",
+            },
+            "most_recent_completed_candle": {
+                "status": "unconfirmed",
+                "why": "chart_unavailable",
+            },
+            "current_bar_reference_candles": [],
+            "completed_candle_reference_candles": [],
+            "trigger_scan_status": "unconfirmed",
+            "why_trigger_scan_passes_or_fails": "Trigger scan is unconfirmed because chart data is unavailable.",
+        }
+
+    recent = chart_check.get("recent_candles") or []
+    ema50_1h = _to_float(chart_check.get("ema50_1h"))
+    market_open = bool(market_context.get("is_open"))
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
+    gate_reason = trigger_state.get("why")
+    structure_ready = trigger_state.get("structure_ready")
+
+    current_bar = recent[-1] if recent else None
+    most_recent_completed = recent[-2] if len(recent) >= 2 else None
+    current_bar_refs = recent[-4:-1] if len(recent) >= 4 else recent[:-1]
+    completed_refs = recent[-5:-2] if len(recent) >= 5 else recent[:-2]
+
+    current_bar_eval = _evaluate_trigger_scan_candle(
+        option_type=option_type,
+        candle=current_bar,
+        reference_candles=current_bar_refs,
+        ema50_1h=ema50_1h,
+        structure_ready=structure_ready,
+        market_open=market_open,
+        fresh_entry_allowed=fresh_entry_allowed,
+        gate_reason=gate_reason,
+    )
+    completed_eval = _evaluate_trigger_scan_candle(
+        option_type=option_type,
+        candle=most_recent_completed,
+        reference_candles=completed_refs,
+        ema50_1h=ema50_1h,
+        structure_ready=structure_ready,
+        market_open=market_open,
+        fresh_entry_allowed=fresh_entry_allowed,
+        gate_reason=gate_reason,
+    )
+
+    if current_bar_eval.get("gated_trigger_pass"):
+        trigger_scan_status = "pass_current_bar"
+        why = "SAFE-FAST trigger conditions pass on the current 1H bar."
+    elif completed_eval.get("gated_trigger_pass"):
+        trigger_scan_status = "pass_most_recent_completed_candle"
+        why = "SAFE-FAST trigger conditions passed on the most recent completed 1H candle."
+    elif not market_open:
+        trigger_scan_status = "fail"
+        why = "Market is closed, so trigger scan cannot produce a live entry."
+    elif not fresh_entry_allowed:
+        trigger_scan_status = "fail"
+        why = gate_reason or "Fresh entry is outside the SAFE-FAST time/day window."
+    elif structure_ready is False:
+        trigger_scan_status = "fail"
+        why = "Structure is not ready for a SAFE-FAST trigger."
+    elif current_bar_eval.get("raw_chart_trigger_pass") or completed_eval.get("raw_chart_trigger_pass"):
+        trigger_scan_status = "fail"
+        why = "A raw chart trigger appeared, but SAFE-FAST gating still blocks it."
+    elif current_bar_eval.get("status") == "unconfirmed" and completed_eval.get("status") == "unconfirmed":
+        trigger_scan_status = "unconfirmed"
+        why = "Trigger scan is still unconfirmed from the available candles."
+    else:
+        trigger_scan_status = "fail"
+        why = "No SAFE-FAST trigger condition is currently satisfied."
+
+    return {
+        "scan_basis": "current_bar_plus_last_3_completed_1h_candles",
+        "required_completed_candle_count": 3,
+        "trigger_style": trigger_state.get("trigger_style"),
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "structure_ready": structure_ready,
+        "current_bar": current_bar_eval,
+        "most_recent_completed_candle": completed_eval,
+        "current_bar_reference_candles": [
+            _summarize_trigger_scan_candle(candle, ema50_1h) for candle in current_bar_refs
+        ],
+        "completed_candle_reference_candles": [
+            _summarize_trigger_scan_candle(candle, ema50_1h) for candle in completed_refs
+        ],
+        "trigger_scan_status": trigger_scan_status,
+        "why_trigger_scan_passes_or_fails": why,
     }
 
 
@@ -857,6 +1088,13 @@ def _build_live_map_block(
         primary_candidate=primary_candidate,
     )
     adx_filter = _build_adx_filter_context(structure_context)
+    trigger_scan = _build_trigger_scan_context(
+        option_type=option_type,
+        chart_check=chart_check,
+        trigger_state=trigger_state,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+    )
     return {
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
@@ -874,6 +1112,7 @@ def _build_live_map_block(
         "options_structure": options_structure,
         "wall_thesis_fit": wall_thesis_fit,
         "adx_filter": adx_filter,
+        "trigger_scan": trigger_scan,
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
@@ -3276,6 +3515,7 @@ def _build_candidate_context(
     options_structure = None
     wall_thesis_fit = None
     adx_filter = None
+    trigger_scan = None
 
     if active:
         entry_zones = _derive_entry_zones(
@@ -3321,6 +3561,13 @@ def _build_candidate_context(
             primary_candidate=primary_candidate,
         )
         adx_filter = _build_adx_filter_context(structure_context)
+        trigger_scan = _build_trigger_scan_context(
+            option_type=option_type,
+            chart_check=chart_check,
+            trigger_state=trigger_state,
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+        )
         primary_entry_zone = entry_zones.get("primary_entry_zone")
         backup_entry_zone = entry_zones.get("backup_entry_zone")
         trigger_candle = trigger_detail.get("trigger_candle")
@@ -3383,6 +3630,7 @@ def _build_candidate_context(
         "options_structure": options_structure if active else None,
         "wall_thesis_fit": wall_thesis_fit if active else None,
         "adx_filter": adx_filter if active else None,
+        "trigger_scan": trigger_scan if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
