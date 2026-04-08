@@ -670,6 +670,42 @@ def _build_wall_thesis_fit_context(
         "why_wall_thesis_fit_passes_or_fails": why,
     }
 
+
+
+def _build_adx_filter_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
+    adx_value = _to_float(structure_context.get("adx_value_1h"))
+    adx_trend = structure_context.get("adx_trend")
+    chop_risk_from_adx = structure_context.get("chop_risk_from_adx")
+
+    adx_override_blocked_by: List[str] = [
+        "price",
+        "room",
+        "late_move",
+        "wall_placement",
+        "risk",
+        "trigger_rules",
+    ]
+
+    if adx_value is None:
+        status = "unconfirmed"
+        why = "ADX is not available from the current candle set, so the secondary ADX filter remains unconfirmed."
+    elif chop_risk_from_adx is True:
+        status = "caution"
+        why = "ADX is secondary only. Current ADX implies chop risk, but it does not override primary SAFE-FAST blockers."
+    else:
+        status = "pass"
+        why = "ADX does not currently add extra chop risk, but it remains secondary to primary SAFE-FAST rules."
+
+    return {
+        "adx_value_1h": adx_value,
+        "adx_trend": adx_trend,
+        "chop_risk_from_adx": chop_risk_from_adx,
+        "adx_override_blocked_by": adx_override_blocked_by,
+        "adx_filter_status": status,
+        "why_adx_passes_or_fails": why,
+    }
+
+
 def _build_options_structure_context(
     request: OnDemandRequest,
     selected_summary: Optional[Dict[str, Any]],
@@ -820,6 +856,7 @@ def _build_live_map_block(
         structure_context=structure_context,
         primary_candidate=primary_candidate,
     )
+    adx_filter = _build_adx_filter_context(structure_context)
     return {
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
@@ -836,6 +873,7 @@ def _build_live_map_block(
         "event_gate": event_gate,
         "options_structure": options_structure,
         "wall_thesis_fit": wall_thesis_fit,
+        "adx_filter": adx_filter,
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
@@ -1966,6 +2004,143 @@ def _candles_by_day_et(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     return [grouped[day] for day in ordered_days]
 
+def _calc_adx(candles: List[Dict[str, Any]], length: int = 14) -> Dict[str, Any]:
+    """
+    Wilder-style 1H ADX. Secondary only.
+    Returns a compact block suitable for doctrine display without overriding
+    primary SAFE-FAST blockers like room, trigger, wall placement, risk, or extension.
+    """
+    if not candles or length <= 0:
+        return {
+            "adx_value_1h": None,
+            "plus_di_1h": None,
+            "minus_di_1h": None,
+            "adx_trend": "unconfirmed",
+            "chop_risk_from_adx": None,
+        }
+
+    valid: List[Dict[str, float]] = []
+    for candle in candles:
+        high = _to_float(candle.get("high"))
+        low = _to_float(candle.get("low"))
+        close = _to_float(candle.get("close"))
+        if high is None or low is None or close is None:
+            continue
+        valid.append({"high": high, "low": low, "close": close})
+
+    if len(valid) < (length * 2 + 2):
+        return {
+            "adx_value_1h": None,
+            "plus_di_1h": None,
+            "minus_di_1h": None,
+            "adx_trend": "unconfirmed",
+            "chop_risk_from_adx": None,
+        }
+
+    trs: List[float] = []
+    plus_dm_values: List[float] = []
+    minus_dm_values: List[float] = []
+
+    for i in range(1, len(valid)):
+        current = valid[i]
+        prev = valid[i - 1]
+
+        up_move = current["high"] - prev["high"]
+        down_move = prev["low"] - current["low"]
+
+        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+        tr = max(
+            current["high"] - current["low"],
+            abs(current["high"] - prev["close"]),
+            abs(current["low"] - prev["close"]),
+        )
+
+        trs.append(tr)
+        plus_dm_values.append(plus_dm)
+        minus_dm_values.append(minus_dm)
+
+    if len(trs) < (length + 1):
+        return {
+            "adx_value_1h": None,
+            "plus_di_1h": None,
+            "minus_di_1h": None,
+            "adx_trend": "unconfirmed",
+            "chop_risk_from_adx": None,
+        }
+
+    tr14 = sum(trs[:length])
+    plus_dm14 = sum(plus_dm_values[:length])
+    minus_dm14 = sum(minus_dm_values[:length])
+
+    dx_values: List[float] = []
+    plus_di = minus_di = None
+
+    for i in range(length, len(trs)):
+        if i > length:
+            tr14 = tr14 - (tr14 / length) + trs[i]
+            plus_dm14 = plus_dm14 - (plus_dm14 / length) + plus_dm_values[i]
+            minus_dm14 = minus_dm14 - (minus_dm14 / length) + minus_dm_values[i]
+
+        if tr14 <= 0:
+            plus_di = 0.0
+            minus_di = 0.0
+            dx = 0.0
+        else:
+            plus_di = 100.0 * (plus_dm14 / tr14)
+            minus_di = 100.0 * (minus_dm14 / tr14)
+            denom = plus_di + minus_di
+            dx = 0.0 if denom <= 0 else 100.0 * abs(plus_di - minus_di) / denom
+
+        dx_values.append(dx)
+
+    if not dx_values:
+        return {
+            "adx_value_1h": None,
+            "plus_di_1h": round(plus_di, 3) if plus_di is not None else None,
+            "minus_di_1h": round(minus_di, 3) if minus_di is not None else None,
+            "adx_trend": "unconfirmed",
+            "chop_risk_from_adx": None,
+        }
+
+    if len(dx_values) < length:
+        adx_series = [sum(dx_values) / len(dx_values)]
+    else:
+        first_adx = sum(dx_values[:length]) / length
+        adx_series = [first_adx]
+        for dx in dx_values[length:]:
+            adx_series.append(((adx_series[-1] * (length - 1)) + dx) / length)
+
+    adx_value = adx_series[-1] if adx_series else None
+    adx_prev = adx_series[-2] if len(adx_series) >= 2 else None
+
+    if adx_value is None:
+        adx_trend = "unconfirmed"
+    elif adx_prev is None:
+        adx_trend = "flat"
+    else:
+        delta = adx_value - adx_prev
+        if delta > 0.25:
+            adx_trend = "rising"
+        elif delta < -0.25:
+            adx_trend = "falling"
+        else:
+            adx_trend = "flat"
+
+    chop_risk_from_adx = None
+    if adx_value is not None:
+        chop_risk_from_adx = bool(adx_value < 18 or adx_trend in {"flat", "falling"})
+
+    return {
+        "adx_value_1h": round(adx_value, 3) if adx_value is not None else None,
+        "plus_di_1h": round(plus_di, 3) if plus_di is not None else None,
+        "minus_di_1h": round(minus_di, 3) if minus_di is not None else None,
+        "adx_trend": adx_trend,
+        "chop_risk_from_adx": chop_risk_from_adx,
+    }
+
+
 
 def _condense_levels(levels: List[float], tolerance: float, descending: bool = False) -> List[float]:
     ordered = sorted(levels, reverse=descending)
@@ -2229,6 +2404,7 @@ def _build_structure_context(
     )
 
     atr14 = _calc_atr(candles, 14)
+    adx_ctx = _calc_adx(candles, 14)
     atr_multiple_from_ema = None
     if atr14 not in (None, 0) and invalidation_distance is not None:
         atr_multiple_from_ema = round(invalidation_distance / atr14, 3)
@@ -2345,6 +2521,11 @@ def _build_structure_context(
         "trend_label": setup_ctx.get("trend_label"),
         "allowed_setup": setup_ctx.get("allowed_setup"),
         "chop_risk": _is_chop(candles),
+        "adx_value_1h": adx_ctx.get("adx_value_1h"),
+        "plus_di_1h": adx_ctx.get("plus_di_1h"),
+        "minus_di_1h": adx_ctx.get("minus_di_1h"),
+        "adx_trend": adx_ctx.get("adx_trend"),
+        "chop_risk_from_adx": adx_ctx.get("chop_risk_from_adx"),
     }
 
 
@@ -3094,6 +3275,7 @@ def _build_candidate_context(
     event_gate = None
     options_structure = None
     wall_thesis_fit = None
+    adx_filter = None
 
     if active:
         entry_zones = _derive_entry_zones(
@@ -3138,6 +3320,7 @@ def _build_candidate_context(
             structure_context=structure_context,
             primary_candidate=primary_candidate,
         )
+        adx_filter = _build_adx_filter_context(structure_context)
         primary_entry_zone = entry_zones.get("primary_entry_zone")
         backup_entry_zone = entry_zones.get("backup_entry_zone")
         trigger_candle = trigger_detail.get("trigger_candle")
@@ -3199,6 +3382,7 @@ def _build_candidate_context(
         "event_gate": event_gate if active else None,
         "options_structure": options_structure if active else None,
         "wall_thesis_fit": wall_thesis_fit if active else None,
+        "adx_filter": adx_filter if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
@@ -3557,6 +3741,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
+        "adx_context": _build_adx_filter_context(structure_context),
         "time_day_gate": time_day_gate,
         "iv_context": iv_context,
         "python_validation": python_validation_block,
