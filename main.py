@@ -14,10 +14,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.2")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.3")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.2"
+USER_AGENT = "safe-fast-backend/1.8.3"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -547,6 +547,49 @@ def _build_execution_quality_context(
 
 
 
+
+def _build_event_gate_context(
+    macro_context: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> Dict[str, Any]:
+    market_open = bool(market_context.get("is_open"))
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
+    has_major_event_today = bool(macro_context.get("has_major_event_today"))
+    has_major_event_tomorrow = bool(macro_context.get("has_major_event_tomorrow"))
+    events = macro_context.get("events") or []
+    risk_level = macro_context.get("risk_level")
+    note = macro_context.get("note")
+
+    if not market_open:
+        event_gate_status = "unconfirmed"
+        why = "Market is closed, so the live event gate is not actionable right now."
+    elif has_major_event_today:
+        event_gate_status = "fail"
+        why = "A major macro event is in play today, so the SAFE-FAST event gate fails unless explicitly approved."
+    elif has_major_event_tomorrow:
+        event_gate_status = "caution"
+        why = "A major macro event is tomorrow, so overnight hold risk needs extra caution."
+    elif not fresh_entry_allowed:
+        event_gate_status = "caution"
+        why = "No major macro event blocks the map, but the fresh-entry window is already closed."
+    else:
+        event_gate_status = "pass"
+        why = "No major macro event is blocking the SAFE-FAST event gate right now."
+
+    return {
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "has_major_event_today": has_major_event_today,
+        "has_major_event_tomorrow": has_major_event_tomorrow,
+        "events": events,
+        "risk_level": risk_level,
+        "event_gate_status": event_gate_status,
+        "why_event_gate_passes_or_fails": why,
+        "note": note,
+    }
+
+
 def _build_wall_thesis_fit_context(
     option_type: str,
     structure_context: Dict[str, Any],
@@ -761,6 +804,11 @@ def _build_live_map_block(
         iv_context=iv_context,
         liquidity_context=liquidity_context,
     )
+    event_gate = _build_event_gate_context(
+        macro_context=macro_context,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+    )
     options_structure = _build_options_structure_context(
         request=request,
         selected_summary=selected_summary,
@@ -785,6 +833,7 @@ def _build_live_map_block(
         "room_wall": room_wall,
         "extension_quality": extension_quality,
         "execution_quality": execution_quality,
+        "event_gate": event_gate,
         "options_structure": options_structure,
         "wall_thesis_fit": wall_thesis_fit,
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
@@ -3042,6 +3091,7 @@ def _build_candidate_context(
     room_wall = None
     extension_quality = None
     execution_quality = None
+    event_gate = None
     options_structure = None
     wall_thesis_fit = None
 
@@ -3071,6 +3121,11 @@ def _build_candidate_context(
             macro_context=macro_context,
             iv_context=iv_context,
             liquidity_context=liquidity_context,
+        )
+        event_gate = _build_event_gate_context(
+            macro_context=macro_context,
+            market_context=market_context,
+            time_day_gate=time_day_gate,
         )
         options_structure = _build_options_structure_context(
             request=request,
@@ -3141,6 +3196,7 @@ def _build_candidate_context(
         "room_wall": room_wall if active else None,
         "extension_quality": extension_quality if active else None,
         "execution_quality": execution_quality if active else None,
+        "event_gate": event_gate if active else None,
         "options_structure": options_structure if active else None,
         "wall_thesis_fit": wall_thesis_fit if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
