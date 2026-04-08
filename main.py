@@ -410,6 +410,44 @@ def _build_setup_route_context(
     }
 
 
+def _build_room_wall_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
+    room_pass = structure_context.get("room_pass")
+    wall_pass = structure_context.get("wall_pass")
+    wall_thesis = structure_context.get("wall_thesis")
+    extension_blocks_now = structure_context.get("extension_blocks_now")
+
+    if room_pass is False:
+        room_wall_status = "fail"
+        why = "Room to the first wall is too tight for SAFE-FAST."
+    elif wall_pass is False:
+        room_wall_status = "fail"
+        why = "Wall thesis does not support the current path."
+    elif room_pass is True and wall_pass is True:
+        room_wall_status = "pass"
+        if wall_thesis == "TO_THE_WALL":
+            why = "Room and wall context are aligned only up to the first wall."
+        else:
+            why = "Room and wall context are aligned for the current path."
+    else:
+        room_wall_status = "unconfirmed"
+        why = "Room/wall context is still unconfirmed from the available chart inputs."
+
+    return {
+        "first_wall": structure_context.get("first_wall"),
+        "next_pocket": structure_context.get("next_pocket"),
+        "room_to_first_wall": structure_context.get("room_to_first_wall"),
+        "room_ratio": structure_context.get("room_ratio"),
+        "next_pocket_room_ratio": structure_context.get("next_pocket_room_ratio"),
+        "room_pass": room_pass,
+        "wall_thesis": wall_thesis,
+        "wall_pass": wall_pass,
+        "extension_blocks_now": extension_blocks_now,
+        "room_wall_status": room_wall_status,
+        "why_room_or_wall_passes_or_fails": why,
+    }
+
+
+
 def _build_live_map_block(
     ticker: Optional[str],
     option_type: str,
@@ -433,6 +471,7 @@ def _build_live_map_block(
         trigger_state=trigger_state,
         chart_check=chart_check,
     )
+    room_wall = _build_room_wall_context(structure_context)
     return {
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
@@ -443,6 +482,7 @@ def _build_live_map_block(
         "trigger_candle": trigger_detail.get("trigger_candle"),
         "current_bar_behavior": trigger_detail.get("current_bar_behavior"),
         "setup_route": setup_route,
+        "room_wall": room_wall,
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
@@ -2692,6 +2732,7 @@ def _build_candidate_context(
     trigger_candle = None
     current_bar_behavior = None
     setup_route = None
+    room_wall = None
 
     if active:
         entry_zones = _derive_entry_zones(
@@ -2711,6 +2752,7 @@ def _build_candidate_context(
             trigger_state=trigger_state,
             chart_check=chart_check,
         )
+        room_wall = _build_room_wall_context(structure_context)
         primary_entry_zone = entry_zones.get("primary_entry_zone")
         backup_entry_zone = entry_zones.get("backup_entry_zone")
         trigger_candle = trigger_detail.get("trigger_candle")
@@ -2766,6 +2808,7 @@ def _build_candidate_context(
         "trigger_candle": trigger_candle if active else None,
         "current_bar_behavior": current_bar_behavior if active else None,
         "setup_route": setup_route if active else None,
+        "room_wall": room_wall if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
