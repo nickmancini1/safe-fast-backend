@@ -1057,6 +1057,73 @@ def _candidate_sort_reason_from_best(best_summary: Optional[Dict[str, Any]]) -> 
     }
 
 
+def _normalize_engine_verdict_for_session(
+    verdict: Optional[str],
+    has_primary_candidate: bool,
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> str:
+    current = verdict or "NO_TRADE"
+
+    if not has_primary_candidate:
+        return "NO_TRADE"
+
+    if current != "ACTIVE_NOW":
+        return current
+
+    if not market_context.get("is_open"):
+        return "PENDING"
+
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return "PENDING"
+
+    return current
+
+
+def _normalize_engine_summary_for_session(
+    summary_payload: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> Dict[str, Any]:
+    normalized = {**summary_payload}
+    original_summaries = summary_payload.get("ticker_summaries", [])
+    normalized_summaries: List[Dict[str, Any]] = []
+
+    for summary in original_summaries:
+        updated = {**summary}
+        updated["verdict"] = _normalize_engine_verdict_for_session(
+            verdict=summary.get("verdict"),
+            has_primary_candidate=bool(summary.get("primary_candidate")),
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+        )
+        normalized_summaries.append(updated)
+
+    normalized["ticker_summaries"] = normalized_summaries
+
+    best_ticker = normalized.get("best_ticker")
+    best_summary = next(
+        (summary for summary in normalized_summaries if summary.get("symbol") == best_ticker),
+        None,
+    )
+
+    if best_summary:
+        normalized["verdict"] = best_summary.get("verdict", "NO_TRADE")
+        normalized["reason"] = best_summary.get("reason", normalized.get("reason"))
+        normalized["selection_mode"] = best_summary.get("selection_mode", normalized.get("selection_mode", "none"))
+        normalized["primary_candidate"] = best_summary.get("primary_candidate")
+        normalized["backup_candidate"] = best_summary.get("backup_candidate")
+    else:
+        normalized["verdict"] = _normalize_engine_verdict_for_session(
+            verdict=summary_payload.get("verdict"),
+            has_primary_candidate=bool(summary_payload.get("primary_candidate")),
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+        )
+
+    return normalized
+
+
 async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
     snapshot = await get_1h_ema50_snapshot(
         symbol=symbol,
@@ -2496,6 +2563,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         hard_max_dollars=request.hard_max_dollars,
         allow_fallback=request.allow_fallback,
         token=token,
+    )
+    summary_payload = _normalize_engine_summary_for_session(
+        summary_payload=summary_payload,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
     )
 
     screened_candidates = list(
