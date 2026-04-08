@@ -493,6 +493,59 @@ def _build_extension_quality_context(structure_context: Dict[str, Any]) -> Dict[
 
 
 
+def _build_execution_quality_context(
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    market_open = bool(market_context.get("is_open"))
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
+    liquidity_pass = liquidity_context.get("liquidity_pass")
+    liquidity_status = liquidity_context.get("status")
+    iv_status = iv_context.get("status")
+    has_major_event_today = bool(macro_context.get("has_major_event_today"))
+    has_major_event_tomorrow = bool(macro_context.get("has_major_event_tomorrow"))
+    macro_risk_level = macro_context.get("risk_level")
+
+    if not market_open or not fresh_entry_allowed:
+        execution_quality_status = "fail"
+        why = "Fresh entries are not allowed right now."
+    elif liquidity_pass is False:
+        execution_quality_status = "fail"
+        why = liquidity_context.get("why") or "Liquidity is too weak for a clean SAFE-FAST entry."
+    elif has_major_event_today:
+        execution_quality_status = "caution"
+        why = "A major macro event is in play today, so execution quality needs extra caution."
+    elif has_major_event_tomorrow:
+        execution_quality_status = "caution"
+        why = "A major macro event is in play tomorrow, so execution quality needs extra caution."
+    elif iv_status == "unconfirmed":
+        execution_quality_status = "caution"
+        why = "IV is still unconfirmed in this build, even though time window and liquidity are acceptable."
+    elif liquidity_pass is True:
+        execution_quality_status = "pass"
+        why = "Time window and liquidity are acceptable for execution."
+    else:
+        execution_quality_status = "unconfirmed"
+        why = "Execution quality is still unconfirmed from the available inputs."
+
+    return {
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "macro_risk_level": macro_risk_level,
+        "has_major_event_today": has_major_event_today,
+        "has_major_event_tomorrow": has_major_event_tomorrow,
+        "iv_status": iv_status,
+        "liquidity_status": liquidity_status,
+        "liquidity_pass": liquidity_pass,
+        "execution_quality_status": execution_quality_status,
+        "why_execution_quality_passes_or_fails": why,
+    }
+
+
+
 def _build_live_map_block(
     ticker: Optional[str],
     option_type: str,
@@ -504,6 +557,9 @@ def _build_live_map_block(
     invalidation_level_1h_ema50: Optional[float],
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     trigger_detail = _build_trigger_detail_context(
         option_type=option_type,
@@ -518,6 +574,13 @@ def _build_live_map_block(
     )
     room_wall = _build_room_wall_context(structure_context)
     extension_quality = _build_extension_quality_context(structure_context)
+    execution_quality = _build_execution_quality_context(
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        macro_context=macro_context,
+        iv_context=iv_context,
+        liquidity_context=liquidity_context,
+    )
     return {
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
@@ -530,6 +593,7 @@ def _build_live_map_block(
         "setup_route": setup_route,
         "room_wall": room_wall,
         "extension_quality": extension_quality,
+        "execution_quality": execution_quality,
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
@@ -2768,6 +2832,8 @@ def _build_candidate_context(
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     macro_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     active = bool(best_ticker and primary_candidate)
 
@@ -2781,6 +2847,7 @@ def _build_candidate_context(
     setup_route = None
     room_wall = None
     extension_quality = None
+    execution_quality = None
 
     if active:
         entry_zones = _derive_entry_zones(
@@ -2802,6 +2869,13 @@ def _build_candidate_context(
         )
         room_wall = _build_room_wall_context(structure_context)
         extension_quality = _build_extension_quality_context(structure_context)
+        execution_quality = _build_execution_quality_context(
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+            macro_context=macro_context,
+            iv_context=iv_context,
+            liquidity_context=liquidity_context,
+        )
         primary_entry_zone = entry_zones.get("primary_entry_zone")
         backup_entry_zone = entry_zones.get("backup_entry_zone")
         trigger_candle = trigger_detail.get("trigger_candle")
@@ -2859,6 +2933,7 @@ def _build_candidate_context(
         "setup_route": setup_route if active else None,
         "room_wall": room_wall if active else None,
         "extension_quality": extension_quality if active else None,
+        "execution_quality": execution_quality if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
@@ -3198,6 +3273,9 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
             market_context=market_context,
             time_day_gate=time_day_gate,
+            macro_context=macro_context,
+            iv_context=iv_context,
+            liquidity_context=liquidity_context,
         ),
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
@@ -3256,6 +3334,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             market_context=market_context,
             time_day_gate=time_day_gate,
             macro_context=macro_context,
+            iv_context=iv_context,
+            liquidity_context=liquidity_context,
         ),
         "two_path": two_path_block,
     }
