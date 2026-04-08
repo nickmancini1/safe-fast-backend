@@ -326,6 +326,8 @@ def _build_setup_route_context(
     trigger_present = bool(trigger_state.get("trigger_present"))
     structure_ready = bool(trigger_state.get("structure_ready"))
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
+    allowed_setup_types = {"Ideal", "Clean Fast Break", "Continuation"}
+    route_type_allowed = intended_setup_type in allowed_setup_types
 
     if intended_setup_type == "Clean Fast Break":
         retest_quality = "breakout_path" if not chop_risk else "messy_breakout"
@@ -363,7 +365,13 @@ def _build_setup_route_context(
     else:
         next_bar_confirmation_required = None
 
-    if allowed_setup is True and room_pass is True and wall_pass is not False and extension_state != "extended":
+    if (
+        route_type_allowed
+        and allowed_setup is True
+        and room_pass is True
+        and wall_pass is not False
+        and extension_state != "extended"
+    ):
         if fast_entry_allowed:
             setup_route_status = "pass_fast_entry"
             why = "Clean Fast Break conditions are aligned and fast-entry is allowed."
@@ -373,7 +381,7 @@ def _build_setup_route_context(
         else:
             setup_route_status = "pass"
             why = "Setup route passes the current SAFE-FAST route checks."
-    elif allowed_setup is False:
+    elif route_type_allowed is False:
         setup_route_status = "fail"
         why = "Setup type is not one of the allowed SAFE-FAST routes."
     elif room_pass is False:
@@ -385,6 +393,9 @@ def _build_setup_route_context(
     elif extension_state == "extended":
         setup_route_status = "fail"
         why = "Setup route is too extended or too late versus the 1H 50 EMA."
+    elif allowed_setup is False:
+        setup_route_status = "fail"
+        why = "This is an allowed SAFE-FAST route class, but the current structure does not qualify it as a valid setup."
     else:
         setup_route_status = "unconfirmed"
         why = "Setup route is still unconfirmed from the available chart context."
