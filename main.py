@@ -545,6 +545,101 @@ def _build_execution_quality_context(
     }
 
 
+def _build_options_structure_context(
+    request: OnDemandRequest,
+    selected_summary: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+    liquidity_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    expiration_date = selected_summary.get("expiration_date") if selected_summary else None
+    days_to_expiration = selected_summary.get("days_to_expiration") if selected_summary else None
+    width = primary_candidate.get("width") if primary_candidate else None
+    est_debit = primary_candidate.get("est_debit") if primary_candidate else None
+    max_loss = primary_candidate.get("max_loss_dollars_1lot") if primary_candidate else None
+    max_profit = primary_candidate.get("max_profit_dollars_1lot") if primary_candidate else None
+    risk_reward = primary_candidate.get("risk_reward") if primary_candidate else None
+    feasibility_pass = primary_candidate.get("feasibility_pass") if primary_candidate else None
+    fits_risk_budget = primary_candidate.get("fits_risk_budget") if primary_candidate else None
+    liquidity_pass = liquidity_context.get("liquidity_pass")
+    liquidity_status = liquidity_context.get("status")
+
+    dte_rule_pass = None
+    if isinstance(days_to_expiration, (int, float)):
+        dte_rule_pass = request.min_dte <= float(days_to_expiration) <= request.max_dte
+
+    width_rule_pass = None
+    if isinstance(width, (int, float)):
+        width_rule_pass = request.width_min <= float(width) <= request.width_max
+
+    debit_feasibility_rule_pass = None
+    if isinstance(est_debit, (int, float)) and isinstance(width, (int, float)):
+        debit_feasibility_rule_pass = (1.60 * float(est_debit)) <= float(width)
+
+    preferred_risk_band_pass = None
+    if isinstance(max_loss, (int, float)):
+        preferred_risk_band_pass = request.risk_min_dollars <= float(max_loss) <= request.risk_max_dollars
+
+    hard_risk_cap_pass = None
+    if isinstance(max_loss, (int, float)):
+        hard_risk_cap_pass = float(max_loss) <= request.hard_max_dollars
+
+    if primary_candidate is None:
+        options_structure_status = "unconfirmed"
+        why = "Options structure is unconfirmed because no primary candidate is available."
+    elif feasibility_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate fails the defined-risk debit spread feasibility rule."
+    elif debit_feasibility_rule_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate fails the 1.60 x debit <= width feasibility rule."
+    elif fits_risk_budget is False or hard_risk_cap_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate does not fit the SAFE-FAST risk budget."
+    elif dte_rule_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate is outside the SAFE-FAST DTE window."
+    elif width_rule_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate is outside the SAFE-FAST width range."
+    elif liquidity_pass is False:
+        options_structure_status = "fail"
+        why = liquidity_context.get("why") or "Options structure is not liquid enough for a clean entry."
+    elif (
+        feasibility_pass is True
+        and debit_feasibility_rule_pass is True
+        and fits_risk_budget is True
+        and dte_rule_pass is True
+        and width_rule_pass is True
+        and liquidity_pass is True
+    ):
+        options_structure_status = "pass"
+        why = "Options structure fits DTE, width, risk, feasibility, and liquidity rules."
+    else:
+        options_structure_status = "caution"
+        why = "Options structure is mostly aligned, but one or more checks remain unconfirmed."
+
+    return {
+        "expiration_date": expiration_date,
+        "days_to_expiration": days_to_expiration,
+        "width": width,
+        "est_debit": est_debit,
+        "max_loss_dollars_1lot": max_loss,
+        "max_profit_dollars_1lot": max_profit,
+        "risk_reward": risk_reward,
+        "feasibility_pass": feasibility_pass,
+        "fits_risk_budget": fits_risk_budget,
+        "preferred_risk_band_pass": preferred_risk_band_pass,
+        "hard_risk_cap_pass": hard_risk_cap_pass,
+        "dte_rule_pass": dte_rule_pass,
+        "width_rule_pass": width_rule_pass,
+        "debit_feasibility_rule_pass": debit_feasibility_rule_pass,
+        "liquidity_status": liquidity_status,
+        "liquidity_pass": liquidity_pass,
+        "options_structure_status": options_structure_status,
+        "why_options_structure_passes_or_fails": why,
+    }
+
+
 
 def _build_live_map_block(
     ticker: Optional[str],
@@ -560,6 +655,9 @@ def _build_live_map_block(
     macro_context: Dict[str, Any],
     iv_context: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    selected_summary: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+    request: OnDemandRequest,
 ) -> Dict[str, Any]:
     trigger_detail = _build_trigger_detail_context(
         option_type=option_type,
@@ -581,6 +679,12 @@ def _build_live_map_block(
         iv_context=iv_context,
         liquidity_context=liquidity_context,
     )
+    options_structure = _build_options_structure_context(
+        request=request,
+        selected_summary=selected_summary,
+        primary_candidate=primary_candidate,
+        liquidity_context=liquidity_context,
+    )
     return {
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
@@ -594,6 +698,7 @@ def _build_live_map_block(
         "room_wall": room_wall,
         "extension_quality": extension_quality,
         "execution_quality": execution_quality,
+        "options_structure": options_structure,
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
@@ -2834,6 +2939,7 @@ def _build_candidate_context(
     macro_context: Dict[str, Any],
     iv_context: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    request: OnDemandRequest,
 ) -> Dict[str, Any]:
     active = bool(best_ticker and primary_candidate)
 
@@ -2848,6 +2954,7 @@ def _build_candidate_context(
     room_wall = None
     extension_quality = None
     execution_quality = None
+    options_structure = None
 
     if active:
         entry_zones = _derive_entry_zones(
@@ -2874,6 +2981,12 @@ def _build_candidate_context(
             time_day_gate=time_day_gate,
             macro_context=macro_context,
             iv_context=iv_context,
+            liquidity_context=liquidity_context,
+        )
+        options_structure = _build_options_structure_context(
+            request=request,
+            selected_summary=selected_summary,
+            primary_candidate=primary_candidate,
             liquidity_context=liquidity_context,
         )
         primary_entry_zone = entry_zones.get("primary_entry_zone")
@@ -3276,6 +3389,9 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             macro_context=macro_context,
             iv_context=iv_context,
             liquidity_context=liquidity_context,
+            selected_summary=selected.get("summary") if selected else None,
+            primary_candidate=primary_candidate,
+            request=request,
         ),
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
@@ -3336,6 +3452,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             macro_context=macro_context,
             iv_context=iv_context,
             liquidity_context=liquidity_context,
+            request=request,
         ),
         "two_path": two_path_block,
     }
