@@ -99,6 +99,113 @@ def _round_or_none(value: Optional[float], places: int = 4) -> Optional[float]:
     return round(value, places)
 
 
+def _build_price_zone(
+    low: Optional[float],
+    high: Optional[float],
+    label: str,
+    source: str,
+) -> Optional[Dict[str, Any]]:
+    if low is None or high is None:
+        return None
+    zone_low = min(low, high)
+    zone_high = max(low, high)
+    return {
+        "label": label,
+        "low": round(zone_low, 4),
+        "high": round(zone_high, 4),
+        "source": source,
+    }
+
+
+def _derive_entry_zones(
+    option_type: str,
+    chart_check: Optional[Dict[str, Any]],
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "primary_entry_zone": None,
+            "backup_entry_zone": None,
+        }
+
+    ema50_1h = _to_float(chart_check.get("ema50_1h"))
+    latest_close = _to_float(chart_check.get("latest_close"))
+    first_wall = _to_float(structure_context.get("first_wall"))
+    room_to_first_wall = _to_float(structure_context.get("room_to_first_wall"))
+    atr_14_1h = _to_float(structure_context.get("atr_14_1h"))
+    trigger_level = _to_float(trigger_state.get("trigger_level"))
+
+    zone_half_width = None
+    if atr_14_1h is not None and atr_14_1h > 0:
+        zone_half_width = max(atr_14_1h * 0.15, 0.10)
+    elif latest_close is not None and latest_close > 0:
+        zone_half_width = max(latest_close * 0.0015, 0.10)
+    else:
+        zone_half_width = 0.10
+
+    primary_entry_zone = None
+    if ema50_1h is not None:
+        primary_entry_zone = _build_price_zone(
+            ema50_1h - zone_half_width,
+            ema50_1h + zone_half_width,
+            "ema_retest_zone",
+            "ema50_1h_anchor",
+        )
+
+    backup_entry_zone = None
+    if trigger_level is not None:
+        backup_entry_zone = _build_price_zone(
+            trigger_level - zone_half_width,
+            trigger_level + zone_half_width,
+            "trigger_retest_zone",
+            "trigger_level_anchor",
+        )
+    elif first_wall is not None:
+        wall_buffer = max(zone_half_width, (room_to_first_wall or 0.0) * 0.5)
+        if option_type == "C":
+            backup_entry_zone = _build_price_zone(
+                first_wall - wall_buffer,
+                first_wall,
+                "first_wall_retest_zone",
+                "first_wall_anchor",
+            )
+        else:
+            backup_entry_zone = _build_price_zone(
+                first_wall,
+                first_wall + wall_buffer,
+                "first_wall_retest_zone",
+                "first_wall_anchor",
+            )
+
+    return {
+        "primary_entry_zone": primary_entry_zone,
+        "backup_entry_zone": backup_entry_zone,
+    }
+
+
+def _build_live_map_block(
+    ticker: Optional[str],
+    primary_entry_zone: Optional[Dict[str, Any]],
+    backup_entry_zone: Optional[Dict[str, Any]],
+    trigger_state: Dict[str, Any],
+    invalidation_level_1h_ema50: Optional[float],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "primary_entry_zone": primary_entry_zone,
+        "backup_entry_zone": backup_entry_zone,
+        "trigger_style": trigger_state.get("trigger_style"),
+        "trigger_level": trigger_state.get("trigger_level"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "invalidation_1h_ema50": invalidation_level_1h_ema50,
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+    }
+
+
 def _calc_pct_of_mid(bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> Optional[float]:
     if bid is None or ask is None or mid in (None, 0):
         return None
@@ -2315,6 +2422,7 @@ async def _screen_ticker_candidate(
 
 def _build_candidate_context(
     best_ticker: Optional[str],
+    option_type: str,
     selected_summary: Optional[Dict[str, Any]],
     primary_candidate: Optional[Dict[str, Any]],
     backup_candidate: Optional[Dict[str, Any]],
@@ -2335,8 +2443,18 @@ def _build_candidate_context(
     options_block = None
     levels_block = None
     targets_block = None
+    primary_entry_zone = None
+    backup_entry_zone = None
 
     if active:
+        entry_zones = _derive_entry_zones(
+            option_type=option_type,
+            chart_check=chart_check,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+        )
+        primary_entry_zone = entry_zones.get("primary_entry_zone")
+        backup_entry_zone = entry_zones.get("backup_entry_zone")
         options_block = {
             "expiration_date": selected_summary.get("expiration_date") if selected_summary else None,
             "days_to_expiration": selected_summary.get("days_to_expiration") if selected_summary else None,
@@ -2385,6 +2503,8 @@ def _build_candidate_context(
         "trigger_state": trigger_state.get("why") if active else None,
         "trigger_style": trigger_state.get("trigger_style") if active else None,
         "trigger_level": trigger_state.get("trigger_level") if active else None,
+        "primary_entry_zone": primary_entry_zone if active else None,
+        "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
         "levels": levels_block,
         "targets": targets_block,
@@ -2700,6 +2820,25 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             "changed_after_screening": changed_after_screening,
             "why_changed_after_screening": why_changed_after_screening,
         },
+        "live_map": _build_live_map_block(
+            ticker=best_ticker,
+            primary_entry_zone=_derive_entry_zones(
+                option_type=clean_option_type,
+                chart_check=chart_check,
+                structure_context=structure_context,
+                trigger_state=trigger_state,
+            ).get("primary_entry_zone") if best_ticker and primary_candidate else None,
+            backup_entry_zone=_derive_entry_zones(
+                option_type=clean_option_type,
+                chart_check=chart_check,
+                structure_context=structure_context,
+                trigger_state=trigger_state,
+            ).get("backup_entry_zone") if best_ticker and primary_candidate else None,
+            trigger_state=trigger_state,
+            invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+        ),
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
@@ -2742,6 +2881,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "user_facing": user_facing_block,
         "candidate_context": _build_candidate_context(
             best_ticker=best_ticker,
+            option_type=clean_option_type,
             selected_summary=selected.get("summary") if selected else None,
             primary_candidate=primary_candidate,
             backup_candidate=selected.get("backup_candidate") if selected else summary_payload.get("backup_candidate"),
