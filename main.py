@@ -853,6 +853,46 @@ def _compact_ticker_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _apply_engine_liquidity_gate(ticker_summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    liquidity_ready: List[Dict[str, Any]] = []
+    liquidity_failed_symbols: List[str] = []
+    liquidity_unconfirmed_symbols: List[str] = []
+
+    for summary in ticker_summaries:
+        primary_candidate = summary.get("primary_candidate")
+        liquidity_block = _build_liquidity_block(primary_candidate)
+
+        summary["engine_liquidity_context"] = liquidity_block
+        summary["engine_liquidity_pass"] = liquidity_block.get("liquidity_pass")
+
+        if primary_candidate is None:
+            continue
+
+        if liquidity_block.get("liquidity_pass") is True:
+            liquidity_ready.append(summary)
+        elif liquidity_block.get("liquidity_pass") is False:
+            liquidity_failed_symbols.append(summary.get("symbol"))
+        else:
+            liquidity_unconfirmed_symbols.append(summary.get("symbol"))
+
+    if liquidity_ready:
+        return {
+            "ranked_summaries": _rank_ticker_summaries(liquidity_ready),
+            "liquidity_gate_applied": True,
+            "liquidity_gate_reason": "Liquidity-failed candidates were removed before engine best-ticker selection.",
+            "liquidity_failed_symbols": liquidity_failed_symbols,
+            "liquidity_unconfirmed_symbols": liquidity_unconfirmed_symbols,
+        }
+
+    return {
+        "ranked_summaries": _rank_ticker_summaries(ticker_summaries),
+        "liquidity_gate_applied": False,
+        "liquidity_gate_reason": "No liquidity-passing candidates were available, so the engine fell back to the original ranked list.",
+        "liquidity_failed_symbols": liquidity_failed_symbols,
+        "liquidity_unconfirmed_symbols": liquidity_unconfirmed_symbols,
+    }
+
+
 def _rank_ticker_summaries(ticker_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
         ticker_summaries,
@@ -980,16 +1020,23 @@ async def _build_summary_compact_payload(
         )
         ticker_summaries.append(summary)
 
-    ranked = _rank_ticker_summaries(ticker_summaries)
+    engine_gate = _apply_engine_liquidity_gate(ticker_summaries)
+    ranked = engine_gate["ranked_summaries"]
     best_summary = ranked[0] if ranked else None
-    best_ticker = best_summary["symbol"] if best_summary and best_summary["primary_candidate"] else None
+    best_ticker = best_summary["symbol"] if best_summary and best_summary.get("primary_candidate") else None
     verdict = best_summary["verdict"] if best_summary else "NO_TRADE"
 
     return {
         "ok": True,
         "verdict": verdict,
         "best_ticker": best_ticker,
-        "candidate_sort_reason": _candidate_sort_reason_from_best(best_summary),
+        "candidate_sort_reason": {
+            **_candidate_sort_reason_from_best(best_summary),
+            "liquidity_gate_applied": engine_gate["liquidity_gate_applied"],
+            "liquidity_gate_reason": engine_gate["liquidity_gate_reason"],
+            "liquidity_failed_symbols": engine_gate["liquidity_failed_symbols"],
+            "liquidity_unconfirmed_symbols": engine_gate["liquidity_unconfirmed_symbols"],
+        },
         "selection_mode": best_summary["selection_mode"] if best_summary else "none",
         "reason": best_summary["reason"] if best_summary else "No summary available.",
         "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
