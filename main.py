@@ -2092,6 +2092,18 @@ def _screened_other_candidates(screened: List[Dict[str, Any]], best_ticker: Opti
         )
     return out
 
+
+def _select_screened_best_candidate(screened_candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not screened_candidates:
+        return None
+
+    with_primary = [item for item in screened_candidates if item.get("primary_candidate")]
+    if with_primary:
+        return with_primary[0]
+
+    return screened_candidates[0]
+
+
 def _build_simple_output_block(
     user_facing: Dict[str, Any],
     trigger_state: Dict[str, Any],
@@ -2505,10 +2517,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     )
 
     screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
-    selected = screened_candidates[0] if screened_candidates else None
+    selected = _select_screened_best_candidate(screened_candidates)
 
-    best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
-    engine_status = selected.get("engine_verdict", "NO_TRADE") if selected else summary_payload.get("verdict", "NO_TRADE")
+    best_ticker = selected.get("symbol") if selected and selected.get("primary_candidate") else summary_payload.get("best_ticker")
+    engine_status = summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
     primary_candidate = selected.get("primary_candidate") if selected else summary_payload.get("primary_candidate")
     chart_check = selected.get("chart_check") if selected else None
