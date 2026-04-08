@@ -447,6 +447,51 @@ def _build_room_wall_context(structure_context: Dict[str, Any]) -> Dict[str, Any
     }
 
 
+def _build_extension_quality_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
+    extension_state = structure_context.get("extension_state")
+    late_move = structure_context.get("late_move")
+    extension_material = structure_context.get("extension_material")
+    extension_soft_flag = structure_context.get("extension_soft_flag")
+    extension_blocks_now = structure_context.get("extension_blocks_now")
+    degraded_entry_quality = structure_context.get("degraded_entry_quality")
+    early_trigger_window_passed = structure_context.get("early_trigger_window_passed")
+    extension_confirmer_flags = structure_context.get("extension_confirmer_flags")
+    extension_confirmer_count = structure_context.get("extension_confirmer_count")
+
+    if extension_blocks_now is True:
+        extension_quality_status = "fail"
+        why = "Move is materially extended for SAFE-FAST right now."
+    elif extension_state == "extended" or late_move is True or extension_material is True:
+        if extension_soft_flag is True:
+            extension_quality_status = "caution"
+            why = "Extension is elevated, but treated as a soft caution rather than a hard blocker."
+        else:
+            extension_quality_status = "caution"
+            why = "Extension is elevated and needs confirmation from cleaner structure."
+    elif extension_state is None and late_move is None:
+        extension_quality_status = "unconfirmed"
+        why = "Extension quality is still unconfirmed from the available chart inputs."
+    else:
+        extension_quality_status = "pass"
+        why = "Extension quality is not currently blocking the setup."
+
+    return {
+        "extension_state": extension_state,
+        "late_move": late_move,
+        "pct_from_ema": structure_context.get("pct_from_ema"),
+        "atr_multiple_from_ema": structure_context.get("atr_multiple_from_ema"),
+        "degraded_entry_quality": degraded_entry_quality,
+        "early_trigger_window_passed": early_trigger_window_passed,
+        "extension_confirmer_flags": extension_confirmer_flags,
+        "extension_confirmer_count": extension_confirmer_count,
+        "extension_material": extension_material,
+        "extension_soft_flag": extension_soft_flag,
+        "extension_blocks_now": extension_blocks_now,
+        "extension_quality_status": extension_quality_status,
+        "why_extension_passes_or_fails": why,
+    }
+
+
 
 def _build_live_map_block(
     ticker: Optional[str],
@@ -472,6 +517,7 @@ def _build_live_map_block(
         chart_check=chart_check,
     )
     room_wall = _build_room_wall_context(structure_context)
+    extension_quality = _build_extension_quality_context(structure_context)
     return {
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
@@ -483,6 +529,7 @@ def _build_live_map_block(
         "current_bar_behavior": trigger_detail.get("current_bar_behavior"),
         "setup_route": setup_route,
         "room_wall": room_wall,
+        "extension_quality": extension_quality,
         "invalidation_1h_ema50": invalidation_level_1h_ema50,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
@@ -2733,6 +2780,7 @@ def _build_candidate_context(
     current_bar_behavior = None
     setup_route = None
     room_wall = None
+    extension_quality = None
 
     if active:
         entry_zones = _derive_entry_zones(
@@ -2753,6 +2801,7 @@ def _build_candidate_context(
             chart_check=chart_check,
         )
         room_wall = _build_room_wall_context(structure_context)
+        extension_quality = _build_extension_quality_context(structure_context)
         primary_entry_zone = entry_zones.get("primary_entry_zone")
         backup_entry_zone = entry_zones.get("backup_entry_zone")
         trigger_candle = trigger_detail.get("trigger_candle")
@@ -2809,6 +2858,7 @@ def _build_candidate_context(
         "current_bar_behavior": current_bar_behavior if active else None,
         "setup_route": setup_route if active else None,
         "room_wall": room_wall if active else None,
+        "extension_quality": extension_quality if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
