@@ -2672,6 +2672,15 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         iv_context=iv_context,
     )
 
+    raw_engine_winner_ticker = summary_payload.get("best_ticker")
+    raw_engine_winner_status = summary_payload.get("verdict")
+    screened_live_winner_ticker = best_ticker
+    screened_live_winner_final_verdict = final_verdict
+    changed_after_screening = raw_engine_winner_ticker != screened_live_winner_ticker
+    why_changed_after_screening = (
+        selected_reason if changed_after_screening else None
+    )
+
     return {
         "ok": True,
         "mode": "on_demand",
@@ -2683,6 +2692,14 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
         "engine_best_ticker": summary_payload.get("best_ticker"),
+        "winner_context": {
+            "raw_engine_winner_ticker": raw_engine_winner_ticker,
+            "raw_engine_winner_status": raw_engine_winner_status,
+            "screened_live_winner_ticker": screened_live_winner_ticker,
+            "screened_live_winner_final_verdict": screened_live_winner_final_verdict,
+            "changed_after_screening": changed_after_screening,
+            "why_changed_after_screening": why_changed_after_screening,
+        },
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
