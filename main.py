@@ -1,3 +1,4 @@
+# fresh full main.py build with trigger_scan regenerated 2026-04-08T20:44:42Z
 
 import asyncio
 
