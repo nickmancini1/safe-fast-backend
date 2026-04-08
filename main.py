@@ -4046,7 +4046,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {"status": "ok", "service": "safe-fast-backend"}
-    
+
 
 @app.get("/health")
 def health() -> Dict[str, bool]:
