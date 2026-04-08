@@ -770,28 +770,41 @@ def _generate_debit_spread_candidates(
     return candidates
 
 
+def _candidate_liquidity_pass(candidate: Dict[str, Any]) -> bool:
+    liquidity_ctx = _classify_liquidity(
+        candidate.get("entry_slippage_vs_mid"),
+        candidate.get("long_leg_width_pct_of_mid"),
+        candidate.get("short_leg_width_pct_of_mid"),
+    )
+    return liquidity_ctx.get("liquidity_pass") is True
+
+
+
 def _select_shortlist(all_candidates: List[Dict[str, Any]], allow_fallback: bool) -> Dict[str, Any]:
     preferred = [c for c in all_candidates if c["feasibility_pass"] and c["fits_risk_budget"]]
     fallback = [c for c in all_candidates if c["feasibility_pass"] and c["within_hard_max"]]
 
-    if preferred:
-        selected = preferred
+    preferred_liquid = [c for c in preferred if _candidate_liquidity_pass(c)]
+    fallback_liquid = [c for c in fallback if _candidate_liquidity_pass(c)]
+
+    if preferred_liquid:
+        selected = preferred_liquid
         selection_mode = "preferred"
-        reason = "Using candidates that pass feasibility, preferred risk band, and hard max."
-    elif allow_fallback and fallback:
-        selected = fallback
+        reason = "Using candidates that pass feasibility, preferred risk band, hard max, and liquidity."
+    elif allow_fallback and fallback_liquid:
+        selected = fallback_liquid
         selection_mode = "fallback"
-        reason = "No preferred candidates found. Using feasible candidates that still stay under hard max."
+        reason = "No preferred liquid candidates found. Using feasible liquid candidates that still stay under hard max."
     else:
         selected = []
         selection_mode = "none"
-        reason = "No feasible candidates found for the current filters."
+        reason = "No feasible liquid candidates found for the current filters."
 
     return {
         "selection_mode": selection_mode,
         "reason": reason,
-        "preferred_count": len(preferred),
-        "fallback_count": len(fallback),
+        "preferred_count": len(preferred_liquid),
+        "fallback_count": len(fallback_liquid),
         "primary_candidate": selected[0] if len(selected) >= 1 else None,
         "backup_candidate": selected[1] if len(selected) >= 2 else None,
     }
