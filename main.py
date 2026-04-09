@@ -1,4 +1,4 @@
-# fresh full main.py build with trigger_scan regenerated 2026-04-08T20:44:42Z
+# fresh full main.py build with entry_context bridge 2026-04-09T16:05:00Z
 
 import asyncio
 
@@ -3531,6 +3531,69 @@ def _build_trigger_context_block(
         "why_trigger_scan_passes_or_fails": trigger_scan.get("why_trigger_scan_passes_or_fails"),
     }
 
+
+
+def _build_entry_context_block(
+    trigger_state: Dict[str, Any],
+    live_map: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    trigger_scan = live_map.get("trigger_scan") or {}
+    current_bar = trigger_scan.get("current_bar") or {}
+    completed_candle = trigger_scan.get("most_recent_completed_candle") or {}
+    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    primary_blocker = blockers[0] if blockers else None
+
+    current_bar_raw_trigger_pass = bool(current_bar.get("raw_chart_trigger_pass") is True)
+    current_bar_gated_trigger_pass = bool(current_bar.get("gated_trigger_pass") is True)
+    completed_candle_raw_trigger_pass = bool(completed_candle.get("raw_chart_trigger_pass") is True)
+    completed_candle_gated_trigger_pass = bool(completed_candle.get("gated_trigger_pass") is True)
+
+    if current_bar_gated_trigger_pass:
+        mid_candle_entry_state = "APPROVED_NOW"
+    elif current_bar_raw_trigger_pass:
+        mid_candle_entry_state = "BLOCKED_NOW"
+    else:
+        mid_candle_entry_state = "NOT_PRESENT"
+
+    if completed_candle_gated_trigger_pass:
+        completed_candle_entry_state = "APPROVED_ON_COMPLETED_CANDLE"
+    elif completed_candle_raw_trigger_pass:
+        completed_candle_entry_state = "BLOCKED_ON_COMPLETED_CANDLE"
+    else:
+        completed_candle_entry_state = "NOT_PRESENT_ON_COMPLETED_CANDLE"
+
+    return {
+        "ok": True,
+        "mid_candle_trade_available_now": current_bar_gated_trigger_pass,
+        "mid_candle_entry_state": mid_candle_entry_state,
+        "mid_candle_raw_trigger_detected_now": current_bar_raw_trigger_pass,
+        "mid_candle_block_reason": None if current_bar_gated_trigger_pass else trigger_state.get("why"),
+        "completed_candle_trade_available": completed_candle_gated_trigger_pass,
+        "completed_candle_entry_state": completed_candle_entry_state,
+        "completed_candle_raw_trigger_detected": completed_candle_raw_trigger_pass,
+        "completed_candle_block_reason": None if completed_candle_gated_trigger_pass else completed_candle.get("why"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "structure_ready": trigger_state.get("structure_ready"),
+        "trigger_style": trigger_state.get("trigger_style"),
+        "trigger_level": trigger_state.get("trigger_level"),
+        "current_close": trigger_state.get("current_close"),
+        "current_bar_relation_to_trigger_level": current_bar.get("relation_to_trigger_level"),
+        "current_bar_relation_to_ema50_1h": current_bar.get("relation_to_ema50_1h"),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "allowed_setup": structure_context.get("allowed_setup"),
+        "setup_type": structure_context.get("setup_type"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
+    }
+
 def _build_screened_best_context(
     selected: Optional[Dict[str, Any]],
     engine_best_ticker: Optional[str],
@@ -4162,7 +4225,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_trigger_context_2026_04_09",
+        "build_tag": "schema_patch_entry_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4212,6 +4275,13 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "trigger_context": _build_trigger_context_block(
             trigger_state=trigger_state,
             live_map=live_map_block,
+        ),
+        "entry_context": _build_entry_context_block(
+            trigger_state=trigger_state,
+            live_map=live_map_block,
+            checklist_block=checklist_block,
+            structure_context=structure_context,
+            user_facing=user_facing_block,
         ),
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
