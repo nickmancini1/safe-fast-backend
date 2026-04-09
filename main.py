@@ -4452,6 +4452,33 @@ def _build_time_gate_check_context_block(
 
 
 
+def _build_final_reason_context_block(
+    user_facing: Dict[str, Any],
+    screened_best_context: Dict[str, Any],
+    time_gate_check_context: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+) -> Dict[str, Any]:
+    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    primary_blocker = blockers[0] if blockers else None
+
+    return {
+        "ok": True,
+        "final_reason": user_facing.get("why"),
+        "screened_reason": screened_best_context.get("screened_reason"),
+        "time_gate_reason": time_gate_check_context.get("time_gate_reason"),
+        "entry_window_status": time_gate_check_context.get("entry_window_status"),
+        "fresh_entry_allowed": time_gate_check_context.get("fresh_entry_allowed"),
+        "early_enough_fails_from_time_gate": time_gate_check_context.get("early_enough_fails_from_time_gate"),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "note": (
+            "The final NO_TRADE reason can come from the time/day gate, "
+            "structural blockers, or both."
+        ),
+    }
+
+
+
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     clean_option_type = _clean_option_type(request.option_type)
@@ -4687,11 +4714,22 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         ten_second_checklist_block=ten_second_checklist_block,
         checklist_block=checklist_block,
     )
+    screened_best_context_block = _build_screened_best_context(
+        selected=selected,
+        engine_best_ticker=summary_payload.get("best_ticker"),
+        screened_candidates=screened_candidates,
+    )
+    final_reason_context_block = _build_final_reason_context_block(
+        user_facing=user_facing_block,
+        screened_best_context=screened_best_context_block,
+        time_gate_check_context=time_gate_check_context_block,
+        checklist_block=checklist_block,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_time_gate_check_context_2026_04_09",
+        "build_tag": "schema_patch_final_reason_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4750,15 +4788,12 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "setup_eligibility_context": setup_eligibility_context_block,
         "setup_check_context": setup_check_context_block,
         "time_gate_check_context": time_gate_check_context_block,
+        "final_reason_context": final_reason_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
         ),
-        "screened_best_context": _build_screened_best_context(
-            selected=selected,
-            engine_best_ticker=summary_payload.get("best_ticker"),
-            screened_candidates=screened_candidates,
-        ),
+        "screened_best_context": screened_best_context_block,
         "market_context": market_context,
         "macro_context": macro_context,
         "structure_context": structure_context,
