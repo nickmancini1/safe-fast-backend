@@ -3503,6 +3503,34 @@ def _build_blocker_context_block(
         "good_idea_now": user_facing.get("good_idea_now"),
     }
 
+
+
+def _build_trigger_context_block(
+    trigger_state: Dict[str, Any],
+    live_map: Dict[str, Any],
+) -> Dict[str, Any]:
+    trigger_scan = live_map.get("trigger_scan") or {}
+    current_bar = trigger_scan.get("current_bar") or {}
+    completed_candle = trigger_scan.get("most_recent_completed_candle") or {}
+
+    return {
+        "ok": True,
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "structure_ready": trigger_state.get("structure_ready"),
+        "trigger_style": trigger_state.get("trigger_style"),
+        "trigger_level": trigger_state.get("trigger_level"),
+        "current_close": trigger_state.get("current_close"),
+        "current_bar_raw_trigger_pass": current_bar.get("raw_chart_trigger_pass"),
+        "current_bar_gated_trigger_pass": current_bar.get("gated_trigger_pass"),
+        "completed_candle_raw_trigger_pass": completed_candle.get("raw_chart_trigger_pass"),
+        "completed_candle_gated_trigger_pass": completed_candle.get("gated_trigger_pass"),
+        "current_bar_relation_to_trigger_level": current_bar.get("relation_to_trigger_level"),
+        "current_bar_relation_to_ema50_1h": current_bar.get("relation_to_ema50_1h"),
+        "trigger_scan_status": trigger_scan.get("trigger_scan_status"),
+        "why_trigger_scan_passes_or_fails": trigger_scan.get("why_trigger_scan_passes_or_fails"),
+    }
+
 def _build_screened_best_context(
     selected: Optional[Dict[str, Any]],
     engine_best_ticker: Optional[str],
@@ -4102,10 +4130,39 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         trigger_state=trigger_state,
     )
 
+    live_map_block = _build_live_map_block(
+        ticker=best_ticker,
+        option_type=clean_option_type,
+        primary_entry_zone=_derive_entry_zones(
+            option_type=clean_option_type,
+            chart_check=chart_check,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+        ).get("primary_entry_zone") if best_ticker and primary_candidate else None,
+        backup_entry_zone=_derive_entry_zones(
+            option_type=clean_option_type,
+            chart_check=chart_check,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+        ).get("backup_entry_zone") if best_ticker and primary_candidate else None,
+        trigger_state=trigger_state,
+        chart_check=chart_check,
+        structure_context=structure_context,
+        invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        macro_context=macro_context,
+        iv_context=iv_context,
+        liquidity_context=liquidity_context,
+        selected_summary=selected.get("summary") if selected else None,
+        primary_candidate=primary_candidate,
+        request=request,
+    )
+
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_blocker_context_2026_04_09",
+        "build_tag": "schema_patch_trigger_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4151,33 +4208,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             final_verdict=final_verdict,
             user_facing=user_facing_block,
         ),
-        "live_map": _build_live_map_block(
-            ticker=best_ticker,
-            option_type=clean_option_type,
-            primary_entry_zone=_derive_entry_zones(
-                option_type=clean_option_type,
-                chart_check=chart_check,
-                structure_context=structure_context,
-                trigger_state=trigger_state,
-            ).get("primary_entry_zone") if best_ticker and primary_candidate else None,
-            backup_entry_zone=_derive_entry_zones(
-                option_type=clean_option_type,
-                chart_check=chart_check,
-                structure_context=structure_context,
-                trigger_state=trigger_state,
-            ).get("backup_entry_zone") if best_ticker and primary_candidate else None,
+        "live_map": live_map_block,
+        "trigger_context": _build_trigger_context_block(
             trigger_state=trigger_state,
-            chart_check=chart_check,
-            structure_context=structure_context,
-            invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
-            market_context=market_context,
-            time_day_gate=time_day_gate,
-            macro_context=macro_context,
-            iv_context=iv_context,
-            liquidity_context=liquidity_context,
-            selected_summary=selected.get("summary") if selected else None,
-            primary_candidate=primary_candidate,
-            request=request,
+            live_map=live_map_block,
         ),
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
