@@ -3366,6 +3366,61 @@ def _build_simple_output_block(
     }
 
 
+
+
+def _build_engine_context_block(
+    summary_payload: Dict[str, Any],
+    selected: Optional[Dict[str, Any]],
+    engine_status: str,
+    final_verdict: str,
+    best_ticker: Optional[str],
+) -> Dict[str, Any]:
+    raw_best_ticker = summary_payload.get("best_ticker")
+    raw_status = summary_payload.get("verdict")
+    raw_reason = summary_payload.get("reason")
+    normalized_reason = selected.get("reason", raw_reason) if selected else raw_reason
+
+    return {
+        "ok": True,
+        "raw_best_ticker": raw_best_ticker,
+        "raw_status": raw_status,
+        "raw_reason": raw_reason,
+        "normalized_best_ticker": best_ticker,
+        "normalized_status": engine_status,
+        "normalized_final_verdict": final_verdict,
+        "normalized_reason": normalized_reason,
+        "changed_from_raw_engine": (
+            raw_best_ticker != best_ticker
+            or raw_status != engine_status
+        ),
+    }
+
+
+def _build_candidate_engine_normalized_block(
+    summary_payload: Dict[str, Any],
+    selected: Optional[Dict[str, Any]],
+    engine_status: str,
+    final_verdict: str,
+    best_ticker: Optional[str],
+) -> Dict[str, Any]:
+    normalized_reason = selected.get("reason", summary_payload.get("reason")) if selected else summary_payload.get("reason")
+    selected_summary = selected.get("summary") if selected else None
+
+    return {
+        "ok": summary_payload.get("ok", True),
+        "raw_best_ticker": summary_payload.get("best_ticker"),
+        "raw_verdict": summary_payload.get("verdict"),
+        "raw_reason": summary_payload.get("reason"),
+        "normalized_best_ticker": best_ticker,
+        "normalized_verdict": engine_status,
+        "normalized_final_verdict": final_verdict,
+        "normalized_reason": normalized_reason,
+        "selection_mode": (
+            selected_summary.get("selection_mode")
+            if selected_summary else summary_payload.get("selection_mode")
+        ),
+    }
+
 def _build_screened_best_context(
     selected: Optional[Dict[str, Any]],
     engine_best_ticker: Optional[str],
@@ -3960,7 +4015,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_engine_ticker_clarity_2026_04_09",
+        "build_tag": "schema_patch_engine_context_bridge_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3980,6 +4035,13 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             "changed_after_screening": changed_after_screening,
             "why_changed_after_screening": why_changed_after_screening,
         },
+        "engine_context": _build_engine_context_block(
+            summary_payload=summary_payload,
+            selected=selected,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
+            best_ticker=best_ticker,
+        ),
         "live_map": _build_live_map_block(
             ticker=best_ticker,
             option_type=clean_option_type,
@@ -4041,6 +4103,13 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
         "request": request.model_dump(),
         "candidate_engine": summary_payload,
+        "candidate_engine_normalized": _build_candidate_engine_normalized_block(
+            summary_payload=summary_payload,
+            selected=selected,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
+            best_ticker=best_ticker,
+        ),
         "chart_check": chart_check_block,
         "chart_confirmation": _build_chart_confirmation_block(
             request=request,
