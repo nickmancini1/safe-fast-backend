@@ -4106,6 +4106,17 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.get("/safe-fast/on-demand/default")
+async def safe_fast_on_demand_default() -> Any:
+    return await _build_on_demand_payload(
+        OnDemandRequest(
+            option_type="C",
+            open_positions=0,
+            weekly_trade_count=0,
+        )
+    )
+
+
 @app.post("/safe-fast/on-demand")
 
 
