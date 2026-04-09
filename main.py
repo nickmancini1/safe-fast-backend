@@ -3421,6 +3421,50 @@ def _build_candidate_engine_normalized_block(
         ),
     }
 
+
+def _build_decision_context_block(
+    summary_payload: Dict[str, Any],
+    selected: Optional[Dict[str, Any]],
+    engine_status: str,
+    final_verdict: str,
+    best_ticker: Optional[str],
+    checklist_block: Dict[str, Any],
+    failed_reasons: List[str],
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    raw_reason = summary_payload.get("reason")
+    normalized_reason = selected.get("reason", raw_reason) if selected else raw_reason
+
+    return {
+        "ok": True,
+        "ticker": best_ticker,
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
+        "raw_engine": {
+            "ticker": summary_payload.get("best_ticker"),
+            "status": summary_payload.get("verdict"),
+            "reason": raw_reason,
+        },
+        "normalized_engine": {
+            "ticker": best_ticker,
+            "status": engine_status,
+            "final_verdict": final_verdict,
+            "reason": normalized_reason,
+        },
+        "screened": {
+            "ticker": best_ticker,
+            "final_verdict": final_verdict,
+            "reason": normalized_reason,
+        },
+        "blockers": checklist_block.get("decision_blockers_priority", []),
+        "failed_reasons": failed_reasons,
+        "changed_from_raw_engine": (
+            summary_payload.get("best_ticker") != best_ticker
+            or summary_payload.get("verdict") != engine_status
+        ),
+    }
+
 def _build_screened_best_context(
     selected: Optional[Dict[str, Any]],
     engine_best_ticker: Optional[str],
@@ -4011,11 +4055,19 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     why_changed_after_screening = (
         selected_reason if changed_after_screening else None
     )
+    failed_reasons_block = _failed_reason_messages(
+        checklist=checklist_block,
+        time_day_gate=time_day_gate,
+        market_context=market_context,
+        structure_context=structure_context,
+        liquidity_context=liquidity_context,
+        trigger_state=trigger_state,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_engine_context_bridge_2026_04_09",
+        "build_tag": "schema_patch_decision_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4041,6 +4093,16 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             engine_status=engine_status,
             final_verdict=final_verdict,
             best_ticker=best_ticker,
+        ),
+        "decision_context": _build_decision_context_block(
+            summary_payload=summary_payload,
+            selected=selected,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
+            best_ticker=best_ticker,
+            checklist_block=checklist_block,
+            failed_reasons=failed_reasons_block,
+            user_facing=user_facing_block,
         ),
         "live_map": _build_live_map_block(
             ticker=best_ticker,
@@ -4092,14 +4154,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "targets": targets_block,
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
         "checklist": checklist_block,
-        "failed_reasons": _failed_reason_messages(
-            checklist=checklist_block,
-            time_day_gate=time_day_gate,
-            market_context=market_context,
-            structure_context=structure_context,
-            liquidity_context=liquidity_context,
-            trigger_state=trigger_state,
-        ),
+        "failed_reasons": failed_reasons_block,
         "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
         "request": request.model_dump(),
         "candidate_engine": summary_payload,
