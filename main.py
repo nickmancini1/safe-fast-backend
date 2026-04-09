@@ -4453,7 +4453,12 @@ def _build_setup_eligibility_context_block(
     setup_type = structure_context.get("setup_type")
     allowed_setup = bool(structure_context.get("allowed_setup") is True)
     route = live_map.get("setup_route") or {}
-    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    blockers = list(
+        approval_requirements_context.get("blockers")
+        or checklist_block.get("decision_blockers_priority")
+        or checklist_block.get("failed_items")
+        or []
+    )
     primary_blocker = blockers[0] if blockers else None
 
     if not setup_type:
@@ -4479,6 +4484,7 @@ def _build_setup_eligibility_context_block(
     }
 
 def _build_setup_check_context_block(
+
     structure_context: Dict[str, Any],
     ten_second_checklist_block: Dict[str, Any],
     setup_eligibility_context: Dict[str, Any],
@@ -4528,7 +4534,14 @@ def _build_time_gate_check_context_block(
     fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed") is True)
     reason = time_day_gate.get("reason")
     cutoff_et = time_day_gate.get("cutoff_et")
-    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    blockers = _effective_blockers(
+        checklist_block,
+        time_gate_reason=reason,
+    )
+    primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        time_gate_reason=reason,
+    )
 
     return {
         "ok": True,
@@ -4541,7 +4554,7 @@ def _build_time_gate_check_context_block(
         "early_enough_fails_from_time_gate": bool(
             early_enough_answer == "NO" and not fresh_entry_allowed
         ),
-        "primary_blocker": blockers[0] if blockers else None,
+        "primary_blocker": primary_blocker,
         "blockers": blockers,
         "note": (
             "The early_enough checklist item can fail from late extension, "
@@ -4549,9 +4562,8 @@ def _build_time_gate_check_context_block(
         ),
     }
 
-
-
 def _build_final_reason_context_block(
+
     user_facing: Dict[str, Any],
     screened_best_context: Dict[str, Any],
     time_gate_check_context: Dict[str, Any],
@@ -5526,7 +5538,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_market_closed_reason_2026_04_09",
+        "build_tag": "schema_patch_core_context_alignment_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
