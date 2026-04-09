@@ -5439,7 +5439,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         normalized_engine_winner_status=normalized_engine_winner_status,
         normalized_engine_winner_final_verdict=normalized_engine_winner_final_verdict,
         screened_live_winner_ticker=screened_live_winner_ticker,
-        screened_live_winner_final_verdict=screened_live_final_verdict,
+        screened_live_winner_final_verdict=screened_live_winner_final_verdict,
         screened_reason=screened_best_context_block.get("screened_reason"),
     )
 
