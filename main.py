@@ -3605,6 +3605,23 @@ def _build_trigger_context_block(
 
 
 
+
+def _derive_global_gate_primary_blocker(trigger_reason: Any) -> Optional[str]:
+    if trigger_reason == "market_closed":
+        return "time_day_gate"
+    if trigger_reason == "past_monday_thursday_cutoff":
+        return "time_day_gate"
+    return None
+
+
+def _derive_global_gate_next_flip(trigger_reason: Any) -> Optional[str]:
+    if trigger_reason == "market_closed":
+        return "market_open"
+    if trigger_reason == "past_monday_thursday_cutoff":
+        return "fresh_entry_allowed"
+    return None
+
+
 def _build_entry_context_block(
     trigger_state: Dict[str, Any],
     live_map: Dict[str, Any],
@@ -3615,7 +3632,10 @@ def _build_entry_context_block(
     trigger_scan = live_map.get("trigger_scan") or {}
     current_bar = trigger_scan.get("current_bar") or {}
     completed_candle = trigger_scan.get("most_recent_completed_candle") or {}
-    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
+    if gate_blocker:
+        blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
     primary_blocker = blockers[0] if blockers else None
 
     current_bar_raw_trigger_pass = bool(current_bar.get("raw_chart_trigger_pass") is True)
@@ -3744,8 +3764,12 @@ def _build_approval_context_block(
     trigger_state: Dict[str, Any],
     user_facing: Dict[str, Any],
 ) -> Dict[str, Any]:
-    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
+    if gate_blocker:
+        blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
     primary_blocker = blockers[0] if blockers else None
+    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("why")) or primary_blocker
     intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
     intrabar_trade_available_now = bool(entry_context.get("mid_candle_trade_available_now") is True)
     completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
@@ -3790,7 +3814,7 @@ def _build_approval_context_block(
         "extension_blocks_now": structure_context.get("extension_blocks_now"),
         "primary_blocker": primary_blocker,
         "blockers": blockers,
-        "next_flip_needed": primary_blocker,
+        "next_flip_needed": next_flip_needed,
         "action": user_facing.get("action"),
         "setup_state": user_facing.get("setup_state"),
         "good_idea_now": user_facing.get("good_idea_now"),
@@ -3810,7 +3834,10 @@ def _build_approval_requirements_context_block(
     approval_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     checklist_items = {row.get("item"): bool(row.get("yes")) for row in checklist_block.get("items", [])}
-    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
+    if gate_blocker:
+        blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
 
     gate_statuses = [
         {
@@ -3879,7 +3906,7 @@ def _build_approval_requirements_context_block(
     ]
 
     missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
-    next_flip_needed = blockers[0] if blockers else (missing_gates[0] if missing_gates else None)
+    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None))
 
     if approval_context.get("approval_ready_now") is True:
         approval_path_status = "APPROVED_NOW"
