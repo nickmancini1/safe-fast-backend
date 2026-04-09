@@ -4414,6 +4414,43 @@ def _build_setup_check_context_block(
     }
 
 
+def _build_time_gate_check_context_block(
+    time_day_gate: Dict[str, Any],
+    ten_second_checklist_block: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+) -> Dict[str, Any]:
+    answers = ten_second_checklist_block.get("answers") or []
+    early_enough_answer = None
+    for row in answers:
+        if row.get("item") == "early_enough":
+            early_enough_answer = row.get("answer")
+            break
+
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed") is True)
+    reason = time_day_gate.get("reason")
+    cutoff_et = time_day_gate.get("cutoff_et")
+    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+
+    return {
+        "ok": True,
+        "entry_window_status": "OPEN" if fresh_entry_allowed else "CLOSED",
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "time_gate_reason": reason,
+        "cutoff_et": cutoff_et,
+        "ten_second_check_item": "early_enough",
+        "ten_second_check_answer": early_enough_answer,
+        "early_enough_fails_from_time_gate": bool(
+            early_enough_answer == "NO" and not fresh_entry_allowed
+        ),
+        "primary_blocker": blockers[0] if blockers else None,
+        "blockers": blockers,
+        "note": (
+            "The early_enough checklist item can fail from late extension, "
+            "the closed entry window, or both."
+        ),
+    }
+
+
 
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
@@ -4645,11 +4682,16 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         ten_second_checklist_block=ten_second_checklist_block,
         setup_eligibility_context=setup_eligibility_context_block,
     )
+    time_gate_check_context_block = _build_time_gate_check_context_block(
+        time_day_gate=time_day_gate,
+        ten_second_checklist_block=ten_second_checklist_block,
+        checklist_block=checklist_block,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_setup_check_context_2026_04_09",
+        "build_tag": "schema_patch_time_gate_check_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4707,6 +4749,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "approval_flip_context": approval_flip_context_block,
         "setup_eligibility_context": setup_eligibility_context_block,
         "setup_check_context": setup_check_context_block,
+        "time_gate_check_context": time_gate_check_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
