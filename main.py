@@ -3662,6 +3662,69 @@ def _build_intrabar_signal_context_block(
         "signal_note": signal_note,
     }
 
+
+
+def _build_approval_context_block(
+    entry_context: Dict[str, Any],
+    intrabar_signal_context: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    primary_blocker = blockers[0] if blockers else None
+    intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
+    intrabar_trade_available_now = bool(entry_context.get("mid_candle_trade_available_now") is True)
+    completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
+    completed_trade_available = bool(entry_context.get("completed_candle_trade_available") is True)
+
+    if intrabar_trade_available_now:
+        approval_status = "APPROVED_NOW"
+    elif intrabar_raw_signal_detected:
+        approval_status = "RAW_SIGNAL_WAITING_FOR_APPROVAL"
+    elif completed_trade_available:
+        approval_status = "APPROVED_ON_COMPLETED_CANDLE"
+    elif completed_raw_signal_detected:
+        approval_status = "COMPLETED_SIGNAL_WAITING_FOR_APPROVAL"
+    else:
+        approval_status = "NO_SIGNAL_TO_APPROVE"
+
+    if intrabar_trade_available_now:
+        approval_note = "All SAFE-FAST approval gates pass right now."
+    elif intrabar_raw_signal_detected:
+        approval_note = "Raw intrabar signal exists, but SAFE-FAST approval gates still block entry."
+    elif completed_trade_available:
+        approval_note = "Completed-candle signal is approved."
+    elif completed_raw_signal_detected:
+        approval_note = "Completed-candle raw signal exists, but SAFE-FAST approval gates still block entry."
+    else:
+        approval_note = "No raw signal is currently waiting for approval."
+
+    return {
+        "ok": True,
+        "ticker": intrabar_signal_context.get("ticker"),
+        "approval_status": approval_status,
+        "approval_ready_now": intrabar_trade_available_now,
+        "approval_ready_on_completed_candle": completed_trade_available,
+        "intrabar_raw_signal_detected": intrabar_raw_signal_detected,
+        "completed_raw_signal_detected": completed_raw_signal_detected,
+        "structure_ready": trigger_state.get("structure_ready"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "allowed_setup": structure_context.get("allowed_setup"),
+        "setup_type": structure_context.get("setup_type"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "next_flip_needed": primary_blocker,
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
+        "approval_note": approval_note,
+    }
+
 def _build_screened_best_context(
     selected: Optional[Dict[str, Any]],
     engine_best_ticker: Optional[str],
@@ -4301,11 +4364,19 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         live_map=live_map_block,
         user_facing=user_facing_block,
     )
+    approval_context_block = _build_approval_context_block(
+        entry_context=entry_context_block,
+        intrabar_signal_context=intrabar_signal_context_block,
+        checklist_block=checklist_block,
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        user_facing=user_facing_block,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_intrabar_signal_context_2026_04_09",
+        "build_tag": "schema_patch_approval_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4358,6 +4429,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         ),
         "entry_context": entry_context_block,
         "intrabar_signal_context": intrabar_signal_context_block,
+        "approval_context": approval_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
