@@ -2658,6 +2658,9 @@ def _build_structure_context(
 
     atr14 = _calc_atr(candles, 14)
     adx_ctx = _calc_adx(candles, 14)
+    candle_overlap_chop_risk = _is_chop(candles)
+    adx_chop_risk = adx_ctx.get("chop_risk_from_adx")
+    effective_chop_risk = bool(candle_overlap_chop_risk) if adx_chop_risk is None else bool(candle_overlap_chop_risk and adx_chop_risk)
     atr_multiple_from_ema = None
     if atr14 not in (None, 0) and invalidation_distance is not None:
         atr_multiple_from_ema = round(invalidation_distance / atr14, 3)
@@ -2773,7 +2776,8 @@ def _build_structure_context(
         "setup_type": setup_ctx.get("setup_type"),
         "trend_label": setup_ctx.get("trend_label"),
         "allowed_setup": setup_ctx.get("allowed_setup"),
-        "chop_risk": _is_chop(candles),
+        "chop_risk": effective_chop_risk,
+        "candle_overlap_chop_risk": candle_overlap_chop_risk,
         "adx_value_1h": adx_ctx.get("adx_value_1h"),
         "plus_di_1h": adx_ctx.get("plus_di_1h"),
         "minus_di_1h": adx_ctx.get("minus_di_1h"),
@@ -5446,7 +5450,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_winner_freeze_2026_04_09",
+        "build_tag": "schema_patch_core_clean_ema_gate_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
