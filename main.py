@@ -3443,6 +3443,46 @@ def _build_candidate_engine_normalized_block(
     }
 
 
+
+
+def _resolve_global_gate_primary_blocker(
+    screened_reason: Optional[str] = None,
+    time_gate_reason: Optional[str] = None,
+) -> Optional[str]:
+    gate_reason = time_gate_reason or screened_reason
+    if gate_reason in {"market_closed", "past_monday_thursday_cutoff"}:
+        return "time_day_gate"
+    return None
+
+
+def _effective_blockers(
+    checklist_block: Dict[str, Any],
+    screened_reason: Optional[str] = None,
+    time_gate_reason: Optional[str] = None,
+) -> List[str]:
+    blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
+    gate_blocker = _resolve_global_gate_primary_blocker(
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+    if gate_blocker:
+        blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    return blockers
+
+
+def _effective_primary_blocker(
+    checklist_block: Dict[str, Any],
+    screened_reason: Optional[str] = None,
+    time_gate_reason: Optional[str] = None,
+) -> Optional[str]:
+    blockers = _effective_blockers(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+    return blockers[0] if blockers else None
+
+
 def _build_decision_context_block(
     summary_payload: Dict[str, Any],
     selected: Optional[Dict[str, Any]],
@@ -3455,6 +3495,15 @@ def _build_decision_context_block(
 ) -> Dict[str, Any]:
     raw_reason = summary_payload.get("reason")
     normalized_reason = selected.get("reason", raw_reason) if selected else raw_reason
+
+    effective_blockers = _effective_blockers(
+        checklist_block,
+        screened_reason=normalized_reason,
+    )
+    effective_primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        screened_reason=normalized_reason,
+    )
 
     return {
         "ok": True,
@@ -3478,12 +3527,8 @@ def _build_decision_context_block(
             "final_verdict": final_verdict,
             "reason": normalized_reason,
         },
-        "primary_blocker": (
-            checklist_block.get("decision_blockers_priority", [None])[0]
-            if checklist_block.get("decision_blockers_priority")
-            else None
-        ),
-        "blockers": checklist_block.get("decision_blockers_priority", []),
+        "primary_blocker": effective_primary_blocker,
+        "blockers": effective_blockers,
         "failed_reasons": failed_reasons,
         "changed_from_raw_engine": (
             summary_payload.get("best_ticker") != best_ticker
@@ -3502,8 +3547,14 @@ def _build_blocker_context_block(
     final_verdict: str,
     user_facing: Dict[str, Any],
 ) -> Dict[str, Any]:
-    blocker_items = checklist_block.get("decision_blockers_priority", []) or []
-    primary_blocker = blocker_items[0] if blocker_items else None
+    blocker_items = _effective_blockers(
+        checklist_block,
+        screened_reason=trigger_state.get("why"),
+    )
+    primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        screened_reason=trigger_state.get("why"),
+    )
 
     return {
         "ok": True,
@@ -4479,14 +4530,24 @@ def _build_final_reason_context_block(
     time_gate_check_context: Dict[str, Any],
     checklist_block: Dict[str, Any],
 ) -> Dict[str, Any]:
-    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
-    primary_blocker = blockers[0] if blockers else None
+    screened_reason = screened_best_context.get("screened_reason")
+    time_gate_reason = time_gate_check_context.get("time_gate_reason")
+    blockers = _effective_blockers(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+    primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
 
     return {
         "ok": True,
         "final_reason": user_facing.get("why"),
-        "screened_reason": screened_best_context.get("screened_reason"),
-        "time_gate_reason": time_gate_check_context.get("time_gate_reason"),
+        "screened_reason": screened_reason,
+        "time_gate_reason": time_gate_reason,
         "entry_window_status": time_gate_check_context.get("entry_window_status"),
         "fresh_entry_allowed": time_gate_check_context.get("fresh_entry_allowed"),
         "early_enough_fails_from_time_gate": time_gate_check_context.get("early_enough_fails_from_time_gate"),
@@ -4505,14 +4566,24 @@ def _build_reason_stack_context_block(
     checklist_block: Dict[str, Any],
     failed_reasons: List[str],
 ) -> Dict[str, Any]:
-    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
-    primary_blocker = blockers[0] if blockers else None
+    screened_reason = final_reason_context.get("screened_reason")
+    time_gate_reason = final_reason_context.get("time_gate_reason")
+    blockers = _effective_blockers(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+    primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
 
     return {
         "ok": True,
         "top_line_reason": final_reason_context.get("final_reason"),
-        "screened_reason": final_reason_context.get("screened_reason"),
-        "time_gate_reason": final_reason_context.get("time_gate_reason"),
+        "screened_reason": screened_reason,
+        "time_gate_reason": time_gate_reason,
         "primary_blocker": primary_blocker,
         "blockers": blockers,
         "failed_reasons": failed_reasons,
