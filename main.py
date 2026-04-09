@@ -3725,6 +3725,128 @@ def _build_approval_context_block(
         "approval_note": approval_note,
     }
 
+
+
+def _build_approval_requirements_context_block(
+    checklist_block: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+    approval_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    checklist_items = {row.get("item"): bool(row.get("yes")) for row in checklist_block.get("items", [])}
+    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+
+    gate_statuses = [
+        {
+            "gate": "allowed_setup_type",
+            "ready": bool(structure_context.get("allowed_setup") is True),
+            "current_value": structure_context.get("setup_type"),
+            "needed_state": "allowed SAFE-FAST setup",
+        },
+        {
+            "gate": "room_pass",
+            "ready": bool(structure_context.get("room_pass") is True),
+            "current_value": structure_context.get("room_pass"),
+            "needed_state": True,
+        },
+        {
+            "gate": "extension_clear",
+            "ready": bool(structure_context.get("extension_blocks_now") is not True),
+            "current_value": structure_context.get("extension_blocks_now"),
+            "needed_state": False,
+        },
+        {
+            "gate": "structure_ready",
+            "ready": bool(trigger_state.get("structure_ready") is True),
+            "current_value": trigger_state.get("structure_ready"),
+            "needed_state": True,
+        },
+        {
+            "gate": "trigger_present",
+            "ready": bool(trigger_state.get("trigger_present") is True),
+            "current_value": trigger_state.get("trigger_present"),
+            "needed_state": True,
+        },
+        {
+            "gate": "liquidity_ok",
+            "ready": bool(liquidity_context.get("liquidity_pass") is True),
+            "current_value": liquidity_context.get("liquidity_pass"),
+            "needed_state": True,
+        },
+        {
+            "gate": "market_open",
+            "ready": bool(market_context.get("is_open") is True),
+            "current_value": market_context.get("is_open"),
+            "needed_state": True,
+        },
+        {
+            "gate": "fresh_entry_allowed",
+            "ready": bool(time_day_gate.get("fresh_entry_allowed") is True),
+            "current_value": time_day_gate.get("fresh_entry_allowed"),
+            "needed_state": True,
+        },
+        {
+            "gate": "macro_event_clear",
+            "ready": bool(
+                not macro_context.get("has_major_event_today")
+                and not macro_context.get("has_major_event_tomorrow")
+            ),
+            "current_value": {
+                "has_major_event_today": macro_context.get("has_major_event_today"),
+                "has_major_event_tomorrow": macro_context.get("has_major_event_tomorrow"),
+            },
+            "needed_state": {
+                "has_major_event_today": False,
+                "has_major_event_tomorrow": False,
+            },
+        },
+    ]
+
+    missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
+    next_flip_needed = blockers[0] if blockers else (missing_gates[0] if missing_gates else None)
+
+    if approval_context.get("approval_ready_now") is True:
+        approval_path_status = "APPROVED_NOW"
+    elif approval_context.get("intrabar_raw_signal_detected") is True:
+        approval_path_status = "WAITING_FOR_GATES"
+    elif approval_context.get("completed_raw_signal_detected") is True:
+        approval_path_status = "COMPLETED_SIGNAL_WAITING_FOR_GATES"
+    else:
+        approval_path_status = "NO_SIGNAL_YET"
+
+    return {
+        "ok": True,
+        "approval_path_status": approval_path_status,
+        "approval_ready_now": approval_context.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
+        "intrabar_raw_signal_detected": approval_context.get("intrabar_raw_signal_detected"),
+        "completed_raw_signal_detected": approval_context.get("completed_raw_signal_detected"),
+        "next_flip_needed": next_flip_needed,
+        "missing_gates": missing_gates,
+        "gate_statuses": gate_statuses,
+        "checklist_failed_items": checklist_block.get("failed_items", []),
+        "blockers": blockers,
+        "allowed_setup": structure_context.get("allowed_setup"),
+        "setup_type": structure_context.get("setup_type"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "structure_ready": trigger_state.get("structure_ready"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "liquidity_ok": liquidity_context.get("liquidity_pass"),
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "macro_event_clear": bool(
+            not macro_context.get("has_major_event_today")
+            and not macro_context.get("has_major_event_tomorrow")
+        ),
+    }
+
+
 def _build_screened_best_context(
     selected: Optional[Dict[str, Any]],
     engine_best_ticker: Optional[str],
@@ -4372,11 +4494,21 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         trigger_state=trigger_state,
         user_facing=user_facing_block,
     )
+    approval_requirements_context_block = _build_approval_requirements_context_block(
+        checklist_block=checklist_block,
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        macro_context=macro_context,
+        liquidity_context=liquidity_context,
+        approval_context=approval_context_block,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_approval_context_2026_04_09",
+        "build_tag": "schema_patch_approval_requirements_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4430,6 +4562,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "entry_context": entry_context_block,
         "intrabar_signal_context": intrabar_signal_context_block,
         "approval_context": approval_context_block,
+        "approval_requirements_context": approval_requirements_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
