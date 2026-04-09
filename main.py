@@ -2918,35 +2918,13 @@ def _build_user_facing_block(
         }
 
     if not market_context["is_open"]:
-        blocking_reasons: List[str] = []
-
-        if structure_context.get("ok"):
-            if structure_context.get("room_pass") is False:
-                blocking_reasons.append("Room to first wall is too tight for SAFE-FAST.")
-            if structure_context.get("extension_state") == "extended":
-                blocking_reasons.append("Move is too extended from the 1H 50 EMA.")
-            if structure_context.get("allowed_setup") is False:
-                blocking_reasons.append(f"Setup type is {structure_context.get('setup_type')}, which is not tradable now.")
-            if structure_context.get("wall_pass") is False:
-                blocking_reasons.append("Wall thesis and strike placement do not match.")
-
-        if blocking_reasons:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": blocking_reasons[0],
-            }
-
         return {
-            "good_idea_now": "WAIT",
+            "good_idea_now": "NO",
             "ticker": ticker,
-            "action": "wait for next regular session",
+            "action": "stand down",
             "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-            "setup_state": "WAIT_MARKET_CLOSED",
-            "why": f"Candidate exists, but the regular session is closed as of {market_context['as_of_et']}. Re-check next session before entry.",
+            "setup_state": "NO TRADE",
+            "why": "Market is closed. Re-check next regular session before entry.",
         }
 
     if macro_context.get("ok") and (
@@ -5450,7 +5428,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_clean_ema_gate_2026_04_09",
+        "build_tag": "schema_patch_core_market_closed_reason_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
