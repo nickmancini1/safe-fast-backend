@@ -3457,12 +3457,50 @@ def _build_decision_context_block(
             "final_verdict": final_verdict,
             "reason": normalized_reason,
         },
+        "primary_blocker": (
+            checklist_block.get("decision_blockers_priority", [None])[0]
+            if checklist_block.get("decision_blockers_priority")
+            else None
+        ),
         "blockers": checklist_block.get("decision_blockers_priority", []),
         "failed_reasons": failed_reasons,
         "changed_from_raw_engine": (
             summary_payload.get("best_ticker") != best_ticker
             or summary_payload.get("verdict") != engine_status
         ),
+    }
+
+
+
+def _build_blocker_context_block(
+    checklist_block: Dict[str, Any],
+    failed_reasons: List[str],
+    trigger_state: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    engine_status: str,
+    final_verdict: str,
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    blocker_items = checklist_block.get("decision_blockers_priority", []) or []
+    primary_blocker = blocker_items[0] if blocker_items else None
+
+    return {
+        "ok": True,
+        "primary_blocker": primary_blocker,
+        "blockers": blocker_items,
+        "failed_reasons": failed_reasons,
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "structure_ready": trigger_state.get("structure_ready"),
+        "setup_type": structure_context.get("setup_type"),
+        "allowed_setup": structure_context.get("allowed_setup"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "engine_status": engine_status,
+        "final_verdict": final_verdict,
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
     }
 
 def _build_screened_best_context(
@@ -4067,7 +4105,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_decision_context_2026_04_09",
+        "build_tag": "schema_patch_blocker_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4102,6 +4140,15 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             best_ticker=best_ticker,
             checklist_block=checklist_block,
             failed_reasons=failed_reasons_block,
+            user_facing=user_facing_block,
+        ),
+        "blocker_context": _build_blocker_context_block(
+            checklist_block=checklist_block,
+            failed_reasons=failed_reasons_block,
+            trigger_state=trigger_state,
+            structure_context=structure_context,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
             user_facing=user_facing_block,
         ),
         "live_map": _build_live_map_block(
