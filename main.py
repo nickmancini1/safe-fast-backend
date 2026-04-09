@@ -4106,19 +4106,32 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@app.get("/safe-fast/on-demand/default")
-async def safe_fast_on_demand_default() -> Any:
-    return await _build_on_demand_payload(
-        OnDemandRequest(
-            option_type="C",
-            open_positions=0,
-            weekly_trade_count=0,
-        )
+def _default_on_demand_request() -> OnDemandRequest:
+    return OnDemandRequest(
+        option_type="C",
+        open_positions=0,
+        weekly_trade_count=0,
     )
 
 
+@app.get("/safe-fast/on-demand/default")
+async def safe_fast_on_demand_default() -> Any:
+    return await _build_on_demand_payload(_default_on_demand_request())
+
+
+@app.get("/safe-fast/on-demand/default/simple")
+async def safe_fast_on_demand_default_simple() -> Any:
+    payload = await _build_on_demand_payload(_default_on_demand_request())
+    return {
+        "ok": payload.get("ok"),
+        "build_tag": payload.get("build_tag"),
+        "read_this_first": payload.get("read_this_first"),
+        "simple_output": payload.get("simple_output"),
+        "screened_best_context": payload.get("screened_best_context"),
+        "failed_reasons": payload.get("failed_reasons"),
+    }
+
+
 @app.post("/safe-fast/on-demand")
-
-
 async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
     return await _build_on_demand_payload(request)
