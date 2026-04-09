@@ -4479,6 +4479,30 @@ def _build_final_reason_context_block(
 
 
 
+def _build_reason_stack_context_block(
+    final_reason_context: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+    failed_reasons: List[str],
+) -> Dict[str, Any]:
+    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    primary_blocker = blockers[0] if blockers else None
+
+    return {
+        "ok": True,
+        "top_line_reason": final_reason_context.get("final_reason"),
+        "screened_reason": final_reason_context.get("screened_reason"),
+        "time_gate_reason": final_reason_context.get("time_gate_reason"),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "failed_reasons": failed_reasons,
+        "reason_count": len(failed_reasons or []),
+        "note": (
+            "The top-line NO_TRADE reason is concise. "
+            "Use blockers and failed_reasons for the full rejection stack."
+        ),
+    }
+
+
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     clean_option_type = _clean_option_type(request.option_type)
@@ -4725,11 +4749,16 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         time_gate_check_context=time_gate_check_context_block,
         checklist_block=checklist_block,
     )
+    reason_stack_context_block = _build_reason_stack_context_block(
+        final_reason_context=final_reason_context_block,
+        checklist_block=checklist_block,
+        failed_reasons=failed_reasons_block,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_final_reason_context_2026_04_09",
+        "build_tag": "schema_patch_reason_stack_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4789,6 +4818,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "setup_check_context": setup_check_context_block,
         "time_gate_check_context": time_gate_check_context_block,
         "final_reason_context": final_reason_context_block,
+        "reason_stack_context": reason_stack_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
