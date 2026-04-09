@@ -3383,10 +3383,13 @@ def _build_screened_best_context(
     engine_pick_reason = engine_pick.get("reason") if engine_pick else None
     engine_pick_verdict = engine_pick.get("final_verdict") if engine_pick else None
 
+    normalized_engine_best_ticker = selected.get("symbol")
     return {
         "ok": True,
         "screened_best_ticker": selected.get("symbol"),
-        "engine_best_ticker": engine_best_ticker,
+        "raw_engine_best_ticker": engine_best_ticker,
+        "normalized_engine_best_ticker": normalized_engine_best_ticker,
+        "engine_best_ticker": normalized_engine_best_ticker,
         "changed_from_engine_best": selected.get("symbol") != engine_best_ticker,
         "screened_final_verdict": selected.get("final_verdict"),
         "screened_reason": selected.get("reason"),
@@ -3944,6 +3947,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     raw_engine_winner_ticker = summary_payload.get("best_ticker")
     raw_engine_winner_status = summary_payload.get("verdict")
+    normalized_engine_winner_ticker = best_ticker
     normalized_engine_winner_status = engine_status
     normalized_engine_winner_final_verdict = final_verdict
     screened_live_winner_ticker = best_ticker
@@ -3956,17 +3960,19 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_winner_context_status_clarity_2026_04_09",
+        "build_tag": "schema_patch_engine_ticker_clarity_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
         "candidate_engine_status": engine_status,
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
-        "engine_best_ticker": summary_payload.get("best_ticker"),
+        "raw_engine_best_ticker": raw_engine_winner_ticker,
+        "engine_best_ticker": normalized_engine_winner_ticker,
         "winner_context": {
             "raw_engine_winner_ticker": raw_engine_winner_ticker,
             "raw_engine_winner_status": raw_engine_winner_status,
+            "normalized_engine_winner_ticker": normalized_engine_winner_ticker,
             "normalized_engine_winner_status": normalized_engine_winner_status,
             "normalized_engine_winner_final_verdict": normalized_engine_winner_final_verdict,
             "screened_live_winner_ticker": screened_live_winner_ticker,
