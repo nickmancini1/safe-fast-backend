@@ -3768,6 +3768,12 @@ def _build_python_validation(
     }
 
 
+def _normalize_top_level_status(final_verdict: Optional[str]) -> str:
+    if final_verdict in {"ACTIVE_NOW", "PENDING", "NO_TRADE", "INVALIDATED"}:
+        return str(final_verdict)
+    return "NO_TRADE"
+
+
 def _build_ten_second_checklist(
     request: OnDemandRequest,
     checklist_block: Dict[str, Any],
@@ -3855,8 +3861,9 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     selected = _select_screened_best_candidate(screened_candidates)
 
     best_ticker = selected.get("symbol") if selected and selected.get("primary_candidate") else summary_payload.get("best_ticker")
-    engine_status = summary_payload.get("verdict", "NO_TRADE")
+    raw_engine_status = summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
+    engine_status = _normalize_top_level_status(final_verdict)
     primary_candidate = selected.get("primary_candidate") if selected else summary_payload.get("primary_candidate")
     chart_check = selected.get("chart_check") if selected else None
     chart_check_error = selected.get("chart_check_error") if selected else None
@@ -3900,7 +3907,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     user_facing_block = _build_user_facing_block(
         request=request,
-        engine_status=engine_status,
+        engine_status=raw_engine_status,
         final_verdict=final_verdict,
         best_ticker=best_ticker,
         chart_check=chart_check,
@@ -3947,7 +3954,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_trigger_scan_adx_fill_2026_04_09",
+        "build_tag": "schema_patch_top_level_status_normalize_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
