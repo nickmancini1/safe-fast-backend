@@ -3594,6 +3594,74 @@ def _build_entry_context_block(
         "good_idea_now": user_facing.get("good_idea_now"),
     }
 
+
+def _build_intrabar_signal_context_block(
+    entry_context: Dict[str, Any],
+    live_map: Dict[str, Any],
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    trigger_scan = live_map.get("trigger_scan") or {}
+    current_bar = trigger_scan.get("current_bar") or {}
+    completed_candle = trigger_scan.get("most_recent_completed_candle") or {}
+
+    intrabar_trade_available_now = bool(entry_context.get("mid_candle_trade_available_now") is True)
+    intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
+    completed_trade_available = bool(entry_context.get("completed_candle_trade_available") is True)
+    completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
+
+    if intrabar_trade_available_now:
+        intrabar_signal_status = "APPROVED_NOW"
+    elif intrabar_raw_signal_detected:
+        intrabar_signal_status = "RAW_SIGNAL_BLOCKED_NOW"
+    else:
+        intrabar_signal_status = "NO_INTRABAR_SIGNAL"
+
+    if completed_trade_available:
+        completed_signal_status = "APPROVED_ON_COMPLETED_CANDLE"
+    elif completed_raw_signal_detected:
+        completed_signal_status = "RAW_SIGNAL_BLOCKED_ON_COMPLETED_CANDLE"
+    else:
+        completed_signal_status = "NO_COMPLETED_CANDLE_SIGNAL"
+
+    if intrabar_trade_available_now:
+        signal_note = "Intrabar SAFE-FAST entry is approved right now."
+    elif intrabar_raw_signal_detected:
+        signal_note = "Intrabar signal is visible, but SAFE-FAST approval still blocks entry."
+    elif completed_trade_available:
+        signal_note = "Completed-candle SAFE-FAST entry is approved."
+    elif completed_raw_signal_detected:
+        signal_note = "Completed-candle signal is visible, but SAFE-FAST approval still blocks entry."
+    else:
+        signal_note = "No live intrabar or completed-candle signal is currently available."
+
+    return {
+        "ok": True,
+        "ticker": live_map.get("ticker"),
+        "intrabar_signal_status": intrabar_signal_status,
+        "intrabar_trade_available_now": intrabar_trade_available_now,
+        "intrabar_raw_signal_detected": intrabar_raw_signal_detected,
+        "intrabar_block_reason": entry_context.get("mid_candle_block_reason"),
+        "intrabar_time_iso": current_bar.get("time_iso"),
+        "intrabar_close": current_bar.get("close"),
+        "intrabar_trigger_level_relation": current_bar.get("relation_to_trigger_level"),
+        "intrabar_ema_relation": current_bar.get("relation_to_ema50_1h"),
+        "completed_signal_status": completed_signal_status,
+        "completed_trade_available": completed_trade_available,
+        "completed_raw_signal_detected": completed_raw_signal_detected,
+        "completed_block_reason": entry_context.get("completed_candle_block_reason"),
+        "completed_time_iso": completed_candle.get("time_iso"),
+        "completed_close": completed_candle.get("close"),
+        "primary_blocker": entry_context.get("primary_blocker"),
+        "blockers": entry_context.get("blockers"),
+        "trigger_present": entry_context.get("trigger_present"),
+        "trigger_reason": entry_context.get("trigger_reason"),
+        "structure_ready": entry_context.get("structure_ready"),
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
+        "signal_note": signal_note,
+    }
+
 def _build_screened_best_context(
     selected: Optional[Dict[str, Any]],
     engine_best_ticker: Optional[str],
@@ -4221,11 +4289,23 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         primary_candidate=primary_candidate,
         request=request,
     )
+    entry_context_block = _build_entry_context_block(
+        trigger_state=trigger_state,
+        live_map=live_map_block,
+        checklist_block=checklist_block,
+        structure_context=structure_context,
+        user_facing=user_facing_block,
+    )
+    intrabar_signal_context_block = _build_intrabar_signal_context_block(
+        entry_context=entry_context_block,
+        live_map=live_map_block,
+        user_facing=user_facing_block,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_entry_context_2026_04_09",
+        "build_tag": "schema_patch_intrabar_signal_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4276,13 +4356,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             trigger_state=trigger_state,
             live_map=live_map_block,
         ),
-        "entry_context": _build_entry_context_block(
-            trigger_state=trigger_state,
-            live_map=live_map_block,
-            checklist_block=checklist_block,
-            structure_context=structure_context,
-            user_facing=user_facing_block,
-        ),
+        "entry_context": entry_context_block,
+        "intrabar_signal_context": intrabar_signal_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
