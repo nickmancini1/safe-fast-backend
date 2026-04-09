@@ -4291,6 +4291,8 @@ def _build_ten_second_checklist(
     }
 
 
+async 
+
 def _build_approval_flip_context_block(
     approval_requirements_context: Dict[str, Any],
     approval_context: Dict[str, Any],
@@ -4344,7 +4346,43 @@ def _build_approval_flip_context_block(
         ),
     }
 
-async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
+
+def _build_setup_eligibility_context_block(
+    structure_context: Dict[str, Any],
+    live_map: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+    approval_requirements_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    setup_type = structure_context.get("setup_type")
+    allowed_setup = bool(structure_context.get("allowed_setup") is True)
+    route = live_map.get("setup_route") or {}
+    blockers = checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or []
+    primary_blocker = blockers[0] if blockers else None
+
+    if not setup_type:
+        setup_type_status = "NO_SETUP_TYPE_DETECTED"
+    elif allowed_setup:
+        setup_type_status = "ELIGIBLE_NOW"
+    else:
+        setup_type_status = "DETECTED_BUT_NOT_ELIGIBLE"
+
+    return {
+        "ok": True,
+        "setup_type_detected": setup_type,
+        "setup_type_status": setup_type_status,
+        "allowed_setup": allowed_setup,
+        "ten_second_check_answer": "YES" if allowed_setup else "NO",
+        "setup_route_status": route.get("setup_route_status"),
+        "setup_route_reason": route.get("why_setup_route_passes_or_fails"),
+        "next_flip_needed": approval_requirements_context.get("next_flip_needed") or primary_blocker,
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "approval_path_status": approval_requirements_context.get("approval_path_status"),
+        "note": "A setup label can be detected while SAFE-FAST still marks the setup as not eligible."
+    }
+
+
+def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
@@ -4563,11 +4601,17 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         entry_context=entry_context_block,
         intrabar_signal_context=intrabar_signal_context_block,
     )
+    setup_eligibility_context_block = _build_setup_eligibility_context_block(
+        structure_context=structure_context,
+        live_map=live_map_block,
+        checklist_block=checklist_block,
+        approval_requirements_context=approval_requirements_context_block,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_approval_flip_context_2026_04_09",
+        "build_tag": "schema_patch_setup_eligibility_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4623,6 +4667,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "approval_context": approval_context_block,
         "approval_requirements_context": approval_requirements_context_block,
         "approval_flip_context": approval_flip_context_block,
+        "setup_eligibility_context": setup_eligibility_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
