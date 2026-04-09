@@ -4502,6 +4502,52 @@ def _build_reason_stack_context_block(
         ),
     }
 
+
+
+def _build_winner_shift_context_block(
+    *,
+    raw_engine_winner_ticker: Optional[str],
+    raw_engine_winner_status: Optional[str],
+    normalized_engine_winner_ticker: Optional[str],
+    normalized_engine_winner_status: Optional[str],
+    normalized_engine_winner_final_verdict: Optional[str],
+    screened_live_winner_ticker: Optional[str],
+    screened_live_winner_final_verdict: Optional[str],
+    screened_reason: Optional[str],
+) -> Dict[str, Any]:
+    raw_to_normalized_changed = raw_engine_winner_ticker != normalized_engine_winner_ticker
+    normalized_to_screened_changed = normalized_engine_winner_ticker != screened_live_winner_ticker
+    any_shift = raw_to_normalized_changed or normalized_to_screened_changed
+
+    if raw_to_normalized_changed and normalized_to_screened_changed:
+        shift_path = "RAW_TO_NORMALIZED_TO_SCREENED_SHIFT"
+    elif raw_to_normalized_changed:
+        shift_path = "RAW_TO_NORMALIZED_SHIFT"
+    elif normalized_to_screened_changed:
+        shift_path = "NORMALIZED_TO_SCREENED_SHIFT"
+    else:
+        shift_path = "NO_SHIFT"
+
+    return {
+        "ok": True,
+        "shift_path": shift_path,
+        "raw_engine_winner_ticker": raw_engine_winner_ticker,
+        "raw_engine_winner_status": raw_engine_winner_status,
+        "normalized_engine_winner_ticker": normalized_engine_winner_ticker,
+        "normalized_engine_winner_status": normalized_engine_winner_status,
+        "normalized_engine_winner_final_verdict": normalized_engine_winner_final_verdict,
+        "screened_live_winner_ticker": screened_live_winner_ticker,
+        "screened_live_winner_final_verdict": screened_live_winner_final_verdict,
+        "raw_to_normalized_changed": raw_to_normalized_changed,
+        "normalized_to_screened_changed": normalized_to_screened_changed,
+        "any_shift": any_shift,
+        "screened_reason": screened_reason,
+        "note": (
+            "Raw engine selection, normalized winner, and screened live winner can differ. "
+            "Use this block to track exactly where the handoff changed."
+        ),
+    }
+
 def _coerce_error_reason(value: Any) -> str:
     if value is None:
         return "Candidate engine unavailable for this run."
@@ -5338,11 +5384,21 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         checklist_block=checklist_block,
         failed_reasons=failed_reasons_block,
     )
+    winner_shift_context_block = _build_winner_shift_context_block(
+        raw_engine_winner_ticker=raw_engine_winner_ticker,
+        raw_engine_winner_status=raw_engine_winner_status,
+        normalized_engine_winner_ticker=normalized_engine_winner_ticker,
+        normalized_engine_winner_status=normalized_engine_winner_status,
+        normalized_engine_winner_final_verdict=normalized_engine_winner_final_verdict,
+        screened_live_winner_ticker=screened_live_winner_ticker,
+        screened_live_winner_final_verdict=screened_live_final_verdict,
+        screened_reason=screened_best_context_block.get("screened_reason"),
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_reason_stack_context_2026_04_09",
+        "build_tag": "schema_patch_winner_shift_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -5403,6 +5459,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "time_gate_check_context": time_gate_check_context_block,
         "final_reason_context": final_reason_context_block,
         "reason_stack_context": reason_stack_context_block,
+        "winner_shift_context": winner_shift_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
