@@ -4379,6 +4379,41 @@ def _build_setup_eligibility_context_block(
         "note": "A setup label can be detected while SAFE-FAST still marks the setup as not eligible."
     }
 
+def _build_setup_check_context_block(
+    structure_context: Dict[str, Any],
+    ten_second_checklist_block: Dict[str, Any],
+    setup_eligibility_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    setup_type = structure_context.get("setup_type")
+    allowed_setup = bool(structure_context.get("allowed_setup") is True)
+    answers = ten_second_checklist_block.get("answers") or []
+    allowed_setup_answer = None
+    for row in answers:
+        if row.get("item") == "allowed_setup_type":
+            allowed_setup_answer = row.get("answer")
+            break
+
+    setup_type_status = setup_eligibility_context.get("setup_type_status")
+    primary_blocker = setup_eligibility_context.get("primary_blocker")
+    blockers = setup_eligibility_context.get("blockers") or []
+
+    return {
+        "ok": True,
+        "setup_type_detected": setup_type,
+        "setup_type_status": setup_type_status,
+        "allowed_setup": allowed_setup,
+        "ten_second_check_item": "allowed_setup_type",
+        "ten_second_check_answer": allowed_setup_answer,
+        "detected_but_not_eligible": bool(setup_type and not allowed_setup),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "note": (
+            "Setup detection and setup eligibility are separate. "
+            "A route can be labeled while the checklist still says NO."
+        ),
+    }
+
+
 
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
@@ -4605,11 +4640,16 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         checklist_block=checklist_block,
         approval_requirements_context=approval_requirements_context_block,
     )
+    setup_check_context_block = _build_setup_check_context_block(
+        structure_context=structure_context,
+        ten_second_checklist_block=ten_second_checklist_block,
+        setup_eligibility_context=setup_eligibility_context_block,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_setup_eligibility_context_2026_04_09",
+        "build_tag": "schema_patch_setup_check_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4666,6 +4706,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "approval_requirements_context": approval_requirements_context_block,
         "approval_flip_context": approval_flip_context_block,
         "setup_eligibility_context": setup_eligibility_context_block,
+        "setup_check_context": setup_check_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
