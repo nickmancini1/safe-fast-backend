@@ -3944,6 +3944,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     raw_engine_winner_ticker = summary_payload.get("best_ticker")
     raw_engine_winner_status = summary_payload.get("verdict")
+    normalized_engine_winner_status = engine_status
+    normalized_engine_winner_final_verdict = final_verdict
     screened_live_winner_ticker = best_ticker
     screened_live_winner_final_verdict = final_verdict
     changed_after_screening = raw_engine_winner_ticker != screened_live_winner_ticker
@@ -3954,7 +3956,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_top_level_status_normalize_2026_04_09",
+        "build_tag": "schema_patch_winner_context_status_clarity_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -3965,6 +3967,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "winner_context": {
             "raw_engine_winner_ticker": raw_engine_winner_ticker,
             "raw_engine_winner_status": raw_engine_winner_status,
+            "normalized_engine_winner_status": normalized_engine_winner_status,
+            "normalized_engine_winner_final_verdict": normalized_engine_winner_final_verdict,
             "screened_live_winner_ticker": screened_live_winner_ticker,
             "screened_live_winner_final_verdict": screened_live_winner_final_verdict,
             "changed_after_screening": changed_after_screening,
