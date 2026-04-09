@@ -4291,7 +4291,62 @@ def _build_ten_second_checklist(
     }
 
 
-async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
+async 
+
+def _build_approval_flip_context_block(
+    approval_requirements_context: Dict[str, Any],
+    approval_context: Dict[str, Any],
+    entry_context: Dict[str, Any],
+    intrabar_signal_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    gate_statuses = approval_requirements_context.get("gate_statuses") or []
+    ready_gates = [row.get("gate") for row in gate_statuses if row.get("ready")]
+    missing_gates = approval_requirements_context.get("missing_gates") or [
+        row.get("gate") for row in gate_statuses if not row.get("ready")
+    ]
+    next_flip_needed = approval_requirements_context.get("next_flip_needed")
+    approval_ready_now = bool(approval_context.get("approval_ready_now") is True)
+    approval_ready_on_completed_candle = bool(approval_context.get("approval_ready_on_completed_candle") is True)
+    intrabar_raw_signal_detected = bool(approval_context.get("intrabar_raw_signal_detected") is True)
+    completed_raw_signal_detected = bool(approval_context.get("completed_raw_signal_detected") is True)
+
+    if approval_ready_now:
+        flip_status = "APPROVED_NOW"
+    elif approval_ready_on_completed_candle:
+        flip_status = "APPROVED_ON_COMPLETED_CANDLE"
+    elif intrabar_raw_signal_detected:
+        flip_status = "NEXT_GATE_BLOCKING_INTRABAR_ENTRY"
+    elif completed_raw_signal_detected:
+        flip_status = "NEXT_GATE_BLOCKING_COMPLETED_ENTRY"
+    else:
+        flip_status = "NO_SIGNAL_TO_APPROVE"
+
+    return {
+        "ok": True,
+        "flip_status": flip_status,
+        "next_flip_needed": next_flip_needed,
+        "ready_gate_count": len([gate for gate in ready_gates if gate]),
+        "remaining_gate_count": len([gate for gate in missing_gates if gate]),
+        "ready_gates": [gate for gate in ready_gates if gate],
+        "missing_gates": [gate for gate in missing_gates if gate],
+        "intrabar_raw_signal_detected": intrabar_raw_signal_detected,
+        "completed_raw_signal_detected": completed_raw_signal_detected,
+        "approval_ready_now": approval_ready_now,
+        "approval_ready_on_completed_candle": approval_ready_on_completed_candle,
+        "mid_candle_trade_available_now": bool(entry_context.get("mid_candle_trade_available_now") is True),
+        "completed_candle_trade_available": bool(entry_context.get("completed_candle_trade_available") is True),
+        "intrabar_signal_status": intrabar_signal_context.get("intrabar_signal_status"),
+        "approval_status": approval_context.get("approval_status"),
+        "primary_blocker": approval_context.get("primary_blocker"),
+        "blockers": approval_context.get("blockers", []),
+        "approval_note": (
+            "Flip the next required gate before any raw signal can become an approved SAFE-FAST entry."
+            if next_flip_needed
+            else "No remaining approval gate is blocking right now."
+        ),
+    }
+
+def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
@@ -4504,11 +4559,17 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         liquidity_context=liquidity_context,
         approval_context=approval_context_block,
     )
+    approval_flip_context_block = _build_approval_flip_context_block(
+        approval_requirements_context=approval_requirements_context_block,
+        approval_context=approval_context_block,
+        entry_context=entry_context_block,
+        intrabar_signal_context=intrabar_signal_context_block,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_approval_requirements_context_2026_04_09",
+        "build_tag": "schema_patch_approval_flip_context_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -4563,6 +4624,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "intrabar_signal_context": intrabar_signal_context_block,
         "approval_context": approval_context_block,
         "approval_requirements_context": approval_requirements_context_block,
+        "approval_flip_context": approval_flip_context_block,
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
