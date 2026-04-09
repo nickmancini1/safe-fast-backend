@@ -4291,8 +4291,6 @@ def _build_ten_second_checklist(
     }
 
 
-async 
-
 def _build_approval_flip_context_block(
     approval_requirements_context: Dict[str, Any],
     approval_context: Dict[str, Any],
@@ -4346,7 +4344,7 @@ def _build_approval_flip_context_block(
         ),
     }
 
-def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
+async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
