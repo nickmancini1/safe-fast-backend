@@ -3338,9 +3338,48 @@ def _screened_other_candidates(screened: List[Dict[str, Any]], best_ticker: Opti
     return out
 
 
-def _select_screened_best_candidate(screened_candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _should_freeze_winner_to_raw_engine(
+    *,
+    summary_payload: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> bool:
+    raw_best_ticker = summary_payload.get("best_ticker")
+    if not raw_best_ticker:
+        return False
+
+    global_gate_reason = str(time_day_gate.get("reason") or "").strip().lower()
+    if global_gate_reason in {
+        "market_closed",
+        "past_monday_thursday_cutoff",
+        "outside_time_window",
+        "outside_day_window",
+    }:
+        return True
+
+    if market_context.get("is_open") is False:
+        return True
+
+    fresh_entry_allowed = time_day_gate.get("fresh_entry_allowed")
+    if fresh_entry_allowed is False:
+        return True
+
+    return False
+
+
+def _select_screened_best_candidate(
+    screened_candidates: List[Dict[str, Any]],
+    *,
+    raw_engine_best_ticker: Optional[str] = None,
+    freeze_to_raw_engine: bool = False,
+) -> Optional[Dict[str, Any]]:
     if not screened_candidates:
         return None
+
+    if freeze_to_raw_engine and raw_engine_best_ticker:
+        for item in screened_candidates:
+            if item.get("symbol") == raw_engine_best_ticker:
+                return item
 
     with_primary = [item for item in screened_candidates if item.get("primary_candidate")]
     if with_primary:
@@ -5184,9 +5223,18 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     )
 
     screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
-    selected = _select_screened_best_candidate(screened_candidates)
+    freeze_to_raw_engine = _should_freeze_winner_to_raw_engine(
+        summary_payload=summary_payload,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+    )
+    selected = _select_screened_best_candidate(
+        screened_candidates,
+        raw_engine_best_ticker=summary_payload.get("best_ticker"),
+        freeze_to_raw_engine=freeze_to_raw_engine,
+    )
 
-    best_ticker = selected.get("symbol") if selected and selected.get("primary_candidate") else summary_payload.get("best_ticker")
+    best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
     raw_engine_status = summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
     engine_status = _normalize_top_level_status(final_verdict)
@@ -5398,7 +5446,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_winner_shift_context_2026_04_09",
+        "build_tag": "schema_patch_core_winner_freeze_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
