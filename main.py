@@ -3198,7 +3198,17 @@ def _build_checklist_block(
     ]
 
     failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
+    global_gate_failures: List[str] = []
+    if time_day_gate.get("fresh_entry_allowed") is False:
+        global_gate_failures.append("time_day_gate")
+
+    effective_failed_items = list(failed_items)
+    for item in global_gate_failures:
+        if item not in effective_failed_items:
+            effective_failed_items.insert(0, item)
+
     priority_order = [
+        "time_day_gate",
         "allowed_setup_type",
         "twentyfour_hour_supportive",
         "one_hour_clean_around_ema",
@@ -3212,12 +3222,19 @@ def _build_checklist_block(
     ]
     priority_rank = {name: idx for idx, name in enumerate(priority_order)}
     decision_blockers_priority = sorted(failed_items, key=lambda item: (priority_rank.get(item, 999), item))
+    effective_decision_blockers_priority = sorted(
+        effective_failed_items,
+        key=lambda item: (priority_rank.get(item, 999), item),
+    )
 
     return {
         "ok": True,
         "items": items,
         "failed_items": failed_items,
         "decision_blockers_priority": decision_blockers_priority,
+        "effective_failed_items": effective_failed_items,
+        "effective_decision_blockers_priority": effective_decision_blockers_priority,
+        "global_gate_failures": global_gate_failures,
     }
 
 
@@ -4745,7 +4762,7 @@ def _build_on_demand_unavailable_payload(
     status_code: int = 503,
 ) -> Dict[str, Any]:
     reason_text = _coerce_error_reason(reason)
-    build_tag = "schema_patch_core_setup_eligibility_split_2026_04_09"
+    build_tag = "schema_patch_core_checklist_source_gate_2026_04_10"
     failed_reasons = [reason_text]
     primary_blocker = "data_unavailable"
 
