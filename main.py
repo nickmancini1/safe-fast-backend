@@ -3405,6 +3405,19 @@ def _candidate_materially_improves_over_raw(
     if raw_primary and not challenger_primary:
         return False
 
+    raw_checklist = raw_item.get("checklist") or {}
+    challenger_checklist = challenger.get("checklist") or {}
+    raw_failed = set(raw_checklist.get("effective_failed_items") or raw_checklist.get("failed_items") or [])
+    challenger_failed = set(challenger_checklist.get("effective_failed_items") or challenger_checklist.get("failed_items") or [])
+
+    if "allowed_setup_type" in raw_failed and "allowed_setup_type" not in challenger_failed:
+        return True
+
+    raw_structure = raw_item.get("structure_context") or {}
+    challenger_structure = challenger.get("structure_context") or {}
+    if raw_structure.get("allowed_setup") is False and challenger_structure.get("allowed_setup") is True:
+        return True
+
     return False
 
 def _select_screened_best_candidate(
@@ -5661,7 +5674,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_raw_signal_behavior_2026_04_10",
+        "build_tag": "schema_patch_core_material_winner_improvement_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
