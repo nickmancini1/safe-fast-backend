@@ -245,8 +245,17 @@ def _build_trigger_detail_context(
     current_high = _to_float(current_candle.get("high"))
     current_low = _to_float(current_candle.get("low"))
 
+    time_gate_blocked = trigger_state.get("why") in {
+        "market_closed",
+        "past_monday_thursday_cutoff",
+        "past_friday_cutoff",
+        "weekend",
+    }
+
     if option_type == "C":
-        if trigger_level is not None and current_close is not None and current_close > trigger_level:
+        if time_gate_blocked:
+            behavior_label = "blocked_by_time_gate"
+        elif trigger_level is not None and current_close is not None and current_close > trigger_level:
             behavior_label = (
                 "breaking_above_trigger"
                 if structure_ready
@@ -269,7 +278,9 @@ def _build_trigger_detail_context(
         else:
             behavior_label = "below_ema_or_not_ready"
     else:
-        if trigger_level is not None and current_close is not None and current_close < trigger_level:
+        if time_gate_blocked:
+            behavior_label = "blocked_by_time_gate"
+        elif trigger_level is not None and current_close is not None and current_close < trigger_level:
             behavior_label = (
                 "breaking_below_trigger"
                 if structure_ready
@@ -5742,7 +5753,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_time_gate_preserves_trigger_map_2026_04_10",
+        "build_tag": "schema_patch_core_time_gate_block_label_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
