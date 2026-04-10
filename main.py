@@ -3721,19 +3721,37 @@ def _build_blocker_context_block(
     final_verdict: str,
     user_facing: Dict[str, Any],
 ) -> Dict[str, Any]:
+    gate_reason = trigger_state.get("gate_reason") or trigger_state.get("why")
     blocker_items = _effective_blockers(
         checklist_block,
-        screened_reason=trigger_state.get("gate_reason") or trigger_state.get("why"),
+        screened_reason=gate_reason,
+        time_gate_reason=trigger_state.get("gate_reason"),
     )
     primary_blocker = _effective_primary_blocker(
         checklist_block,
-        screened_reason=trigger_state.get("gate_reason") or trigger_state.get("why"),
+        screened_reason=gate_reason,
+        time_gate_reason=trigger_state.get("gate_reason"),
+    )
+
+    blocker_route_next_flip = _derive_route_next_flip(
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")),
+    )
+    blocker_route_primary_blocker = _map_route_flip_to_blocker_name(blocker_route_next_flip)
+    blocker_context_blockers = list(blocker_items)
+    if blocker_route_primary_blocker and blocker_route_primary_blocker in blocker_context_blockers:
+        blocker_context_blockers = [blocker_route_primary_blocker] + [
+            item for item in blocker_context_blockers if item != blocker_route_primary_blocker
+        ]
+    blocker_context_primary_blocker = (
+        blocker_context_blockers[0] if blocker_context_blockers else primary_blocker
     )
 
     return {
         "ok": True,
-        "primary_blocker": primary_blocker,
-        "blockers": blocker_items,
+        "primary_blocker": blocker_context_primary_blocker,
+        "blockers": blocker_context_blockers,
         "failed_reasons": failed_reasons,
         "trigger_present": trigger_state.get("trigger_present"),
         "trigger_reason": trigger_state.get("why"),
@@ -5880,7 +5898,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_decision_context_blocker_priority_2026_04_10",
+        "build_tag": "schema_patch_core_blocker_context_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
