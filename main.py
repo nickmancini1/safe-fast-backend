@@ -3397,40 +3397,7 @@ def _candidate_materially_improves_over_raw(
     if raw_primary and not challenger_primary:
         return False
 
-    raw_structure = raw_item.get("structure_context") or {}
-    challenger_structure = challenger.get("structure_context") or {}
-
-    raw_allowed = bool(raw_structure.get("allowed_setup") is True)
-    challenger_allowed = bool(challenger_structure.get("allowed_setup") is True)
-    raw_room = raw_structure.get("room_ratio")
-    challenger_room = challenger_structure.get("room_ratio")
-    raw_trend = raw_structure.get("trend_label")
-    challenger_trend = challenger_structure.get("trend_label")
-    raw_extension_clear = bool(raw_structure.get("extension_blocks_now") is not True)
-    challenger_extension_clear = bool(challenger_structure.get("extension_blocks_now") is not True)
-
-    if challenger_allowed and not raw_allowed:
-        return True
-    if raw_allowed and not challenger_allowed:
-        return False
-
-    if challenger_trend == "Trend-aligned" and raw_trend != "Trend-aligned":
-        if challenger_extension_clear or not raw_extension_clear:
-            return True
-    if raw_trend == "Trend-aligned" and challenger_trend != "Trend-aligned":
-        return False
-
-    if (
-        raw_room is not None
-        and challenger_room is not None
-        and (challenger_room - raw_room) >= 0.50
-        and challenger_allowed >= raw_allowed
-        and challenger_extension_clear >= raw_extension_clear
-    ):
-        return True
-
     return False
-
 
 def _select_screened_best_candidate(
     screened_candidates: List[Dict[str, Any]],
