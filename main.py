@@ -5653,11 +5653,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_setup_status_not_allowed_2026_04_10",
+        "build_tag": "schema_patch_core_top_level_status_parity_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
-        "candidate_engine_status": raw_summary_payload.get("verdict", engine_status),
+        "candidate_engine_status": engine_status,
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
         "raw_engine_best_ticker": raw_summary_payload.get("best_ticker"),
@@ -5852,6 +5852,6 @@ async def safe_fast_on_demand_default_simple() -> Any:
     }
 
 
-@app.post("/safe-fast/on-demand")
+@app.post("/safe-fast/on-demand") mm
 async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
     return await _build_on_demand_payload(request)
