@@ -3241,10 +3241,19 @@ def _build_checklist_block(
         {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
         {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
         {"item": "open_trade_already", "yes": bool(request.open_positions > 0)},
+        {"item": "weekly_trade_cap_reached", "yes": bool(request.weekly_trade_count >= 4)},
     ]
 
-    failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
+    failed_items = [
+        row["item"]
+        for row in items
+        if not row["yes"] and row["item"] not in {"open_trade_already", "weekly_trade_cap_reached"}
+    ]
     global_gate_failures: List[str] = []
+    if request.open_positions > 0:
+        global_gate_failures.append("open_trade_already")
+    if request.weekly_trade_count >= 4:
+        global_gate_failures.append("weekly_trade_cap_reached")
     if time_day_gate.get("fresh_entry_allowed") is False:
         global_gate_failures.append("time_day_gate")
 
@@ -3254,6 +3263,8 @@ def _build_checklist_block(
             effective_failed_items.insert(0, item)
 
     priority_order = [
+        "open_trade_already",
+        "weekly_trade_cap_reached",
         "time_day_gate",
         "allowed_setup_type",
         "twentyfour_hour_supportive",
@@ -3264,7 +3275,6 @@ def _build_checklist_block(
         "liquidity_ok",
         "invalidation_clear",
         "fits_risk",
-        "open_trade_already",
     ]
     priority_rank = {name: idx for idx, name in enumerate(priority_order)}
     decision_blockers_priority = sorted(failed_items, key=lambda item: (priority_rank.get(item, 999), item))
@@ -3306,6 +3316,7 @@ def _failed_reason_messages(
         "invalidation_clear": "invalidation is not clear",
         "fits_risk": "risk does not fit the SAFE-FAST budget",
         "open_trade_already": "an open trade already exists",
+        "weekly_trade_cap_reached": "weekly trade count is already at or above the SAFE-FAST max",
     }
 
     for item in checklist.get("failed_items", []):
@@ -3629,9 +3640,18 @@ def _has_open_trade_already_blocker(checklist_block: Dict[str, Any]) -> bool:
     return False
 
 
+def _has_weekly_trade_cap_reached_blocker(checklist_block: Dict[str, Any]) -> bool:
+    for row in checklist_block.get("items", []):
+        if row.get("item") == "weekly_trade_cap_reached":
+            return bool(row.get("yes") is True)
+    return False
+
+
 def _derive_account_gate_primary_blocker(checklist_block: Dict[str, Any]) -> Optional[str]:
     if _has_open_trade_already_blocker(checklist_block):
         return "open_trade_already"
+    if _has_weekly_trade_cap_reached_blocker(checklist_block):
+        return "weekly_trade_cap_reached"
     return None
 
 
@@ -4784,9 +4804,13 @@ def _build_ten_second_checklist(
     effective_failed_items = checklist_block.get("effective_failed_items", failed_items)
     if request.open_positions > 0 and "open_trade_already" not in effective_failed_items:
         effective_failed_items = ["open_trade_already"] + list(effective_failed_items)
+    if request.weekly_trade_count >= 4 and "weekly_trade_cap_reached" not in effective_failed_items:
+        effective_failed_items = list(effective_failed_items)
+        insert_at = 1 if effective_failed_items and effective_failed_items[0] == "open_trade_already" else 0
+        effective_failed_items.insert(insert_at, "weekly_trade_cap_reached")
     global_gate_failures = checklist_block.get(
         "global_gate_failures",
-        [item for item in effective_failed_items if item not in failed_items and item != "open_trade_already"],
+        [item for item in effective_failed_items if item not in failed_items and item not in {"open_trade_already", "weekly_trade_cap_reached"}],
     )
     return {
         "ok": True,
