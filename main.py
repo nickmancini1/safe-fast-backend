@@ -3070,26 +3070,6 @@ def _build_trigger_state(
 ) -> Dict[str, Any]:
     trigger_style = "close_above_recent_high" if option_type == "C" else "close_below_recent_low"
 
-    if not market_context.get("is_open"):
-        return {
-            "ok": True,
-            "trigger_present": False,
-            "trigger_style": trigger_style,
-            "trigger_level": None,
-            "current_close": chart_check.get("latest_close") if chart_check else None,
-            "why": "market_closed",
-        }
-
-    if not time_day_gate.get("fresh_entry_allowed"):
-        return {
-            "ok": True,
-            "trigger_present": False,
-            "trigger_style": trigger_style,
-            "trigger_level": None,
-            "current_close": chart_check.get("latest_close") if chart_check else None,
-            "why": time_day_gate.get("reason", "time_day_gate_blocked"),
-        }
-
     if not chart_check or not chart_check.get("ok"):
         return {
             "ok": False,
@@ -3097,6 +3077,8 @@ def _build_trigger_state(
             "trigger_style": trigger_style,
             "trigger_level": None,
             "current_close": None,
+            "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h") if chart_check else None,
+            "structure_ready": None,
             "why": "chart_unavailable",
         }
 
@@ -3110,7 +3092,9 @@ def _build_trigger_state(
             "trigger_present": False,
             "trigger_style": trigger_style,
             "trigger_level": None,
-            "current_close": current_close,
+            "current_close": _round_or_none(current_close, 4),
+            "price_vs_ema50_1h": price_side,
+            "structure_ready": None,
             "why": "insufficient_recent_candles",
         }
 
@@ -3145,6 +3129,13 @@ def _build_trigger_state(
         why = "wrong_side_of_ema"
     elif not crossed:
         why = "close_trigger_not_hit"
+
+    if not market_context.get("is_open"):
+        why = "market_closed"
+        trigger_present = False
+    elif not time_day_gate.get("fresh_entry_allowed"):
+        why = time_day_gate.get("reason", "time_day_gate_blocked")
+        trigger_present = False
 
     return {
         "ok": True,
@@ -5751,7 +5742,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_blocker_material_improvement_2026_04_10",
+        "build_tag": "schema_patch_core_time_gate_preserves_trigger_map_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
