@@ -246,8 +246,12 @@ def _build_trigger_detail_context(
     current_low = _to_float(current_candle.get("low"))
 
     if option_type == "C":
-        if trigger_level is not None and current_close is not None and current_close > trigger_level and structure_ready:
-            behavior_label = "breaking_above_trigger"
+        if trigger_level is not None and current_close is not None and current_close > trigger_level:
+            behavior_label = (
+                "breaking_above_trigger"
+                if structure_ready
+                else "breaking_above_trigger_but_blocked"
+            )
         elif trigger_level is not None and current_high is not None and current_high >= trigger_level:
             behavior_label = "testing_trigger_but_not_confirmed"
         elif price_side == "above" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
@@ -257,8 +261,12 @@ def _build_trigger_detail_context(
         else:
             behavior_label = "below_ema_or_not_ready"
     else:
-        if trigger_level is not None and current_close is not None and current_close < trigger_level and structure_ready:
-            behavior_label = "breaking_below_trigger"
+        if trigger_level is not None and current_close is not None and current_close < trigger_level:
+            behavior_label = (
+                "breaking_below_trigger"
+                if structure_ready
+                else "breaking_below_trigger_but_blocked"
+            )
         elif trigger_level is not None and current_low is not None and current_low <= trigger_level:
             behavior_label = "testing_trigger_but_not_confirmed"
         elif price_side == "below" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
