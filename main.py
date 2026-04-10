@@ -555,7 +555,7 @@ def _build_setup_route_context(
     chart_check: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     intended_setup_type = structure_context.get("setup_type")
-    allowed_setup = structure_context.get("allowed_setup")
+    setup_eligible_now = structure_context.get("setup_eligible_now")
     chop_risk = bool(structure_context.get("chop_risk"))
     extension_state = structure_context.get("extension_state")
     room_pass = structure_context.get("room_pass")
@@ -587,7 +587,7 @@ def _build_setup_route_context(
 
     fast_entry_allowed = bool(
         intended_setup_type == "Clean Fast Break"
-        and allowed_setup is True
+        and setup_eligible_now is True
         and room_pass is True
         and wall_pass is not False
         and extension_state != "extended"
@@ -604,7 +604,7 @@ def _build_setup_route_context(
 
     if (
         route_type_allowed
-        and allowed_setup is True
+        and setup_eligible_now is True
         and room_pass is True
         and wall_pass is not False
         and extension_state != "extended"
@@ -2583,7 +2583,7 @@ def _setup_classifier(
     trend_label = "Trend-aligned" if trend_supportive is True else "Countertrend" if trend_supportive is False else "unconfirmed"
 
     if latest_close is None or ema50_1h is None:
-        return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None}
+        return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None, "setup_type_allowed": None, "setup_eligible_now": None}
 
     near_ema = abs(latest_close - ema50_1h) / ema50_1h <= 0.0025
     chop = _is_chop(candles)
@@ -2594,26 +2594,26 @@ def _setup_classifier(
 
     if room_pass is False or wall_pass is False or extension_state.get("state") == "extended":
         if trend_supportive is True and near_ema:
-            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": False}
+            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
         if trend_supportive is True and tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": False}
-        return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False}
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
+        return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False, "setup_type_allowed": False, "setup_eligible_now": False}
 
     if trend_supportive is True:
         if near_ema and (room_ratio or 0) >= 2.5 and not chop:
-            return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": True}
+            return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
         if tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True}
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
         if near_ema:
-            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True}
-        return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": False}
+            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+        return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
 
     if trend_supportive is False:
         if tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True}
-        return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False}
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+        return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False, "setup_type_allowed": False, "setup_eligible_now": False}
 
-    return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None}
+    return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None, "setup_type_allowed": None, "setup_eligible_now": None}
 
 
 
@@ -2781,6 +2781,8 @@ def _build_structure_context(
         "setup_type": setup_ctx.get("setup_type"),
         "trend_label": setup_ctx.get("trend_label"),
         "allowed_setup": setup_ctx.get("allowed_setup"),
+        "setup_type_allowed": setup_ctx.get("setup_type_allowed", setup_ctx.get("allowed_setup")),
+        "setup_eligible_now": setup_ctx.get("setup_eligible_now", setup_ctx.get("allowed_setup")),
         "chop_risk": effective_chop_risk,
         "candle_overlap_chop_risk": candle_overlap_chop_risk,
         "adx_value_1h": adx_ctx.get("adx_value_1h"),
@@ -2838,7 +2840,7 @@ def _final_verdict(
             return "NO_TRADE"
         if structure_context.get("extension_state") == "extended":
             return "NO_TRADE"
-        if structure_context.get("allowed_setup") is False:
+        if structure_context.get("setup_eligible_now") is False:
             return "NO_TRADE"
     return "PENDING"
 
@@ -3002,14 +3004,14 @@ def _build_user_facing_block(
                 "setup_state": "NO TRADE",
                 "why": "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
             }
-        if structure_context.get("allowed_setup") is False:
+        if structure_context.get("setup_type_allowed") is False:
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
-                "why": f"Setup type is {structure_context.get('setup_type')}, which is not tradable now.",
+                "why": f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types.",
             }
 
     if final_verdict == "NO_TRADE":
@@ -3103,7 +3105,7 @@ def _build_trigger_state(
         side_ok = price_side == "below"
 
     structure_ok = bool(
-        structure_context.get("allowed_setup") is True
+        structure_context.get("setup_eligible_now") is True
         and structure_context.get("room_pass") is True
         and structure_context.get("wall_pass") is True
         and structure_context.get("extension_state") != "extended"
@@ -3571,6 +3573,7 @@ def _build_blocker_context_block(
         "structure_ready": trigger_state.get("structure_ready"),
         "setup_type": structure_context.get("setup_type"),
         "allowed_setup": structure_context.get("allowed_setup"),
+        "setup_eligible_now": structure_context.get("setup_eligible_now"),
         "room_pass": structure_context.get("room_pass"),
         "extension_blocks_now": structure_context.get("extension_blocks_now"),
         "engine_status": engine_status,
@@ -4066,7 +4069,7 @@ async def _screen_ticker_candidate(
             reason = "Wall thesis and strike placement do not match."
         elif structure_context.get("extension_state") == "extended":
             reason = "Move is too extended from the 1H 50 EMA."
-        elif structure_context.get("allowed_setup") is False:
+        elif structure_context.get("setup_type_allowed") is False:
             reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
         elif chart_alignment is False:
             reason = "Price is on the wrong side of the 1H 50 EMA."
@@ -4480,7 +4483,8 @@ def _build_setup_eligibility_context_block(
 ) -> Dict[str, Any]:
     setup_type = structure_context.get("setup_type")
     allowed_setup_type = _is_allowed_setup_type_name(setup_type)
-    allowed_setup = bool(structure_context.get("allowed_setup") is True)
+    setup_type_allowed = bool(structure_context.get("setup_type_allowed") is True)
+    setup_eligible_now = bool(structure_context.get("setup_eligible_now") is True)
     route = live_map.get("setup_route") or {}
     blockers = list(
         approval_requirements_context.get("blockers")
@@ -4492,7 +4496,7 @@ def _build_setup_eligibility_context_block(
 
     if not setup_type:
         setup_type_status = "NO_SETUP_TYPE_DETECTED"
-    elif allowed_setup:
+    elif setup_eligible_now:
         setup_type_status = "ELIGIBLE_NOW"
     else:
         setup_type_status = "DETECTED_BUT_NOT_ELIGIBLE"
@@ -4501,7 +4505,8 @@ def _build_setup_eligibility_context_block(
         "ok": True,
         "setup_type_detected": setup_type,
         "setup_type_status": setup_type_status,
-        "allowed_setup": allowed_setup,
+        "allowed_setup": setup_type_allowed,
+        "setup_eligible_now": setup_eligible_now,
         "ten_second_check_answer": "YES" if allowed_setup_type else "NO",
         "setup_route_status": route.get("setup_route_status"),
         "setup_route_reason": route.get("why_setup_route_passes_or_fails"),
@@ -4519,7 +4524,8 @@ def _build_setup_check_context_block(
     setup_eligibility_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     setup_type = structure_context.get("setup_type")
-    allowed_setup = bool(structure_context.get("allowed_setup") is True)
+    setup_type_allowed = bool(structure_context.get("setup_type_allowed") is True)
+    setup_eligible_now = bool(structure_context.get("setup_eligible_now") is True)
     answers = ten_second_checklist_block.get("answers") or []
     allowed_setup_answer = None
     for row in answers:
@@ -4535,10 +4541,11 @@ def _build_setup_check_context_block(
         "ok": True,
         "setup_type_detected": setup_type,
         "setup_type_status": setup_type_status,
-        "allowed_setup": allowed_setup,
+        "allowed_setup": setup_type_allowed,
+        "setup_eligible_now": setup_eligible_now,
         "ten_second_check_item": "allowed_setup_type",
         "ten_second_check_answer": allowed_setup_answer,
-        "detected_but_not_eligible": bool(_is_allowed_setup_type_name(setup_type) and not allowed_setup),
+        "detected_but_not_eligible": bool(_is_allowed_setup_type_name(setup_type) and not setup_eligible_now),
         "primary_blocker": primary_blocker,
         "blockers": blockers,
         "note": (
@@ -4730,7 +4737,7 @@ def _build_on_demand_unavailable_payload(
     status_code: int = 503,
 ) -> Dict[str, Any]:
     reason_text = _coerce_error_reason(reason)
-    build_tag = "schema_patch_core_setup_type_gate_split_2026_04_09"
+    build_tag = "schema_patch_core_setup_eligibility_split_2026_04_09"
     failed_reasons = [reason_text]
     primary_blocker = "data_unavailable"
 
@@ -5576,7 +5583,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_setup_type_gate_split_2026_04_09",
+        "build_tag": "schema_patch_core_setup_eligibility_split_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
