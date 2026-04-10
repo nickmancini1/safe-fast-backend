@@ -5571,19 +5571,24 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         screened_reason=screened_best_context_block.get("screened_reason"),
     )
     effective_payload_checklist_block = dict(checklist_block)
-    effective_payload_checklist_block["failed_items"] = _effective_blockers(
+    effective_payload_checklist_block["effective_failed_items"] = _effective_blockers(
         checklist_block,
         screened_reason=screened_best_context_block.get("screened_reason"),
         time_gate_reason=time_day_gate.get("reason"),
     )
-    effective_payload_checklist_block["decision_blockers_priority"] = list(
-        effective_payload_checklist_block["failed_items"]
+    effective_payload_checklist_block["effective_decision_blockers_priority"] = list(
+        effective_payload_checklist_block["effective_failed_items"]
     )
+    effective_payload_checklist_block["global_gate_failures"] = [
+        item
+        for item in effective_payload_checklist_block["effective_failed_items"]
+        if item not in (checklist_block.get("failed_items") or [])
+    ]
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_setup_eligibility_split_2026_04_09",
+        "build_tag": "schema_patch_core_payload_checklist_consistency_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
