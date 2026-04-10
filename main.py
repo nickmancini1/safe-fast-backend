@@ -3745,6 +3745,12 @@ def _build_decision_context_block(
         checklist_block,
         screened_reason=normalized_reason,
     )
+    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(normalized_reason)
+    if no_candidate_primary_blocker:
+        effective_blockers = [no_candidate_primary_blocker] + [
+            item for item in effective_blockers if item != no_candidate_primary_blocker
+        ]
+        effective_primary_blocker = no_candidate_primary_blocker
     account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
     if account_gate_primary_blocker:
         effective_blockers = [account_gate_primary_blocker] + [
@@ -3763,7 +3769,7 @@ def _build_decision_context_block(
     )
     screened_route_blocker = _map_route_flip_to_blocker_name(screened_route_next_flip)
 
-    if screened_route_blocker and not account_gate_primary_blocker:
+    if screened_route_blocker and not account_gate_primary_blocker and not no_candidate_primary_blocker:
         effective_blockers = [screened_route_blocker] + [
             item for item in effective_blockers if item != screened_route_blocker
         ]
@@ -3847,6 +3853,7 @@ def _build_blocker_context_block(
         blocker_route_primary_blocker
         and blocker_route_primary_blocker in blocker_context_blockers
         and not account_gate_primary_blocker
+        and not no_candidate_primary_blocker
     ):
         blocker_context_blockers = [blocker_route_primary_blocker] + [
             item for item in blocker_context_blockers if item != blocker_route_primary_blocker
@@ -3968,6 +3975,9 @@ def _build_entry_context_block(
     gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(user_facing.get("why"))
+    if no_candidate_primary_blocker:
+        blockers = [no_candidate_primary_blocker] + [item for item in blockers if item != no_candidate_primary_blocker]
     blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
     account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
     primary_blocker = blockers[0] if blockers else None
@@ -3978,6 +3988,10 @@ def _build_entry_context_block(
     )
     if account_gate_primary_blocker:
         next_flip_needed = account_gate_primary_blocker
+    elif no_candidate_primary_blocker:
+        next_flip_needed = no_candidate_primary_blocker
+        primary_blocker = no_candidate_primary_blocker
+        blockers = [no_candidate_primary_blocker] + [item for item in blockers if item != no_candidate_primary_blocker]
     elif next_flip_needed:
         primary_blocker = next_flip_needed
         blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
@@ -4974,10 +4988,20 @@ def _build_setup_eligibility_context_block(
         fallback=approval_requirements_context.get("next_flip_needed") or (blockers[0] if blockers else None),
     )
     account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
+    no_candidate_primary_blocker = (
+        approval_requirements_context.get("next_flip_needed")
+        if approval_requirements_context.get("next_flip_needed") == "no_candidate_available"
+        else None
+    )
     if account_gate_primary_blocker:
         next_flip_needed = account_gate_primary_blocker
         blockers = [account_gate_primary_blocker] + [
             item for item in blockers if item != account_gate_primary_blocker
+        ]
+    elif no_candidate_primary_blocker:
+        next_flip_needed = no_candidate_primary_blocker
+        blockers = [no_candidate_primary_blocker] + [
+            item for item in blockers if item != no_candidate_primary_blocker
         ]
     else:
         next_flip_needed = route_next_flip
