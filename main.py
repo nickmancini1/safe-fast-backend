@@ -3662,6 +3662,23 @@ def _build_decision_context_block(
         screened_reason=normalized_reason,
     )
 
+    selected_structure_context = selected.get("structure_context") or {} if selected else {}
+    selected_trigger_state = selected.get("trigger_state") or {} if selected else {}
+    screened_route_next_flip = _derive_route_next_flip(
+        structure_context=selected_structure_context,
+        trigger_state=selected_trigger_state,
+        fallback=_derive_global_gate_next_flip(
+            selected_trigger_state.get("gate_reason") or selected_trigger_state.get("why")
+        ),
+    )
+    screened_route_blocker = _map_route_flip_to_blocker_name(screened_route_next_flip)
+
+    if screened_route_blocker:
+        effective_blockers = [screened_route_blocker] + [
+            item for item in effective_blockers if item != screened_route_blocker
+        ]
+        effective_primary_blocker = effective_blockers[0] if effective_blockers else screened_route_blocker
+
     return {
         "ok": True,
         "ticker": best_ticker,
@@ -5863,7 +5880,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_screened_best_blocker_priority_2026_04_10",
+        "build_tag": "schema_patch_core_decision_context_blocker_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
