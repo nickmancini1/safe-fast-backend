@@ -253,9 +253,7 @@ def _build_trigger_detail_context(
     }
 
     if option_type == "C":
-        if time_gate_blocked:
-            behavior_label = "blocked_by_time_gate"
-        elif trigger_level is not None and current_close is not None and current_close > trigger_level:
+        if trigger_level is not None and current_close is not None and current_close > trigger_level:
             behavior_label = (
                 "breaking_above_trigger"
                 if structure_ready
@@ -278,9 +276,7 @@ def _build_trigger_detail_context(
         else:
             behavior_label = "below_ema_or_not_ready"
     else:
-        if time_gate_blocked:
-            behavior_label = "blocked_by_time_gate"
-        elif trigger_level is not None and current_close is not None and current_close < trigger_level:
+        if trigger_level is not None and current_close is not None and current_close < trigger_level:
             behavior_label = (
                 "breaking_below_trigger"
                 if structure_ready
@@ -5772,7 +5768,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_current_bar_gate_reason_2026_04_10",
+        "build_tag": "schema_patch_core_current_bar_price_label_preserved_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
