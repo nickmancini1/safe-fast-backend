@@ -1994,9 +1994,7 @@ async def _build_ticker_summary(
 
     shortlist = _select_shortlist(all_candidates, allow_fallback)
 
-    if shortlist["selection_mode"] == "preferred":
-        verdict = "ACTIVE_NOW"
-    elif shortlist["selection_mode"] == "fallback":
+    if shortlist["selection_mode"] in {"preferred", "fallback"}:
         verdict = "PENDING"
     else:
         verdict = "NO_TRADE"
@@ -5617,7 +5615,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_raw_vs_normalized_winner_parity_2026_04_10",
+        "build_tag": "schema_patch_core_engine_pending_parity_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
