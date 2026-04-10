@@ -4560,10 +4560,10 @@ def _build_setup_eligibility_context_block(
 
     if not setup_type:
         setup_type_status = "NO_SETUP_TYPE_DETECTED"
-    elif setup_eligible_now:
-        setup_type_status = "ELIGIBLE_NOW"
+    elif _is_allowed_setup_type_name(setup_type):
+        setup_type_status = "ELIGIBLE_NOW" if setup_eligible_now else "DETECTED_BUT_NOT_ELIGIBLE"
     else:
-        setup_type_status = "DETECTED_BUT_NOT_ELIGIBLE"
+        setup_type_status = "NOT_ALLOWED"
 
     return {
         "ok": True,
@@ -5653,7 +5653,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_topline_reason_priority_2026_04_10",
+        "build_tag": "schema_patch_core_setup_status_not_allowed_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
