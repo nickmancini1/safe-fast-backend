@@ -3621,6 +3621,32 @@ def _resolve_global_gate_primary_blocker(
     return None
 
 
+
+def _has_open_trade_already_blocker(checklist_block: Dict[str, Any]) -> bool:
+    for row in checklist_block.get("items", []):
+        if row.get("item") == "open_trade_already":
+            return bool(row.get("yes") is True)
+    return False
+
+
+def _derive_account_gate_primary_blocker(checklist_block: Dict[str, Any]) -> Optional[str]:
+    if _has_open_trade_already_blocker(checklist_block):
+        return "open_trade_already"
+    return None
+
+
+def _prepend_account_gate_primary_blocker(
+    blockers: List[str],
+    checklist_block: Dict[str, Any],
+) -> List[str]:
+    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
+    if account_gate_primary_blocker:
+        return [account_gate_primary_blocker] + [
+            item for item in blockers if item != account_gate_primary_blocker
+        ]
+    return blockers
+
+
 def _effective_blockers(
     checklist_block: Dict[str, Any],
     screened_reason: Optional[str] = None,
@@ -3633,6 +3659,7 @@ def _effective_blockers(
     )
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
     return blockers
 
 
@@ -3670,6 +3697,12 @@ def _build_decision_context_block(
         checklist_block,
         screened_reason=normalized_reason,
     )
+    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
+    if account_gate_primary_blocker:
+        effective_blockers = [account_gate_primary_blocker] + [
+            item for item in effective_blockers if item != account_gate_primary_blocker
+        ]
+        effective_primary_blocker = account_gate_primary_blocker
 
     selected_structure_context = selected.get("structure_context") or {} if selected else {}
     selected_trigger_state = selected.get("trigger_state") or {} if selected else {}
@@ -3682,7 +3715,7 @@ def _build_decision_context_block(
     )
     screened_route_blocker = _map_route_flip_to_blocker_name(screened_route_next_flip)
 
-    if screened_route_blocker:
+    if screened_route_blocker and not account_gate_primary_blocker:
         effective_blockers = [screened_route_blocker] + [
             item for item in effective_blockers if item != screened_route_blocker
         ]
@@ -3741,6 +3774,12 @@ def _build_blocker_context_block(
         screened_reason=gate_reason,
         time_gate_reason=trigger_state.get("gate_reason"),
     )
+    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
+    if account_gate_primary_blocker:
+        blocker_items = [account_gate_primary_blocker] + [
+            item for item in blocker_items if item != account_gate_primary_blocker
+        ]
+        primary_blocker = account_gate_primary_blocker
 
     blocker_route_next_flip = _derive_route_next_flip(
         structure_context=structure_context,
@@ -3749,7 +3788,11 @@ def _build_blocker_context_block(
     )
     blocker_route_primary_blocker = _map_route_flip_to_blocker_name(blocker_route_next_flip)
     blocker_context_blockers = list(blocker_items)
-    if blocker_route_primary_blocker and blocker_route_primary_blocker in blocker_context_blockers:
+    if (
+        blocker_route_primary_blocker
+        and blocker_route_primary_blocker in blocker_context_blockers
+        and not account_gate_primary_blocker
+    ):
         blocker_context_blockers = [blocker_route_primary_blocker] + [
             item for item in blocker_context_blockers if item != blocker_route_primary_blocker
         ]
@@ -3870,13 +3913,15 @@ def _build_entry_context_block(
     gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
+    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
     primary_blocker = blockers[0] if blockers else None
     next_flip_needed = _derive_route_next_flip(
         structure_context=structure_context,
         trigger_state=trigger_state,
         fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker,
     )
-    if next_flip_needed:
+    if next_flip_needed and not account_gate_primary_blocker:
         primary_blocker = next_flip_needed
         blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
 
@@ -4014,13 +4059,15 @@ def _build_approval_context_block(
     gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
+    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
     primary_blocker = blockers[0] if blockers else None
     next_flip_needed = _derive_route_next_flip(
         structure_context=structure_context,
         trigger_state=trigger_state,
         fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker,
     )
-    if next_flip_needed:
+    if next_flip_needed and not account_gate_primary_blocker:
         primary_blocker = next_flip_needed
         blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
     intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
@@ -4091,6 +4138,8 @@ def _build_approval_requirements_context_block(
     gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
+    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
 
     gate_statuses = [
         {
@@ -4159,12 +4208,15 @@ def _build_approval_requirements_context_block(
     ]
 
     missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
-    next_flip_needed = _derive_route_next_flip(
-        structure_context=structure_context,
-        trigger_state=trigger_state,
-        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None)),
+    next_flip_needed = (
+        account_gate_primary_blocker
+        or _derive_route_next_flip(
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+            fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None)),
+        )
     )
-    if next_flip_needed:
+    if next_flip_needed and next_flip_needed != "open_trade_already":
         blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
 
     if approval_context.get("approval_ready_now") is True:
@@ -4232,6 +4284,12 @@ def _build_screened_best_context(
     effective_primary_blocker = (
         effective_failed_items[0] if effective_failed_items else None
     )
+    account_gate_primary_blocker = _derive_account_gate_primary_blocker(selected_checklist)
+    if account_gate_primary_blocker:
+        effective_failed_items = [account_gate_primary_blocker] + [
+            item for item in effective_failed_items if item != account_gate_primary_blocker
+        ]
+        effective_primary_blocker = account_gate_primary_blocker
 
     screened_route_next_flip = _derive_route_next_flip(
         structure_context=selected_structure_context,
@@ -4242,7 +4300,11 @@ def _build_screened_best_context(
     )
     screened_route_primary_blocker = _map_route_flip_to_blocker_name(screened_route_next_flip)
     screened_blockers = list(effective_failed_items)
-    if screened_route_primary_blocker and screened_route_primary_blocker in screened_blockers:
+    if (
+        screened_route_primary_blocker
+        and screened_route_primary_blocker in screened_blockers
+        and not account_gate_primary_blocker
+    ):
         screened_blockers = [screened_route_primary_blocker] + [
             item for item in screened_blockers if item != screened_route_primary_blocker
         ]
@@ -4507,6 +4569,12 @@ def _build_candidate_context(
         screened_reason=gate_reason,
         time_gate_reason=time_day_gate.get("reason"),
     )
+    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist)
+    if account_gate_primary_blocker:
+        effective_blockers = [account_gate_primary_blocker] + [
+            item for item in effective_blockers if item != account_gate_primary_blocker
+        ]
+        effective_primary_blocker = account_gate_primary_blocker
 
     candidate_route_next_flip = _derive_route_next_flip(
         structure_context=structure_context,
@@ -4515,7 +4583,11 @@ def _build_candidate_context(
     )
     candidate_route_primary_blocker = _map_route_flip_to_blocker_name(candidate_route_next_flip)
     candidate_context_blockers = list(effective_blockers)
-    if candidate_route_primary_blocker and candidate_route_primary_blocker in candidate_context_blockers:
+    if (
+        candidate_route_primary_blocker
+        and candidate_route_primary_blocker in candidate_context_blockers
+        and not account_gate_primary_blocker
+    ):
         candidate_context_blockers = [candidate_route_primary_blocker] + [
             item for item in candidate_context_blockers if item != candidate_route_primary_blocker
         ]
@@ -4705,9 +4777,11 @@ def _build_ten_second_checklist(
     ]
     failed_items = checklist_block.get("failed_items", [])
     effective_failed_items = checklist_block.get("effective_failed_items", failed_items)
+    if request.open_positions > 0 and "open_trade_already" not in effective_failed_items:
+        effective_failed_items = ["open_trade_already"] + list(effective_failed_items)
     global_gate_failures = checklist_block.get(
         "global_gate_failures",
-        [item for item in effective_failed_items if item not in failed_items],
+        [item for item in effective_failed_items if item not in failed_items and item != "open_trade_already"],
     )
     return {
         "ok": True,
@@ -5945,7 +6019,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_user_facing_reason_priority_2026_04_10",
+        "build_tag": "schema_patch_core_open_position_priority_parity_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
