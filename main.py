@@ -4064,11 +4064,14 @@ def _build_approval_context_block(
     blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
     account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
     primary_blocker = blockers[0] if blockers else None
-    next_flip_needed = _derive_route_next_flip(
-        structure_context=structure_context,
-        trigger_state=trigger_state,
-        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker,
-    )
+    if account_gate_primary_blocker:
+        next_flip_needed = account_gate_primary_blocker
+    else:
+        next_flip_needed = _derive_route_next_flip(
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+            fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker,
+        )
     if next_flip_needed and not account_gate_primary_blocker:
         primary_blocker = next_flip_needed
         blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
