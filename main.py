@@ -2977,6 +2977,15 @@ def _build_user_facing_block(
         }
 
     if structure_context.get("ok"):
+        if structure_context.get("setup_type_allowed") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types.",
+            }
         if structure_context.get("room_pass") is False:
             return {
                 "good_idea_now": "NO",
@@ -3003,15 +3012,6 @@ def _build_user_facing_block(
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
                 "why": "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
-            }
-        if structure_context.get("setup_type_allowed") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types.",
             }
 
     if final_verdict == "NO_TRADE":
@@ -5653,7 +5653,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_raw_winner_selection_parity_2026_04_10",
+        "build_tag": "schema_patch_core_topline_reason_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
