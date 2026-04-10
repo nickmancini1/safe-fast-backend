@@ -1,6 +1,7 @@
 # fresh full main.py build with entry_context bridge 2026-04-09T16:05:00Z
 
 import asyncio
+import json
 
 import os
 import re
@@ -630,7 +631,7 @@ def _build_setup_route_context(
     elif extension_state == "extended":
         setup_route_status = "fail"
         why = "Setup route is too extended or too late versus the 1H 50 EMA."
-    elif allowed_setup is False:
+    elif setup_eligible_now is False:
         setup_route_status = "fail"
         why = "This is an allowed SAFE-FAST route class, but the current structure does not qualify it as a valid setup."
     else:
