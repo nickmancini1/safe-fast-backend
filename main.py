@@ -3952,7 +3952,9 @@ def _build_approval_requirements_context_block(
         "next_flip_needed": next_flip_needed,
         "missing_gates": missing_gates,
         "gate_statuses": gate_statuses,
-        "checklist_failed_items": checklist_block.get("failed_items", []),
+        "checklist_failed_items": checklist_block.get("effective_failed_items", checklist_block.get("failed_items", [])),
+        "raw_checklist_failed_items": checklist_block.get("failed_items", []),
+        "global_gate_failures": checklist_block.get("global_gate_failures", []),
         "blockers": blockers,
         "allowed_setup": structure_context.get("allowed_setup"),
         "setup_type": structure_context.get("setup_type"),
@@ -4762,7 +4764,7 @@ def _build_on_demand_unavailable_payload(
     status_code: int = 503,
 ) -> Dict[str, Any]:
     reason_text = _coerce_error_reason(reason)
-    build_tag = "schema_patch_core_checklist_source_gate_2026_04_10"
+    build_tag = "schema_patch_core_approval_requirements_effective_gate_2026_04_10"
     failed_reasons = [reason_text]
     primary_blocker = "data_unavailable"
 
