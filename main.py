@@ -5909,6 +5909,15 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         screened_reason=screened_best_context_block.get("screened_reason"),
         time_gate_reason=time_day_gate.get("reason"),
     )
+    screened_primary_blocker = screened_best_context_block.get("screened_primary_blocker")
+    if screened_primary_blocker:
+        effective_payload_checklist_block["effective_failed_items"] = [
+            screened_primary_blocker
+        ] + [
+            item
+            for item in effective_payload_checklist_block["effective_failed_items"]
+            if item != screened_primary_blocker
+        ]
     effective_payload_checklist_block["effective_decision_blockers_priority"] = list(
         effective_payload_checklist_block["effective_failed_items"]
     )
@@ -5921,7 +5930,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_final_reason_priority_2026_04_10",
+        "build_tag": "schema_patch_core_checklist_effective_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
