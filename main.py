@@ -4409,7 +4409,10 @@ def _build_ten_second_checklist(
     ]
     failed_items = checklist_block.get("failed_items", [])
     effective_failed_items = checklist_block.get("effective_failed_items", failed_items)
-    global_gate_failures = checklist_block.get("global_gate_failures", [])
+    global_gate_failures = checklist_block.get(
+        "global_gate_failures",
+        [item for item in effective_failed_items if item not in failed_items],
+    )
     return {
         "ok": True,
         "answers": [
@@ -5593,7 +5596,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_payload_checklist_consistency_2026_04_09",
+        "build_tag": "schema_patch_core_ten_second_effective_gate_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
