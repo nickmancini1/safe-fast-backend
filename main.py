@@ -3862,6 +3862,14 @@ def _build_entry_context_block(
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
     primary_blocker = blockers[0] if blockers else None
+    next_flip_needed = _derive_route_next_flip(
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker,
+    )
+    if next_flip_needed:
+        primary_blocker = next_flip_needed
+        blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
 
     current_bar_raw_trigger_pass = bool(current_bar.get("raw_chart_trigger_pass") is True)
     current_bar_gated_trigger_pass = bool(current_bar.get("gated_trigger_pass") is True)
@@ -5898,7 +5906,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_blocker_context_priority_2026_04_10",
+        "build_tag": "schema_patch_core_entry_context_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
