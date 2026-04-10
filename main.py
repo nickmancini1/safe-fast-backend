@@ -245,7 +245,7 @@ def _build_trigger_detail_context(
     current_high = _to_float(current_candle.get("high"))
     current_low = _to_float(current_candle.get("low"))
 
-    time_gate_blocked = trigger_state.get("why") in {
+    time_gate_blocked = (trigger_state.get("gate_reason") or trigger_state.get("why")) in {
         "market_closed",
         "past_monday_thursday_cutoff",
         "past_friday_cutoff",
@@ -511,7 +511,7 @@ def _build_trigger_scan_context(
     ema50_1h = _to_float(chart_check.get("ema50_1h"))
     market_open = bool(market_context.get("is_open"))
     fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
-    gate_reason = trigger_state.get("why")
+    gate_reason = trigger_state.get("gate_reason") or trigger_state.get("why")
     structure_ready = trigger_state.get("structure_ready")
 
     current_bar = recent[-1] if recent else None
@@ -3091,6 +3091,7 @@ def _build_trigger_state(
             "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h") if chart_check else None,
             "structure_ready": None,
             "why": "chart_unavailable",
+            "gate_reason": None,
         }
 
     recent = chart_check.get("recent_candles") or []
@@ -3107,6 +3108,7 @@ def _build_trigger_state(
             "price_vs_ema50_1h": price_side,
             "structure_ready": None,
             "why": "insufficient_recent_candles",
+            "gate_reason": None,
         }
 
     prior = recent[:-1] if len(recent) >= 2 else recent
@@ -3141,11 +3143,12 @@ def _build_trigger_state(
     elif not crossed:
         why = "close_trigger_not_hit"
 
+    gate_reason = None
     if not market_context.get("is_open"):
-        why = "market_closed"
+        gate_reason = "market_closed"
         trigger_present = False
     elif not time_day_gate.get("fresh_entry_allowed"):
-        why = time_day_gate.get("reason", "time_day_gate_blocked")
+        gate_reason = time_day_gate.get("reason", "time_day_gate_blocked")
         trigger_present = False
 
     return {
@@ -3157,6 +3160,7 @@ def _build_trigger_state(
         "price_vs_ema50_1h": price_side,
         "structure_ready": structure_ok,
         "why": why,
+        "gate_reason": gate_reason,
     }
 
 
@@ -3695,11 +3699,11 @@ def _build_blocker_context_block(
 ) -> Dict[str, Any]:
     blocker_items = _effective_blockers(
         checklist_block,
-        screened_reason=trigger_state.get("why"),
+        screened_reason=trigger_state.get("gate_reason") or trigger_state.get("why"),
     )
     primary_blocker = _effective_primary_blocker(
         checklist_block,
-        screened_reason=trigger_state.get("why"),
+        screened_reason=trigger_state.get("gate_reason") or trigger_state.get("why"),
     )
 
     return {
@@ -3778,7 +3782,7 @@ def _build_entry_context_block(
     current_bar = trigger_scan.get("current_bar") or {}
     completed_candle = trigger_scan.get("most_recent_completed_candle") or {}
     blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
-    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
     primary_blocker = blockers[0] if blockers else None
@@ -3807,7 +3811,7 @@ def _build_entry_context_block(
         "mid_candle_trade_available_now": current_bar_gated_trigger_pass,
         "mid_candle_entry_state": mid_candle_entry_state,
         "mid_candle_raw_trigger_detected_now": current_bar_raw_trigger_pass,
-        "mid_candle_block_reason": None if current_bar_gated_trigger_pass else trigger_state.get("why"),
+        "mid_candle_block_reason": None if current_bar_gated_trigger_pass else (trigger_state.get("gate_reason") or trigger_state.get("why")),
         "completed_candle_trade_available": completed_candle_gated_trigger_pass,
         "completed_candle_entry_state": completed_candle_entry_state,
         "completed_candle_raw_trigger_detected": completed_candle_raw_trigger_pass,
@@ -3910,11 +3914,11 @@ def _build_approval_context_block(
     user_facing: Dict[str, Any],
 ) -> Dict[str, Any]:
     blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
-    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
     primary_blocker = blockers[0] if blockers else None
-    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("why")) or primary_blocker
+    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker
     intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
     intrabar_trade_available_now = bool(entry_context.get("mid_candle_trade_available_now") is True)
     completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
@@ -3980,7 +3984,7 @@ def _build_approval_requirements_context_block(
 ) -> Dict[str, Any]:
     checklist_items = {row.get("item"): bool(row.get("yes")) for row in checklist_block.get("items", [])}
     blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
-    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
 
@@ -4051,7 +4055,7 @@ def _build_approval_requirements_context_block(
     ]
 
     missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
-    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None))
+    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None))
 
     if approval_context.get("approval_ready_now") is True:
         approval_path_status = "APPROVED_NOW"
@@ -4200,7 +4204,7 @@ async def _screen_ticker_candidate(
     if "liquidity_ok" in failed_items:
         reason = liquidity_context.get("why") or "Options liquidity is too wide for a clean debit spread entry."
     elif "clear_trigger" in failed_items:
-        reason = trigger_state.get("why") or "No valid live trigger is present."
+        reason = trigger_state.get("gate_reason") or trigger_state.get("why") or "No valid live trigger is present."
     elif structure_context.get("ok"):
         if structure_context.get("room_pass") is False:
             reason = "Room to first wall is too tight for SAFE-FAST."
@@ -5753,7 +5757,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_time_gate_block_label_2026_04_10",
+        "build_tag": "schema_patch_core_trigger_reason_preserved_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
