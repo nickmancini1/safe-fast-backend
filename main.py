@@ -252,6 +252,14 @@ def _build_trigger_detail_context(
                 if structure_ready
                 else "breaking_above_trigger_but_blocked"  # raw-signal behavior parity patch
             )
+        elif (
+            trigger_level is not None
+            and current_high is not None
+            and current_high >= trigger_level
+            and current_close is not None
+            and current_close <= trigger_level
+        ):
+            behavior_label = "rejected_at_trigger"
         elif trigger_level is not None and current_high is not None and current_high >= trigger_level:
             behavior_label = "testing_trigger_but_not_confirmed"
         elif price_side == "above" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
@@ -267,6 +275,14 @@ def _build_trigger_detail_context(
                 if structure_ready
                 else "breaking_below_trigger_but_blocked"
             )
+        elif (
+            trigger_level is not None
+            and current_low is not None
+            and current_low <= trigger_level
+            and current_close is not None
+            and current_close >= trigger_level
+        ):
+            behavior_label = "rejected_at_trigger"
         elif trigger_level is not None and current_low is not None and current_low <= trigger_level:
             behavior_label = "testing_trigger_but_not_confirmed"
         elif price_side == "below" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
@@ -5691,7 +5707,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_winner_shift_status_parity_2026_04_10",
+        "build_tag": "schema_patch_core_trigger_rejection_behavior_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
