@@ -4097,6 +4097,8 @@ def _build_approval_requirements_context_block(
         trigger_state=trigger_state,
         fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None)),
     )
+    if next_flip_needed:
+        blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
 
     if approval_context.get("approval_ready_now") is True:
         approval_path_status = "APPROVED_NOW"
@@ -5810,7 +5812,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_approval_primary_blocker_priority_2026_04_10",
+        "build_tag": "schema_patch_core_approval_requirements_blocker_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
