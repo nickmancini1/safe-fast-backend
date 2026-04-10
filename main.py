@@ -4420,12 +4420,26 @@ def _build_candidate_context(
         time_gate_reason=time_day_gate.get("reason"),
     )
 
+    candidate_route_next_flip = _derive_route_next_flip(
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")),
+    )
+    candidate_context_blockers = list(effective_blockers)
+    if candidate_route_next_flip and candidate_route_next_flip in candidate_context_blockers:
+        candidate_context_blockers = [candidate_route_next_flip] + [
+            item for item in candidate_context_blockers if item != candidate_route_next_flip
+        ]
+    candidate_context_primary_blocker = (
+        candidate_context_blockers[0] if candidate_context_blockers else effective_primary_blocker
+    )
+
     return {
         "active": active,
         "ticker": best_ticker,
         "availability_reason": availability_reason,
-        "primary_blocker": effective_primary_blocker if active else None,
-        "blockers": effective_blockers if active else [],
+        "primary_blocker": candidate_context_primary_blocker if active else None,
+        "blockers": candidate_context_blockers if active else [],
         "good_idea_now": user_facing.get("good_idea_now") if active else "NO",
         "action": user_facing.get("action") if active else "stand down",
         "setup_state": user_facing.get("setup_state") if active else "NO TRADE",
@@ -4453,8 +4467,8 @@ def _build_candidate_context(
         "primary_candidate": primary_candidate if active else None,
         "backup_candidate": backup_candidate if active else None,
         "invalidation": invalidation_level_1h_ema50 if active else None,
-        "checklist_failed_items": effective_blockers if active else [],
-        "decision_blockers_priority": effective_blockers if active else [],
+        "checklist_failed_items": candidate_context_blockers if active else [],
+        "decision_blockers_priority": candidate_context_blockers if active else [],
         "execution": {
             "ideal_path": two_path.get("ideal_path"),
             "acceptable_path": two_path.get("acceptable_path"),
@@ -5812,7 +5826,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_approval_requirements_blocker_priority_2026_04_10",
+        "build_tag": "schema_patch_core_candidate_context_blocker_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
