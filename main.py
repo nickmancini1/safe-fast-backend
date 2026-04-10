@@ -5450,18 +5450,18 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
     freeze_to_raw_engine = _should_freeze_winner_to_raw_engine(
-        summary_payload=summary_payload,
+        summary_payload=raw_summary_payload,
         market_context=market_context,
         time_day_gate=time_day_gate,
     )
     selected = _select_screened_best_candidate(
         screened_candidates,
-        raw_engine_best_ticker=summary_payload.get("best_ticker"),
+        raw_engine_best_ticker=raw_summary_payload.get("best_ticker"),
         freeze_to_raw_engine=freeze_to_raw_engine,
     )
 
-    best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
-    raw_engine_status = summary_payload.get("verdict", "NO_TRADE")
+    best_ticker = selected.get("symbol") if selected else raw_summary_payload.get("best_ticker")
+    raw_engine_status = raw_summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
     engine_status = _normalize_top_level_status(final_verdict)
     primary_candidate = selected.get("primary_candidate") if selected else summary_payload.get("primary_candidate")
@@ -5686,7 +5686,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_winner_shift_material_improvement_2026_04_10",
+        "build_tag": "schema_patch_core_raw_winner_selection_parity_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
