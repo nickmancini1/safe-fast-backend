@@ -5852,6 +5852,6 @@ async def safe_fast_on_demand_default_simple() -> Any:
     }
 
 
-@app.post("/safe-fast/on-demand") mm
+@app.post("/safe-fast/on-demand")
 async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
     return await _build_on_demand_payload(request)
