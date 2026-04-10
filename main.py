@@ -385,6 +385,7 @@ def _evaluate_trigger_scan_candle(
         return {
             "status": "unconfirmed",
             "why": "candle_unavailable",
+            "gate_reason": gate_reason,
         }
 
     if len(reference_candles) < 3:
@@ -405,6 +406,7 @@ def _evaluate_trigger_scan_candle(
             "gated_trigger_pass": False,
             "status": "unconfirmed",
             "why": "insufficient_reference_candles",
+            "gate_reason": gate_reason,
         }
 
     close_value = _to_float(candle.get("close"))
@@ -437,24 +439,30 @@ def _evaluate_trigger_scan_candle(
         and fresh_entry_allowed
     )
 
+    if structure_ready is False:
+        structural_why = "structure_not_ready"
+    elif not ema_side_pass:
+        structural_why = "wrong_side_of_ema"
+    elif not raw_cross_pass:
+        structural_why = "close_trigger_not_hit"
+    else:
+        structural_why = None
+
     if gated_trigger_pass:
         status = "pass"
         why = "Trigger conditions pass on this candle."
     elif not market_open:
         status = "fail"
         why = "market_closed"
+    elif not fresh_entry_allowed and structural_why is None:
+        status = "fail"
+        why = gate_reason or "time_day_gate_blocked"
+    elif structural_why is not None:
+        status = "fail"
+        why = structural_why
     elif not fresh_entry_allowed:
         status = "fail"
         why = gate_reason or "time_day_gate_blocked"
-    elif structure_ready is False:
-        status = "fail"
-        why = "structure_not_ready"
-    elif not ema_side_pass:
-        status = "fail"
-        why = "wrong_side_of_ema"
-    elif not raw_cross_pass:
-        status = "fail"
-        why = "close_trigger_not_hit"
     else:
         status = "unconfirmed"
         why = "trigger_unconfirmed"
@@ -476,6 +484,7 @@ def _evaluate_trigger_scan_candle(
         "gated_trigger_pass": gated_trigger_pass,
         "status": status,
         "why": why,
+        "gate_reason": gate_reason if not fresh_entry_allowed else None,
     }
 
 
@@ -549,12 +558,12 @@ def _build_trigger_scan_context(
     elif not market_open:
         trigger_scan_status = "fail"
         why = "Market is closed, so trigger scan cannot produce a live entry."
-    elif not fresh_entry_allowed:
-        trigger_scan_status = "fail"
-        why = gate_reason or "Fresh entry is outside the SAFE-FAST time/day window."
     elif structure_ready is False:
         trigger_scan_status = "fail"
         why = "Structure is not ready for a SAFE-FAST trigger."
+    elif not fresh_entry_allowed:
+        trigger_scan_status = "fail"
+        why = gate_reason or "Fresh entry is outside the SAFE-FAST time/day window."
     elif current_bar_eval.get("raw_chart_trigger_pass") or completed_eval.get("raw_chart_trigger_pass"):
         trigger_scan_status = "fail"
         why = "A raw chart trigger appeared, but SAFE-FAST gating still blocks it."
@@ -572,6 +581,7 @@ def _build_trigger_scan_context(
         "market_open": market_open,
         "fresh_entry_allowed": fresh_entry_allowed,
         "structure_ready": structure_ready,
+        "gate_reason": gate_reason if not fresh_entry_allowed else None,
         "current_bar": current_bar_eval,
         "most_recent_completed_candle": completed_eval,
         "current_bar_reference_candles": [
@@ -5757,7 +5767,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_trigger_reason_preserved_2026_04_10",
+        "build_tag": "schema_patch_core_trigger_scan_reason_preserved_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
