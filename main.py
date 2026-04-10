@@ -4583,13 +4583,6 @@ def _build_two_path_block(
             "invalidation_1h_ema50": ema,
         }
 
-    if not time_day_gate.get("fresh_entry_allowed"):
-        return {
-            "ideal_path": "Wait for a valid SAFE-FAST entry window before considering a new trade.",
-            "acceptable_path": "Stand down until the time/day gate reopens.",
-            "invalidation_1h_ema50": ema,
-        }
-
     failed_items = set(checklist.get("failed_items", []))
     if failed_items:
         labels = []
@@ -4619,9 +4612,23 @@ def _build_two_path_block(
             if key in failed_items:
                 labels.append(label_map[key])
 
+        ideal_path = "Need " + ", ".join(labels) + " before entry." if labels else "Need full gate pass before entry."
+        acceptable_path = "Stand down until all failed gates pass."
+
+        if not time_day_gate.get("fresh_entry_allowed"):
+            ideal_path = ideal_path + " Time/day gate is also closed."
+            acceptable_path = "Stand down until all failed gates pass; the time/day gate reopening alone is not enough."
+
         return {
-            "ideal_path": "Need " + ", ".join(labels) + " before entry." if labels else "Need full gate pass before entry.",
-            "acceptable_path": "Stand down until all failed gates pass.",
+            "ideal_path": ideal_path,
+            "acceptable_path": acceptable_path,
+            "invalidation_1h_ema50": ema,
+        }
+
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return {
+            "ideal_path": "Wait for a valid SAFE-FAST entry window before considering a new trade.",
+            "acceptable_path": "Stand down until the time/day gate reopens.",
             "invalidation_1h_ema50": ema,
         }
 
