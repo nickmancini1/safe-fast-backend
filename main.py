@@ -3423,8 +3423,36 @@ def _candidate_materially_improves_over_raw(
 
     raw_checklist = raw_item.get("checklist") or {}
     challenger_checklist = challenger.get("checklist") or {}
-    raw_failed = set(raw_checklist.get("effective_failed_items") or raw_checklist.get("failed_items") or [])
-    challenger_failed = set(challenger_checklist.get("effective_failed_items") or challenger_checklist.get("failed_items") or [])
+
+    raw_failed_list = list(raw_checklist.get("effective_failed_items") or raw_checklist.get("failed_items") or [])
+    challenger_failed_list = list(challenger_checklist.get("effective_failed_items") or challenger_checklist.get("failed_items") or [])
+
+    priority_order = {
+        "allowed_setup_type": 0,
+        "twentyfour_hour_supportive": 1,
+        "one_hour_clean_around_ema": 2,
+        "clear_room": 3,
+        "early_enough": 4,
+        "clear_trigger": 5,
+        "liquidity_ok": 6,
+        "invalidation_clear": 7,
+        "fits_risk": 8,
+        "open_trade_already": 9,
+    }
+
+    def _normalize_failed(items: List[str]) -> List[str]:
+        seen = set()
+        ordered: List[str] = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            ordered.append(item)
+        ordered.sort(key=lambda item: (priority_order.get(item, 999), item))
+        return ordered
+
+    raw_failed = _normalize_failed(raw_failed_list)
+    challenger_failed = _normalize_failed(challenger_failed_list)
 
     if "allowed_setup_type" in raw_failed and "allowed_setup_type" not in challenger_failed:
         return True
@@ -3433,6 +3461,22 @@ def _candidate_materially_improves_over_raw(
     challenger_structure = challenger.get("structure_context") or {}
     if raw_structure.get("allowed_setup") is False and challenger_structure.get("allowed_setup") is True:
         return True
+
+    raw_primary_blocker = raw_failed[0] if raw_failed else None
+    challenger_primary_blocker = challenger_failed[0] if challenger_failed else None
+
+    if raw_primary_blocker and challenger_primary_blocker:
+        raw_rank = priority_order.get(raw_primary_blocker, 999)
+        challenger_rank = priority_order.get(challenger_primary_blocker, 999)
+        if challenger_rank < raw_rank:
+            return True
+
+    if len(challenger_failed) < len(raw_failed):
+        return True
+
+    if raw_primary_blocker and challenger_primary_blocker and raw_primary_blocker == challenger_primary_blocker:
+        if len(challenger_failed) < len(raw_failed):
+            return True
 
     return False
 
@@ -5707,7 +5751,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_trigger_rejection_behavior_2026_04_10",
+        "build_tag": "schema_patch_core_blocker_material_improvement_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
