@@ -4205,10 +4205,24 @@ def _build_candidate_context(
         or ("Candidate present." if active else "No feasible candidates found for the current filters.")
     )
 
+    gate_reason = time_day_gate.get("reason") or trigger_state.get("why")
+    effective_blockers = _effective_blockers(
+        checklist,
+        screened_reason=gate_reason,
+        time_gate_reason=time_day_gate.get("reason"),
+    )
+    effective_primary_blocker = _effective_primary_blocker(
+        checklist,
+        screened_reason=gate_reason,
+        time_gate_reason=time_day_gate.get("reason"),
+    )
+
     return {
         "active": active,
         "ticker": best_ticker,
         "availability_reason": availability_reason,
+        "primary_blocker": effective_primary_blocker if active else None,
+        "blockers": effective_blockers if active else [],
         "good_idea_now": user_facing.get("good_idea_now") if active else "NO",
         "action": user_facing.get("action") if active else "stand down",
         "setup_state": user_facing.get("setup_state") if active else "NO TRADE",
@@ -4236,8 +4250,8 @@ def _build_candidate_context(
         "primary_candidate": primary_candidate if active else None,
         "backup_candidate": backup_candidate if active else None,
         "invalidation": invalidation_level_1h_ema50 if active else None,
-        "checklist_failed_items": checklist.get("failed_items", []) if active else [],
-        "decision_blockers_priority": checklist.get("decision_blockers_priority", []) if active else [],
+        "checklist_failed_items": effective_blockers if active else [],
+        "decision_blockers_priority": effective_blockers if active else [],
         "execution": {
             "ideal_path": two_path.get("ideal_path"),
             "acceptable_path": two_path.get("acceptable_path"),
@@ -5538,7 +5552,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_context_alignment_2026_04_09",
+        "build_tag": "schema_patch_core_candidate_handoff_gate_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
