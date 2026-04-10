@@ -4407,6 +4407,9 @@ def _build_ten_second_checklist(
         ("fits_risk", "Does this fit risk budget?", item_map.get("fits_risk")),
         ("open_trade_already", "Do we already have an open trade?", request.open_positions > 0),
     ]
+    failed_items = checklist_block.get("failed_items", [])
+    effective_failed_items = checklist_block.get("effective_failed_items", failed_items)
+    global_gate_failures = checklist_block.get("global_gate_failures", [])
     return {
         "ok": True,
         "answers": [
@@ -4417,7 +4420,9 @@ def _build_ten_second_checklist(
             }
             for item, question, value in questions
         ],
-        "failed_items": checklist_block.get("failed_items", []),
+        "failed_items": failed_items,
+        "effective_failed_items": effective_failed_items,
+        "global_gate_failures": global_gate_failures,
     }
 
 
