@@ -4767,16 +4767,29 @@ def _build_winner_shift_context_block(
     screened_live_winner_final_verdict: Optional[str],
     screened_reason: Optional[str],
 ) -> Dict[str, Any]:
-    raw_to_normalized_changed = raw_engine_winner_ticker != normalized_engine_winner_ticker
-    normalized_to_screened_changed = normalized_engine_winner_ticker != screened_live_winner_ticker
+    raw_to_normalized_ticker_changed = raw_engine_winner_ticker != normalized_engine_winner_ticker
+    raw_to_normalized_status_changed = raw_engine_winner_status != normalized_engine_winner_status
+    normalized_to_screened_ticker_changed = normalized_engine_winner_ticker != screened_live_winner_ticker
+    normalized_to_screened_status_changed = normalized_engine_winner_final_verdict != screened_live_winner_final_verdict
+
+    raw_to_normalized_changed = bool(
+        raw_to_normalized_ticker_changed or raw_to_normalized_status_changed
+    )
+    normalized_to_screened_changed = bool(
+        normalized_to_screened_ticker_changed or normalized_to_screened_status_changed
+    )
     any_shift = raw_to_normalized_changed or normalized_to_screened_changed
 
     if raw_to_normalized_changed and normalized_to_screened_changed:
         shift_path = "RAW_TO_NORMALIZED_TO_SCREENED_SHIFT"
-    elif raw_to_normalized_changed:
-        shift_path = "RAW_TO_NORMALIZED_SHIFT"
-    elif normalized_to_screened_changed:
-        shift_path = "NORMALIZED_TO_SCREENED_SHIFT"
+    elif raw_to_normalized_ticker_changed:
+        shift_path = "RAW_TO_NORMALIZED_TICKER_SHIFT"
+    elif raw_to_normalized_status_changed:
+        shift_path = "RAW_TO_NORMALIZED_STATUS_SHIFT"
+    elif normalized_to_screened_ticker_changed:
+        shift_path = "NORMALIZED_TO_SCREENED_TICKER_SHIFT"
+    elif normalized_to_screened_status_changed:
+        shift_path = "NORMALIZED_TO_SCREENED_STATUS_SHIFT"
     else:
         shift_path = "NO_SHIFT"
 
@@ -4790,6 +4803,10 @@ def _build_winner_shift_context_block(
         "normalized_engine_winner_final_verdict": normalized_engine_winner_final_verdict,
         "screened_live_winner_ticker": screened_live_winner_ticker,
         "screened_live_winner_final_verdict": screened_live_winner_final_verdict,
+        "raw_to_normalized_ticker_changed": raw_to_normalized_ticker_changed,
+        "raw_to_normalized_status_changed": raw_to_normalized_status_changed,
+        "normalized_to_screened_ticker_changed": normalized_to_screened_ticker_changed,
+        "normalized_to_screened_status_changed": normalized_to_screened_status_changed,
         "raw_to_normalized_changed": raw_to_normalized_changed,
         "normalized_to_screened_changed": normalized_to_screened_changed,
         "any_shift": any_shift,
@@ -5674,7 +5691,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_material_winner_improvement_2026_04_10",
+        "build_tag": "schema_patch_core_winner_shift_status_parity_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
