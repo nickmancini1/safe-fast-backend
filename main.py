@@ -4177,7 +4177,7 @@ def _build_approval_requirements_context_block(
         "next_flip_needed": next_flip_needed,
         "missing_gates": missing_gates,
         "gate_statuses": gate_statuses,
-        "checklist_failed_items": checklist_block.get("effective_failed_items", checklist_block.get("failed_items", [])),
+        "checklist_failed_items": blockers,
         "raw_checklist_failed_items": checklist_block.get("failed_items", []),
         "global_gate_failures": checklist_block.get("global_gate_failures", []),
         "blockers": blockers,
@@ -5936,7 +5936,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_ten_second_effective_priority_2026_04_10",
+        "build_tag": "schema_patch_core_approval_requirements_checklist_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
