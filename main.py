@@ -3953,6 +3953,9 @@ def _build_approval_context_block(
         trigger_state=trigger_state,
         fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker,
     )
+    if next_flip_needed:
+        primary_blocker = next_flip_needed
+        blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
     intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
     intrabar_trade_available_now = bool(entry_context.get("mid_candle_trade_available_now") is True)
     completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
@@ -5807,7 +5810,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_setup_primary_blocker_priority_2026_04_10",
+        "build_tag": "schema_patch_core_approval_primary_blocker_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
