@@ -3374,6 +3374,64 @@ def _should_freeze_winner_to_raw_engine(
     return False
 
 
+
+
+def _candidate_materially_improves_over_raw(
+    raw_item: Optional[Dict[str, Any]],
+    challenger: Optional[Dict[str, Any]],
+) -> bool:
+    if not raw_item or not challenger:
+        return False
+
+    raw_final = raw_item.get("final_verdict")
+    challenger_final = challenger.get("final_verdict")
+
+    if raw_final != challenger_final:
+        verdict_rank = {"PENDING": 0, "NO_TRADE": 1}
+        return verdict_rank.get(challenger_final, 99) < verdict_rank.get(raw_final, 99)
+
+    raw_primary = raw_item.get("primary_candidate")
+    challenger_primary = challenger.get("primary_candidate")
+    if not raw_primary and challenger_primary:
+        return True
+    if raw_primary and not challenger_primary:
+        return False
+
+    raw_structure = raw_item.get("structure_context") or {}
+    challenger_structure = challenger.get("structure_context") or {}
+
+    raw_allowed = bool(raw_structure.get("allowed_setup") is True)
+    challenger_allowed = bool(challenger_structure.get("allowed_setup") is True)
+    raw_room = raw_structure.get("room_ratio")
+    challenger_room = challenger_structure.get("room_ratio")
+    raw_trend = raw_structure.get("trend_label")
+    challenger_trend = challenger_structure.get("trend_label")
+    raw_extension_clear = bool(raw_structure.get("extension_blocks_now") is not True)
+    challenger_extension_clear = bool(challenger_structure.get("extension_blocks_now") is not True)
+
+    if challenger_allowed and not raw_allowed:
+        return True
+    if raw_allowed and not challenger_allowed:
+        return False
+
+    if challenger_trend == "Trend-aligned" and raw_trend != "Trend-aligned":
+        if challenger_extension_clear or not raw_extension_clear:
+            return True
+    if raw_trend == "Trend-aligned" and challenger_trend != "Trend-aligned":
+        return False
+
+    if (
+        raw_room is not None
+        and challenger_room is not None
+        and (challenger_room - raw_room) >= 0.50
+        and challenger_allowed >= raw_allowed
+        and challenger_extension_clear >= raw_extension_clear
+    ):
+        return True
+
+    return False
+
+
 def _select_screened_best_candidate(
     screened_candidates: List[Dict[str, Any]],
     *,
@@ -3383,10 +3441,23 @@ def _select_screened_best_candidate(
     if not screened_candidates:
         return None
 
-    if freeze_to_raw_engine and raw_engine_best_ticker:
+    raw_item = None
+    if raw_engine_best_ticker:
         for item in screened_candidates:
             if item.get("symbol") == raw_engine_best_ticker:
-                return item
+                raw_item = item
+                break
+
+    if freeze_to_raw_engine and raw_item:
+        return raw_item
+
+    if raw_item:
+        best_challenger = screened_candidates[0]
+        if best_challenger.get("symbol") == raw_engine_best_ticker:
+            return raw_item
+        if _candidate_materially_improves_over_raw(raw_item, best_challenger):
+            return best_challenger
+        return raw_item
 
     with_primary = [item for item in screened_candidates if item.get("primary_candidate")]
     if with_primary:
@@ -5615,7 +5686,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_extension_early_enough_parity_2026_04_10",
+        "build_tag": "schema_patch_core_winner_shift_material_improvement_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
