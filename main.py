@@ -2189,6 +2189,11 @@ def _normalize_engine_summary_for_session(
             market_context=market_context,
             time_day_gate=time_day_gate,
         )
+        if not normalized.get("best_ticker"):
+            normalized["reason"] = "No candidate available."
+            normalized["selection_mode"] = "none"
+            normalized["primary_candidate"] = None
+            normalized["backup_candidate"] = None
 
     return normalized
 
@@ -3522,6 +3527,9 @@ def _select_screened_best_candidate(
     if not screened_candidates:
         return None
 
+    if raw_engine_best_ticker is None and not any(item.get("primary_candidate") for item in screened_candidates):
+        return None
+
     raw_item = None
     if raw_engine_best_ticker:
         for item in screened_candidates:
@@ -3603,29 +3611,49 @@ def _build_candidate_engine_normalized_block(
 ) -> Dict[str, Any]:
     normalized_reason = selected.get("reason", summary_payload.get("reason")) if selected else summary_payload.get("reason")
     selected_summary = selected.get("summary") if selected else None
+    raw_best_ticker = summary_payload.get("best_ticker")
+    no_candidate_branch = bool(
+        raw_best_ticker is None
+        and not (selected and selected.get("primary_candidate"))
+    )
 
     return {
         "ok": summary_payload.get("ok", True),
-        "raw_best_ticker": summary_payload.get("best_ticker"),
+        "raw_best_ticker": raw_best_ticker,
         "raw_verdict": summary_payload.get("verdict"),
         "raw_reason": summary_payload.get("reason"),
-        "normalized_best_ticker": best_ticker,
+        "normalized_best_ticker": None if no_candidate_branch else best_ticker,
         "normalized_verdict": engine_status,
         "normalized_final_verdict": final_verdict,
-        "normalized_reason": normalized_reason,
+        "normalized_reason": "No candidate available." if no_candidate_branch else normalized_reason,
         "selection_mode": (
-            selected_summary.get("selection_mode")
-            if selected_summary else summary_payload.get("selection_mode")
+            "none"
+            if no_candidate_branch else (
+                selected_summary.get("selection_mode")
+                if selected_summary else summary_payload.get("selection_mode")
+            )
         ),
     }
 
 
 
 
+def _is_no_candidate_reason(reason: Any) -> bool:
+    reason_text = str(reason or "").strip().lower()
+    if not reason_text:
+        return False
+    return (
+        reason_text in {"no candidate available.", "no candidate available"}
+        or "no feasible liquid candidates found" in reason_text
+    )
+
+
 def _resolve_global_gate_primary_blocker(
     screened_reason: Optional[str] = None,
     time_gate_reason: Optional[str] = None,
 ) -> Optional[str]:
+    if _is_no_candidate_reason(screened_reason):
+        return "no_candidate_available"
     gate_reason = time_gate_reason or screened_reason
     if gate_reason in {"market_closed", "past_monday_thursday_cutoff", "past_friday_cutoff", "outside_time_window", "outside_day_window"}:
         return "time_day_gate"
@@ -3800,6 +3828,13 @@ def _build_blocker_context_block(
             item for item in blocker_items if item != account_gate_primary_blocker
         ]
         primary_blocker = account_gate_primary_blocker
+
+    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(user_facing.get("why"))
+    if no_candidate_primary_blocker:
+        blocker_items = [no_candidate_primary_blocker] + [
+            item for item in blocker_items if item != no_candidate_primary_blocker
+        ]
+        primary_blocker = no_candidate_primary_blocker
 
     blocker_route_next_flip = _derive_route_next_flip(
         structure_context=structure_context,
@@ -4083,9 +4118,14 @@ def _build_approval_context_block(
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
     blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
     account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
+    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(user_facing.get("why"))
+    if no_candidate_primary_blocker:
+        blockers = [no_candidate_primary_blocker] + [item for item in blockers if item != no_candidate_primary_blocker]
     primary_blocker = blockers[0] if blockers else None
     if account_gate_primary_blocker:
         next_flip_needed = account_gate_primary_blocker
+    elif no_candidate_primary_blocker:
+        next_flip_needed = no_candidate_primary_blocker
     else:
         next_flip_needed = _derive_route_next_flip(
             structure_context=structure_context,
@@ -4233,8 +4273,12 @@ def _build_approval_requirements_context_block(
     ]
 
     missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
+    no_candidate_primary_blocker = approval_context.get("primary_blocker") if approval_context.get("primary_blocker") == "no_candidate_available" else None
+    if no_candidate_primary_blocker:
+        blockers = [no_candidate_primary_blocker] + [item for item in blockers if item != no_candidate_primary_blocker]
     next_flip_needed = (
         account_gate_primary_blocker
+        or no_candidate_primary_blocker
         or _derive_route_next_flip(
             structure_context=structure_context,
             trigger_state=trigger_state,
@@ -4290,6 +4334,21 @@ def _build_screened_best_context(
     screened_candidates: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     if not selected:
+        if engine_best_ticker is None and screened_candidates and not any(item.get("primary_candidate") for item in screened_candidates):
+            return {
+                "ok": True,
+                "screened_best_ticker": None,
+                "raw_engine_best_ticker": None,
+                "normalized_engine_best_ticker": None,
+                "engine_best_ticker": None,
+                "changed_from_engine_best": False,
+                "screened_final_verdict": "NO_TRADE",
+                "screened_reason": "No candidate available.",
+                "screened_primary_blocker": "no_candidate_available",
+                "screened_checklist_failed_items": ["no_candidate_available"],
+                "engine_best_final_verdict_after_screen": None,
+                "engine_best_reason_after_screen": None,
+            }
         return {"ok": False, "why": "no screened candidates"}
 
     engine_pick = next(
@@ -4336,18 +4395,24 @@ def _build_screened_best_context(
     screened_primary_blocker = (
         screened_blockers[0] if screened_blockers else effective_primary_blocker
     )
+    if no_candidate_primary_blocker:
+        screened_blockers = [no_candidate_primary_blocker] + [
+            item for item in screened_blockers if item != no_candidate_primary_blocker
+        ]
+        screened_primary_blocker = no_candidate_primary_blocker
 
     engine_pick_reason = engine_pick.get("reason") if engine_pick else None
     engine_pick_verdict = engine_pick.get("final_verdict") if engine_pick else None
 
-    normalized_engine_best_ticker = selected.get("symbol")
+    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(selected_reason)
+    normalized_engine_best_ticker = None if no_candidate_primary_blocker == "no_candidate_available" else selected.get("symbol")
     return {
         "ok": True,
-        "screened_best_ticker": selected.get("symbol"),
+        "screened_best_ticker": normalized_engine_best_ticker,
         "raw_engine_best_ticker": engine_best_ticker,
         "normalized_engine_best_ticker": normalized_engine_best_ticker,
         "engine_best_ticker": normalized_engine_best_ticker,
-        "changed_from_engine_best": selected.get("symbol") != engine_best_ticker,
+        "changed_from_engine_best": normalized_engine_best_ticker != engine_best_ticker,
         "screened_final_verdict": selected.get("final_verdict"),
         "screened_reason": selected_reason,
         "screened_primary_blocker": screened_primary_blocker,
@@ -5815,7 +5880,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         freeze_to_raw_engine=freeze_to_raw_engine,
     )
 
-    best_ticker = selected.get("symbol") if selected else raw_summary_payload.get("best_ticker")
+    best_ticker = (
+        None
+        if raw_summary_payload.get("best_ticker") is None and not selected
+        else (selected.get("symbol") if selected else raw_summary_payload.get("best_ticker"))
+    )
     raw_engine_status = raw_summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
     engine_status = _normalize_top_level_status(final_verdict)
