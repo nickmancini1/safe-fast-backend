@@ -2966,6 +2966,63 @@ def _build_user_facing_block(
             "why": "Weekly trade count is already at or above the SAFE-FAST max.",
         }
 
+    if engine_status == "NO_TRADE" or not best_ticker:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": "No valid candidate engine setup is available.",
+            "setup_state": "NO TRADE",
+            "why": engine_reason,
+        }
+
+    if structure_context.get("ok"):
+        if structure_context.get("setup_type_allowed") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types.",
+            }
+        if structure_context.get("chop_risk") is True:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "1H structure around the 50 EMA is not clean.",
+            }
+        if structure_context.get("room_pass") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "Room to first wall is too tight for SAFE-FAST.",
+            }
+        if structure_context.get("wall_pass") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "Wall thesis and strike placement do not match.",
+            }
+        if structure_context.get("extension_state") == "extended" or structure_context.get("extension_blocks_now") is True:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
+            }
+
     if not market_context["is_open"]:
         return {
             "good_idea_now": "NO",
@@ -3007,54 +3064,6 @@ def _build_user_facing_block(
             "setup_state": "NO TRADE",
             "why": liquidity_context.get("why") or "Options liquidity is too wide for a clean SAFE-FAST entry.",
         }
-
-    if engine_status == "NO_TRADE" or not best_ticker:
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": "No valid candidate engine setup is available.",
-            "setup_state": "NO TRADE",
-            "why": engine_reason,
-        }
-
-    if structure_context.get("ok"):
-        if structure_context.get("setup_type_allowed") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types.",
-            }
-        if structure_context.get("room_pass") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "Room to first wall is too tight for SAFE-FAST.",
-            }
-        if structure_context.get("wall_pass") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "Wall thesis and strike placement do not match.",
-            }
-        if structure_context.get("extension_state") == "extended":
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
-            }
 
     if final_verdict == "NO_TRADE":
         why = "Best ticker failed the 1H EMA alignment check."
@@ -5936,7 +5945,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_approval_requirements_checklist_priority_2026_04_10",
+        "build_tag": "schema_patch_core_user_facing_reason_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
