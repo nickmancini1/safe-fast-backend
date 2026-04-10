@@ -250,7 +250,7 @@ def _build_trigger_detail_context(
             behavior_label = (
                 "breaking_above_trigger"
                 if structure_ready
-                else "breaking_above_trigger_but_blocked"
+                else "breaking_above_trigger_but_blocked"  # raw-signal behavior parity patch
             )
         elif trigger_level is not None and current_high is not None and current_high >= trigger_level:
             behavior_label = "testing_trigger_but_not_confirmed"
@@ -5661,7 +5661,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_top_level_status_parity_2026_04_10",
+        "build_tag": "schema_patch_core_raw_signal_behavior_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
