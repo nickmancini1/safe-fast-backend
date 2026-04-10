@@ -346,6 +346,7 @@ def _build_trigger_detail_context(
         "trigger_present": trigger_present,
         "structure_ready": structure_ready,
         "why": trigger_state.get("why"),
+        "gate_reason": trigger_state.get("gate_reason"),
     }
 
     return {
@@ -5771,7 +5772,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_entry_block_reason_preserved_2026_04_10",
+        "build_tag": "schema_patch_core_current_bar_gate_reason_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
