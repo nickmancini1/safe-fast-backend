@@ -1,6 +1,7 @@
 # fresh full main.py build with entry_context bridge 2026-04-09T16:05:00Z
 
 import asyncio
+import copy
 import json
 
 import os
@@ -5323,6 +5324,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             allow_fallback=request.allow_fallback,
             token=token,
         )
+        raw_summary_payload = copy.deepcopy(summary_payload)
     except httpx.TimeoutException:
         return _build_on_demand_unavailable_payload(
             request,
@@ -5354,7 +5356,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             status_code=503,
         )
     summary_payload = _normalize_engine_summary_for_session(
-        summary_payload=summary_payload,
+        summary_payload=raw_summary_payload,
         market_context=market_context,
         time_day_gate=time_day_gate,
     )
@@ -5471,8 +5473,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         iv_context=iv_context,
     )
 
-    raw_engine_winner_ticker = summary_payload.get("best_ticker")
-    raw_engine_winner_status = summary_payload.get("verdict")
+    raw_engine_winner_ticker = raw_summary_payload.get("best_ticker")
+    raw_engine_winner_status = raw_summary_payload.get("verdict")
     normalized_engine_winner_ticker = best_ticker
     normalized_engine_winner_status = engine_status
     normalized_engine_winner_final_verdict = final_verdict
@@ -5573,7 +5575,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     )
     screened_best_context_block = _build_screened_best_context(
         selected=selected,
-        engine_best_ticker=summary_payload.get("best_ticker"),
+        engine_best_ticker=raw_summary_payload.get("best_ticker"),
         screened_candidates=screened_candidates,
     )
     final_reason_context_block = _build_final_reason_context_block(
@@ -5615,14 +5617,14 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_ten_second_effective_gate_2026_04_09",
+        "build_tag": "schema_patch_core_raw_vs_normalized_winner_parity_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
-        "candidate_engine_status": engine_status,
+        "candidate_engine_status": raw_summary_payload.get("verdict", engine_status),
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
-        "raw_engine_best_ticker": raw_engine_winner_ticker,
+        "raw_engine_best_ticker": raw_summary_payload.get("best_ticker"),
         "engine_best_ticker": normalized_engine_winner_ticker,
         "winner_context": {
             "raw_engine_winner_ticker": raw_engine_winner_ticker,
@@ -5636,14 +5638,14 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             "why_changed_after_screening": why_changed_after_screening,
         },
         "engine_context": _build_engine_context_block(
-            summary_payload=summary_payload,
+            summary_payload=raw_summary_payload,
             selected=selected,
             engine_status=engine_status,
             final_verdict=final_verdict,
             best_ticker=best_ticker,
         ),
         "decision_context": _build_decision_context_block(
-            summary_payload=summary_payload,
+            summary_payload=raw_summary_payload,
             selected=selected,
             engine_status=engine_status,
             final_verdict=final_verdict,
@@ -5698,9 +5700,9 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "failed_reasons": failed_reasons_block,
         "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
         "request": request.model_dump(),
-        "candidate_engine": summary_payload,
+        "candidate_engine": raw_summary_payload,
         "candidate_engine_normalized": _build_candidate_engine_normalized_block(
-            summary_payload=summary_payload,
+            summary_payload=raw_summary_payload,
             selected=selected,
             engine_status=engine_status,
             final_verdict=final_verdict,
