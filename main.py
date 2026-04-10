@@ -4919,11 +4919,19 @@ def _build_final_reason_context_block(
         screened_reason=screened_reason,
         time_gate_reason=time_gate_reason,
     )
-    primary_blocker = _effective_primary_blocker(
-        checklist_block,
-        screened_reason=screened_reason,
-        time_gate_reason=time_gate_reason,
-    )
+
+    screened_primary_blocker = screened_best_context.get("screened_primary_blocker")
+    if screened_primary_blocker:
+        blockers = [screened_primary_blocker] + [
+            item for item in blockers if item != screened_primary_blocker
+        ]
+        primary_blocker = screened_primary_blocker
+    else:
+        primary_blocker = _effective_primary_blocker(
+            checklist_block,
+            screened_reason=screened_reason,
+            time_gate_reason=time_gate_reason,
+        )
 
     return {
         "ok": True,
@@ -4936,8 +4944,8 @@ def _build_final_reason_context_block(
         "primary_blocker": primary_blocker,
         "blockers": blockers,
         "note": (
-            "The final NO_TRADE reason can come from the time/day gate, "
-            "structural blockers, or both."
+            "The top-line NO_TRADE reason may still be the time/day gate, "
+            "while primary_blocker leads with the structural blocker when one already exists."
         ),
     }
 
@@ -4950,12 +4958,12 @@ def _build_reason_stack_context_block(
 ) -> Dict[str, Any]:
     screened_reason = final_reason_context.get("screened_reason")
     time_gate_reason = final_reason_context.get("time_gate_reason")
-    blockers = _effective_blockers(
+    blockers = list(final_reason_context.get("blockers") or _effective_blockers(
         checklist_block,
         screened_reason=screened_reason,
         time_gate_reason=time_gate_reason,
-    )
-    primary_blocker = _effective_primary_blocker(
+    ))
+    primary_blocker = final_reason_context.get("primary_blocker") or _effective_primary_blocker(
         checklist_block,
         screened_reason=screened_reason,
         time_gate_reason=time_gate_reason,
@@ -5913,7 +5921,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_entry_context_priority_2026_04_10",
+        "build_tag": "schema_patch_core_final_reason_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
