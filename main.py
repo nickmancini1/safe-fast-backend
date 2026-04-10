@@ -3797,6 +3797,21 @@ def _derive_route_next_flip(
     return fallback
 
 
+
+
+def _map_route_flip_to_blocker_name(route_flip: Optional[str]) -> Optional[str]:
+    mapping = {
+        "allowed_setup_type": "allowed_setup_type",
+        "room_pass": "clear_room",
+        "extension_clear": "early_enough",
+        "structure_ready": "clear_trigger",
+        "trigger_present": "clear_trigger",
+        "fresh_entry_allowed": "time_day_gate",
+        "market_open": "time_day_gate",
+        "time_day_gate": "time_day_gate",
+    }
+    return mapping.get(route_flip, route_flip)
+
 def _build_entry_context_block(
     trigger_state: Dict[str, Any],
     live_map: Dict[str, Any],
@@ -4425,10 +4440,11 @@ def _build_candidate_context(
         trigger_state=trigger_state,
         fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")),
     )
+    candidate_route_primary_blocker = _map_route_flip_to_blocker_name(candidate_route_next_flip)
     candidate_context_blockers = list(effective_blockers)
-    if candidate_route_next_flip and candidate_route_next_flip in candidate_context_blockers:
-        candidate_context_blockers = [candidate_route_next_flip] + [
-            item for item in candidate_context_blockers if item != candidate_route_next_flip
+    if candidate_route_primary_blocker and candidate_route_primary_blocker in candidate_context_blockers:
+        candidate_context_blockers = [candidate_route_primary_blocker] + [
+            item for item in candidate_context_blockers if item != candidate_route_primary_blocker
         ]
     candidate_context_primary_blocker = (
         candidate_context_blockers[0] if candidate_context_blockers else effective_primary_blocker
@@ -5826,7 +5842,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_candidate_context_blocker_priority_2026_04_10",
+        "build_tag": "schema_patch_core_candidate_context_primary_blocker_mapping_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
