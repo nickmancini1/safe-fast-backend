@@ -4871,7 +4871,7 @@ def _build_setup_eligibility_context_block(
         or []
     )
 
-    next_flip_needed = _derive_route_next_flip(
+    route_next_flip = _derive_route_next_flip(
         structure_context=structure_context,
         trigger_state={
             "structure_ready": structure_context.get("setup_eligible_now"),
@@ -4879,8 +4879,16 @@ def _build_setup_eligibility_context_block(
         },
         fallback=approval_requirements_context.get("next_flip_needed") or (blockers[0] if blockers else None),
     )
-    if next_flip_needed:
-        blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
+    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
+    if account_gate_primary_blocker:
+        next_flip_needed = account_gate_primary_blocker
+        blockers = [account_gate_primary_blocker] + [
+            item for item in blockers if item != account_gate_primary_blocker
+        ]
+    else:
+        next_flip_needed = route_next_flip
+        if next_flip_needed:
+            blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
     primary_blocker = blockers[0] if blockers else None
 
     if not setup_type:
@@ -6019,7 +6027,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_open_position_priority_parity_2026_04_10",
+        "build_tag": "schema_patch_core_setup_open_position_priority_parity_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
