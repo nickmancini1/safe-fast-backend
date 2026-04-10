@@ -4681,6 +4681,17 @@ def _build_setup_eligibility_context_block(
         or checklist_block.get("failed_items")
         or []
     )
+
+    next_flip_needed = _derive_route_next_flip(
+        structure_context=structure_context,
+        trigger_state={
+            "structure_ready": structure_context.get("setup_eligible_now"),
+            "trigger_present": live_map.get("trigger_present"),
+        },
+        fallback=approval_requirements_context.get("next_flip_needed") or (blockers[0] if blockers else None),
+    )
+    if next_flip_needed:
+        blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
     primary_blocker = blockers[0] if blockers else None
 
     if not setup_type:
@@ -4699,19 +4710,13 @@ def _build_setup_eligibility_context_block(
         "ten_second_check_answer": "YES" if allowed_setup_type else "NO",
         "setup_route_status": route.get("setup_route_status"),
         "setup_route_reason": route.get("why_setup_route_passes_or_fails"),
-        "next_flip_needed": _derive_route_next_flip(
-            structure_context=structure_context,
-            trigger_state={
-                "structure_ready": structure_context.get("setup_eligible_now"),
-                "trigger_present": live_map.get("trigger_present"),
-            },
-            fallback=approval_requirements_context.get("next_flip_needed") or primary_blocker,
-        ),
+        "next_flip_needed": next_flip_needed,
         "primary_blocker": primary_blocker,
         "blockers": blockers,
         "approval_path_status": approval_requirements_context.get("approval_path_status"),
         "note": "A setup label can be detected while SAFE-FAST still marks the setup as not eligible."
     }
+
 
 def _build_setup_check_context_block(
 
@@ -5802,7 +5807,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_route_next_flip_priority_2026_04_10",
+        "build_tag": "schema_patch_core_setup_primary_blocker_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
