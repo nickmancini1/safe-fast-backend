@@ -29,6 +29,11 @@ ALLOWED_SYMBOLS = {"SPY", "QQQ", "IWM", "GLD"}
 SYMBOL_ORDER = ["SPY", "QQQ", "IWM", "GLD"]
 
 NY_TZ = ZoneInfo("America/New_York")
+ALLOWED_SETUP_TYPES = {"Ideal", "Clean Fast Break", "Continuation"}
+
+
+def _is_allowed_setup_type_name(setup_type: Optional[str]) -> bool:
+    return isinstance(setup_type, str) and setup_type in ALLOWED_SETUP_TYPES
 
 
 class OnDemandRequest(BaseModel):
@@ -558,7 +563,7 @@ def _build_setup_route_context(
     trigger_present = bool(trigger_state.get("trigger_present"))
     structure_ready = bool(trigger_state.get("structure_ready"))
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
-    allowed_setup_types = {"Ideal", "Clean Fast Break", "Continuation"}
+    allowed_setup_types = ALLOWED_SETUP_TYPES
     route_type_allowed = intended_setup_type in allowed_setup_types
 
     if intended_setup_type == "Clean Fast Break":
@@ -3178,7 +3183,7 @@ def _build_checklist_block(
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
 
     items = [
-        {"item": "allowed_setup_type", "yes": bool(structure_context.get("allowed_setup") is True)},
+        {"item": "allowed_setup_type", "yes": _is_allowed_setup_type_name(structure_context.get("setup_type"))},
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
@@ -3842,9 +3847,9 @@ def _build_approval_requirements_context_block(
     gate_statuses = [
         {
             "gate": "allowed_setup_type",
-            "ready": bool(structure_context.get("allowed_setup") is True),
+            "ready": _is_allowed_setup_type_name(structure_context.get("setup_type")),
             "current_value": structure_context.get("setup_type"),
-            "needed_state": "allowed SAFE-FAST setup",
+            "needed_state": "one of the 3 allowed SAFE-FAST setup types",
         },
         {
             "gate": "room_pass",
@@ -4474,6 +4479,7 @@ def _build_setup_eligibility_context_block(
     approval_requirements_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     setup_type = structure_context.get("setup_type")
+    allowed_setup_type = _is_allowed_setup_type_name(setup_type)
     allowed_setup = bool(structure_context.get("allowed_setup") is True)
     route = live_map.get("setup_route") or {}
     blockers = list(
@@ -4496,7 +4502,7 @@ def _build_setup_eligibility_context_block(
         "setup_type_detected": setup_type,
         "setup_type_status": setup_type_status,
         "allowed_setup": allowed_setup,
-        "ten_second_check_answer": "YES" if allowed_setup else "NO",
+        "ten_second_check_answer": "YES" if allowed_setup_type else "NO",
         "setup_route_status": route.get("setup_route_status"),
         "setup_route_reason": route.get("why_setup_route_passes_or_fails"),
         "next_flip_needed": approval_requirements_context.get("next_flip_needed") or primary_blocker,
@@ -4532,7 +4538,7 @@ def _build_setup_check_context_block(
         "allowed_setup": allowed_setup,
         "ten_second_check_item": "allowed_setup_type",
         "ten_second_check_answer": allowed_setup_answer,
-        "detected_but_not_eligible": bool(setup_type and not allowed_setup),
+        "detected_but_not_eligible": bool(_is_allowed_setup_type_name(setup_type) and not allowed_setup),
         "primary_blocker": primary_blocker,
         "blockers": blockers,
         "note": (
@@ -4724,7 +4730,7 @@ def _build_on_demand_unavailable_payload(
     status_code: int = 503,
 ) -> Dict[str, Any]:
     reason_text = _coerce_error_reason(reason)
-    build_tag = "schema_patch_reason_stack_context_timeout_guard_2026_04_09"
+    build_tag = "schema_patch_core_setup_type_gate_split_2026_04_09"
     failed_reasons = [reason_text]
     primary_blocker = "data_unavailable"
 
@@ -5570,7 +5576,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_checklist_gate_alignment_2026_04_09",
+        "build_tag": "schema_patch_core_setup_type_gate_split_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
