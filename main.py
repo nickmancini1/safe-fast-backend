@@ -4170,6 +4170,9 @@ def _build_screened_best_context(
 
     selected_checklist = selected.get("checklist") or {}
     selected_reason = selected.get("reason")
+    selected_structure_context = selected.get("structure_context") or {}
+    selected_trigger_state = selected.get("trigger_state") or {}
+
     effective_failed_items = _effective_blockers(
         selected_checklist,
         screened_reason=selected_reason,
@@ -4177,6 +4180,24 @@ def _build_screened_best_context(
     effective_primary_blocker = (
         effective_failed_items[0] if effective_failed_items else None
     )
+
+    screened_route_next_flip = _derive_route_next_flip(
+        structure_context=selected_structure_context,
+        trigger_state=selected_trigger_state,
+        fallback=_derive_global_gate_next_flip(
+            selected_trigger_state.get("gate_reason") or selected_trigger_state.get("why")
+        ),
+    )
+    screened_route_primary_blocker = _map_route_flip_to_blocker_name(screened_route_next_flip)
+    screened_blockers = list(effective_failed_items)
+    if screened_route_primary_blocker and screened_route_primary_blocker in screened_blockers:
+        screened_blockers = [screened_route_primary_blocker] + [
+            item for item in screened_blockers if item != screened_route_primary_blocker
+        ]
+    screened_primary_blocker = (
+        screened_blockers[0] if screened_blockers else effective_primary_blocker
+    )
+
     engine_pick_reason = engine_pick.get("reason") if engine_pick else None
     engine_pick_verdict = engine_pick.get("final_verdict") if engine_pick else None
 
@@ -4190,8 +4211,8 @@ def _build_screened_best_context(
         "changed_from_engine_best": selected.get("symbol") != engine_best_ticker,
         "screened_final_verdict": selected.get("final_verdict"),
         "screened_reason": selected_reason,
-        "screened_primary_blocker": effective_primary_blocker,
-        "screened_checklist_failed_items": effective_failed_items,
+        "screened_primary_blocker": screened_primary_blocker,
+        "screened_checklist_failed_items": screened_blockers,
         "engine_best_final_verdict_after_screen": engine_pick_verdict,
         "engine_best_reason_after_screen": engine_pick_reason,
     }
@@ -5842,7 +5863,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_candidate_context_primary_blocker_mapping_2026_04_10",
+        "build_tag": "schema_patch_core_screened_best_blocker_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
