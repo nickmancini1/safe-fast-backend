@@ -3778,6 +3778,25 @@ def _derive_global_gate_next_flip(trigger_reason: Any) -> Optional[str]:
     return None
 
 
+def _derive_route_next_flip(
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    fallback: Optional[str],
+) -> Optional[str]:
+    setup_type = structure_context.get("setup_type")
+    if not _is_allowed_setup_type_name(setup_type):
+        return "allowed_setup_type"
+    if structure_context.get("room_pass") is not True:
+        return "room_pass"
+    if structure_context.get("extension_blocks_now") is True:
+        return "extension_clear"
+    if trigger_state.get("structure_ready") is not True:
+        return "structure_ready"
+    if trigger_state.get("trigger_present") is not True:
+        return "trigger_present"
+    return fallback
+
+
 def _build_entry_context_block(
     trigger_state: Dict[str, Any],
     live_map: Dict[str, Any],
@@ -3929,7 +3948,11 @@ def _build_approval_context_block(
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
     primary_blocker = blockers[0] if blockers else None
-    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker
+    next_flip_needed = _derive_route_next_flip(
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker,
+    )
     intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
     intrabar_trade_available_now = bool(entry_context.get("mid_candle_trade_available_now") is True)
     completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
@@ -4066,7 +4089,11 @@ def _build_approval_requirements_context_block(
     ]
 
     missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
-    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None))
+    next_flip_needed = _derive_route_next_flip(
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None)),
+    )
 
     if approval_context.get("approval_ready_now") is True:
         approval_path_status = "APPROVED_NOW"
@@ -4672,7 +4699,14 @@ def _build_setup_eligibility_context_block(
         "ten_second_check_answer": "YES" if allowed_setup_type else "NO",
         "setup_route_status": route.get("setup_route_status"),
         "setup_route_reason": route.get("why_setup_route_passes_or_fails"),
-        "next_flip_needed": approval_requirements_context.get("next_flip_needed") or primary_blocker,
+        "next_flip_needed": _derive_route_next_flip(
+            structure_context=structure_context,
+            trigger_state={
+                "structure_ready": structure_context.get("setup_eligible_now"),
+                "trigger_present": live_map.get("trigger_present"),
+            },
+            fallback=approval_requirements_context.get("next_flip_needed") or primary_blocker,
+        ),
         "primary_blocker": primary_blocker,
         "blockers": blockers,
         "approval_path_status": approval_requirements_context.get("approval_path_status"),
@@ -5768,7 +5802,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_current_bar_price_label_preserved_2026_04_10",
+        "build_tag": "schema_patch_core_route_next_flip_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
