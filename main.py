@@ -3960,6 +3960,14 @@ def _build_screened_best_context(
     )
 
     selected_checklist = selected.get("checklist") or {}
+    selected_reason = selected.get("reason")
+    effective_failed_items = _effective_blockers(
+        selected_checklist,
+        screened_reason=selected_reason,
+    )
+    effective_primary_blocker = (
+        effective_failed_items[0] if effective_failed_items else None
+    )
     engine_pick_reason = engine_pick.get("reason") if engine_pick else None
     engine_pick_verdict = engine_pick.get("final_verdict") if engine_pick else None
 
@@ -3972,8 +3980,9 @@ def _build_screened_best_context(
         "engine_best_ticker": normalized_engine_best_ticker,
         "changed_from_engine_best": selected.get("symbol") != engine_best_ticker,
         "screened_final_verdict": selected.get("final_verdict"),
-        "screened_reason": selected.get("reason"),
-        "screened_checklist_failed_items": selected_checklist.get("failed_items", []),
+        "screened_reason": selected_reason,
+        "screened_primary_blocker": effective_primary_blocker,
+        "screened_checklist_failed_items": effective_failed_items,
         "engine_best_final_verdict_after_screen": engine_pick_verdict,
         "engine_best_reason_after_screen": engine_pick_reason,
     }
@@ -5548,11 +5557,20 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         screened_live_winner_final_verdict=screened_live_winner_final_verdict,
         screened_reason=screened_best_context_block.get("screened_reason"),
     )
+    effective_payload_checklist_block = dict(checklist_block)
+    effective_payload_checklist_block["failed_items"] = _effective_blockers(
+        checklist_block,
+        screened_reason=screened_best_context_block.get("screened_reason"),
+        time_gate_reason=time_day_gate.get("reason"),
+    )
+    effective_payload_checklist_block["decision_blockers_priority"] = list(
+        effective_payload_checklist_block["failed_items"]
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_candidate_handoff_gate_2026_04_09",
+        "build_tag": "schema_patch_core_checklist_gate_alignment_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -5631,7 +5649,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "trigger_state": trigger_state,
         "targets": targets_block,
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
-        "checklist": checklist_block,
+        "checklist": effective_payload_checklist_block,
         "failed_reasons": failed_reasons_block,
         "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
         "request": request.model_dump(),
