@@ -3359,6 +3359,7 @@ def _should_freeze_winner_to_raw_engine(
     if global_gate_reason in {
         "market_closed",
         "past_monday_thursday_cutoff",
+        "past_friday_cutoff",
         "outside_time_window",
         "outside_day_window",
     }:
@@ -3475,7 +3476,7 @@ def _resolve_global_gate_primary_blocker(
     time_gate_reason: Optional[str] = None,
 ) -> Optional[str]:
     gate_reason = time_gate_reason or screened_reason
-    if gate_reason in {"market_closed", "past_monday_thursday_cutoff"}:
+    if gate_reason in {"market_closed", "past_monday_thursday_cutoff", "past_friday_cutoff", "outside_time_window", "outside_day_window"}:
         return "time_day_gate"
     return None
 
@@ -3633,9 +3634,7 @@ def _build_trigger_context_block(
 
 
 def _derive_global_gate_primary_blocker(trigger_reason: Any) -> Optional[str]:
-    if trigger_reason == "market_closed":
-        return "time_day_gate"
-    if trigger_reason == "past_monday_thursday_cutoff":
+    if trigger_reason in {"market_closed", "past_monday_thursday_cutoff", "past_friday_cutoff", "outside_time_window", "outside_day_window"}:
         return "time_day_gate"
     return None
 
@@ -3643,7 +3642,7 @@ def _derive_global_gate_primary_blocker(trigger_reason: Any) -> Optional[str]:
 def _derive_global_gate_next_flip(trigger_reason: Any) -> Optional[str]:
     if trigger_reason == "market_closed":
         return "market_open"
-    if trigger_reason == "past_monday_thursday_cutoff":
+    if trigger_reason in {"past_monday_thursday_cutoff", "past_friday_cutoff", "outside_time_window", "outside_day_window"}:
         return "fresh_entry_allowed"
     return None
 
