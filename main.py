@@ -5926,11 +5926,17 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         for item in effective_payload_checklist_block["effective_failed_items"]
         if item not in (checklist_block.get("failed_items") or [])
     ]
+    ten_second_checklist_block = _build_ten_second_checklist(
+        request=request,
+        checklist_block=effective_payload_checklist_block,
+        structure_context=structure_context,
+        iv_context=iv_context,
+    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_checklist_effective_priority_2026_04_10",
+        "build_tag": "schema_patch_core_ten_second_effective_priority_2026_04_10",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
