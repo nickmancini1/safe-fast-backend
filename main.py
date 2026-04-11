@@ -4391,6 +4391,7 @@ def _build_approval_requirements_context_block(
     time_day_gate: Dict[str, Any],
     macro_context: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
     approval_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     checklist_items = {row.get("item"): bool(row.get("yes")) for row in checklist_block.get("items", [])}
@@ -6266,6 +6267,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         time_day_gate=time_day_gate,
         macro_context=macro_context,
         liquidity_context=liquidity_context,
+        iv_context=iv_context,
         approval_context=approval_context_block,
     )
     approval_flip_context_block = _build_approval_flip_context_block(
