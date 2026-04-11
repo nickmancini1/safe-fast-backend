@@ -1,8 +1,6 @@
 # fresh full main.py build with entry_context bridge 2026-04-09T16:05:00Z
 
 import asyncio
-import copy
-import json
 
 import os
 import re
@@ -105,6 +103,76 @@ def _round_or_none(value: Optional[float], places: int = 4) -> Optional[float]:
     if value is None:
         return None
     return round(value, places)
+
+
+def _normalize_pct_0_to_100(value: Any) -> Optional[float]:
+    numeric = _to_float(value)
+    if numeric is None:
+        return None
+    if 0.0 <= numeric <= 1.5:
+        numeric *= 100.0
+    return round(numeric, 2)
+
+
+def _first_present_float(source: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for key in keys:
+        value = _to_float(source.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_iv_metrics(source: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(source, dict):
+        return {
+            "iv_rank_pct": None,
+            "iv_percentile_pct": None,
+            "iv_index_pct": None,
+        }
+
+    iv_rank_raw = _first_present_float(
+        source,
+        [
+            "iv-rank",
+            "iv_rank",
+            "ivRank",
+            "implied-volatility-rank",
+            "implied_volatility_rank",
+            "impliedVolatilityRank",
+        ],
+    )
+    iv_percentile_raw = _first_present_float(
+        source,
+        [
+            "iv-percentile",
+            "iv_percentile",
+            "ivPercentile",
+            "implied-volatility-percentile",
+            "implied_volatility_percentile",
+            "impliedVolatilityPercentile",
+        ],
+    )
+    iv_index_raw = _first_present_float(
+        source,
+        [
+            "implied-volatility",
+            "implied_volatility",
+            "impliedVolatility",
+            "implied-volatility-index",
+            "implied_volatility_index",
+            "impliedVolatilityIndex",
+            "iv",
+            "iv-index",
+            "iv_index",
+            "volatility",
+        ],
+    )
+
+    return {
+        "iv_rank_pct": _normalize_pct_0_to_100(iv_rank_raw),
+        "iv_percentile_pct": _normalize_pct_0_to_100(iv_percentile_raw),
+        "iv_index_pct": _normalize_pct_0_to_100(iv_index_raw),
+    }
 
 
 def _build_price_zone(
@@ -245,28 +313,9 @@ def _build_trigger_detail_context(
     current_high = _to_float(current_candle.get("high"))
     current_low = _to_float(current_candle.get("low"))
 
-    time_gate_blocked = (trigger_state.get("gate_reason") or trigger_state.get("why")) in {
-        "market_closed",
-        "past_monday_thursday_cutoff",
-        "past_friday_cutoff",
-        "weekend",
-    }
-
     if option_type == "C":
-        if trigger_level is not None and current_close is not None and current_close > trigger_level:
-            behavior_label = (
-                "breaking_above_trigger"
-                if structure_ready
-                else "breaking_above_trigger_but_blocked"  # raw-signal behavior parity patch
-            )
-        elif (
-            trigger_level is not None
-            and current_high is not None
-            and current_high >= trigger_level
-            and current_close is not None
-            and current_close <= trigger_level
-        ):
-            behavior_label = "rejected_at_trigger"
+        if trigger_level is not None and current_close is not None and current_close > trigger_level and structure_ready:
+            behavior_label = "breaking_above_trigger"
         elif trigger_level is not None and current_high is not None and current_high >= trigger_level:
             behavior_label = "testing_trigger_but_not_confirmed"
         elif price_side == "above" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
@@ -276,20 +325,8 @@ def _build_trigger_detail_context(
         else:
             behavior_label = "below_ema_or_not_ready"
     else:
-        if trigger_level is not None and current_close is not None and current_close < trigger_level:
-            behavior_label = (
-                "breaking_below_trigger"
-                if structure_ready
-                else "breaking_below_trigger_but_blocked"
-            )
-        elif (
-            trigger_level is not None
-            and current_low is not None
-            and current_low <= trigger_level
-            and current_close is not None
-            and current_close >= trigger_level
-        ):
-            behavior_label = "rejected_at_trigger"
+        if trigger_level is not None and current_close is not None and current_close < trigger_level and structure_ready:
+            behavior_label = "breaking_below_trigger"
         elif trigger_level is not None and current_low is not None and current_low <= trigger_level:
             behavior_label = "testing_trigger_but_not_confirmed"
         elif price_side == "below" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
@@ -342,7 +379,6 @@ def _build_trigger_detail_context(
         "trigger_present": trigger_present,
         "structure_ready": structure_ready,
         "why": trigger_state.get("why"),
-        "gate_reason": trigger_state.get("gate_reason"),
     }
 
     return {
@@ -382,7 +418,6 @@ def _evaluate_trigger_scan_candle(
         return {
             "status": "unconfirmed",
             "why": "candle_unavailable",
-            "gate_reason": gate_reason,
         }
 
     if len(reference_candles) < 3:
@@ -403,7 +438,6 @@ def _evaluate_trigger_scan_candle(
             "gated_trigger_pass": False,
             "status": "unconfirmed",
             "why": "insufficient_reference_candles",
-            "gate_reason": gate_reason,
         }
 
     close_value = _to_float(candle.get("close"))
@@ -436,30 +470,24 @@ def _evaluate_trigger_scan_candle(
         and fresh_entry_allowed
     )
 
-    if structure_ready is False:
-        structural_why = "structure_not_ready"
-    elif not ema_side_pass:
-        structural_why = "wrong_side_of_ema"
-    elif not raw_cross_pass:
-        structural_why = "close_trigger_not_hit"
-    else:
-        structural_why = None
-
     if gated_trigger_pass:
         status = "pass"
         why = "Trigger conditions pass on this candle."
     elif not market_open:
         status = "fail"
         why = "market_closed"
-    elif not fresh_entry_allowed and structural_why is None:
-        status = "fail"
-        why = gate_reason or "time_day_gate_blocked"
-    elif structural_why is not None:
-        status = "fail"
-        why = structural_why
     elif not fresh_entry_allowed:
         status = "fail"
         why = gate_reason or "time_day_gate_blocked"
+    elif structure_ready is False:
+        status = "fail"
+        why = "structure_not_ready"
+    elif not ema_side_pass:
+        status = "fail"
+        why = "wrong_side_of_ema"
+    elif not raw_cross_pass:
+        status = "fail"
+        why = "close_trigger_not_hit"
     else:
         status = "unconfirmed"
         why = "trigger_unconfirmed"
@@ -481,7 +509,6 @@ def _evaluate_trigger_scan_candle(
         "gated_trigger_pass": gated_trigger_pass,
         "status": status,
         "why": why,
-        "gate_reason": gate_reason if not fresh_entry_allowed else None,
     }
 
 
@@ -517,7 +544,7 @@ def _build_trigger_scan_context(
     ema50_1h = _to_float(chart_check.get("ema50_1h"))
     market_open = bool(market_context.get("is_open"))
     fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
-    gate_reason = trigger_state.get("gate_reason") or trigger_state.get("why")
+    gate_reason = trigger_state.get("why")
     structure_ready = trigger_state.get("structure_ready")
 
     current_bar = recent[-1] if recent else None
@@ -555,12 +582,12 @@ def _build_trigger_scan_context(
     elif not market_open:
         trigger_scan_status = "fail"
         why = "Market is closed, so trigger scan cannot produce a live entry."
-    elif structure_ready is False:
-        trigger_scan_status = "fail"
-        why = "Structure is not ready for a SAFE-FAST trigger."
     elif not fresh_entry_allowed:
         trigger_scan_status = "fail"
         why = gate_reason or "Fresh entry is outside the SAFE-FAST time/day window."
+    elif structure_ready is False:
+        trigger_scan_status = "fail"
+        why = "Structure is not ready for a SAFE-FAST trigger."
     elif current_bar_eval.get("raw_chart_trigger_pass") or completed_eval.get("raw_chart_trigger_pass"):
         trigger_scan_status = "fail"
         why = "A raw chart trigger appeared, but SAFE-FAST gating still blocks it."
@@ -578,7 +605,6 @@ def _build_trigger_scan_context(
         "market_open": market_open,
         "fresh_entry_allowed": fresh_entry_allowed,
         "structure_ready": structure_ready,
-        "gate_reason": gate_reason if not fresh_entry_allowed else None,
         "current_bar": current_bar_eval,
         "most_recent_completed_candle": completed_eval,
         "current_bar_reference_candles": [
@@ -674,7 +700,7 @@ def _build_setup_route_context(
     elif extension_state == "extended":
         setup_route_status = "fail"
         why = "Setup route is too extended or too late versus the 1H 50 EMA."
-    elif setup_eligible_now is False:
+    elif allowed_setup is False:
         setup_route_status = "fail"
         why = "This is an allowed SAFE-FAST route class, but the current structure does not qualify it as a valid setup."
     else:
@@ -802,12 +828,15 @@ def _build_execution_quality_context(
     elif has_major_event_tomorrow:
         execution_quality_status = "caution"
         why = "A major macro event is in play tomorrow, so execution quality needs extra caution."
+    elif iv_status == "high":
+        execution_quality_status = "fail"
+        why = iv_context.get("why") or "IV is too high for SAFE-FAST."
     elif iv_status == "unconfirmed":
         execution_quality_status = "caution"
-        why = "IV is still unconfirmed in this build, even though time window and liquidity are acceptable."
+        why = iv_context.get("why") or "IV is still unconfirmed in this build, even though time window and liquidity are acceptable."
     elif liquidity_pass is True:
         execution_quality_status = "pass"
-        why = "Time window and liquidity are acceptable for execution."
+        why = "Time window, liquidity, and IV are acceptable for execution."
     else:
         execution_quality_status = "unconfirmed"
         why = "Execution quality is still unconfirmed from the available inputs."
@@ -1251,11 +1280,66 @@ def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
-def _build_iv_context() -> Dict[str, Any]:
+def _build_iv_context(
+    selected_summary: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    summary_metrics = (selected_summary or {}).get("underlying_iv_metrics") or {}
+    iv_rank_pct = _to_float(summary_metrics.get("iv_rank_pct"))
+    iv_percentile_pct = _to_float(summary_metrics.get("iv_percentile_pct"))
+    iv_index_pct = _to_float(summary_metrics.get("iv_index_pct"))
+
+    avg_leg_iv_pct = _to_float((primary_candidate or {}).get("avg_leg_iv_pct"))
+    long_leg_iv_pct = _to_float((primary_candidate or {}).get("long_leg_iv_pct"))
+    short_leg_iv_pct = _to_float((primary_candidate or {}).get("short_leg_iv_pct"))
+
+    thresholds = {
+        "iv_rank_high_above": 50.0,
+        "iv_percentile_high_above": 60.0,
+    }
+
+    has_rank_or_percentile = iv_rank_pct is not None or iv_percentile_pct is not None
+    if has_rank_or_percentile:
+        iv_too_high = bool(
+            (iv_rank_pct is not None and iv_rank_pct > thresholds["iv_rank_high_above"])
+            or (iv_percentile_pct is not None and iv_percentile_pct > thresholds["iv_percentile_high_above"])
+        )
+        if iv_too_high:
+            status = "high"
+            ok = False
+            why = (
+                "IV is too high for SAFE-FAST. "
+                f"IV Rank={iv_rank_pct if iv_rank_pct is not None else 'n/a'} "
+                f"and IV Percentile={iv_percentile_pct if iv_percentile_pct is not None else 'n/a'}."
+            )
+        else:
+            status = "acceptable"
+            ok = True
+            why = (
+                "IV is acceptable for SAFE-FAST from the available IV Rank/Percentile data."
+            )
+    else:
+        status = "unconfirmed"
+        ok = False
+        if any(value is not None for value in (avg_leg_iv_pct, long_leg_iv_pct, short_leg_iv_pct, iv_index_pct)):
+            why = (
+                "Leg/quote IV is observed, but IV Rank and IV Percentile are unavailable, "
+                "so SAFE-FAST does not use IV to approve or reject this setup yet."
+            )
+        else:
+            why = "IV source is still unavailable for this setup."
+
     return {
-        "ok": False,
-        "status": "unconfirmed",
-        "why": "IV source is not wired into this build yet.",
+        "ok": ok,
+        "status": status,
+        "why": why,
+        "iv_rank_pct": _round_or_none(iv_rank_pct, 2),
+        "iv_percentile_pct": _round_or_none(iv_percentile_pct, 2),
+        "iv_index_pct": _round_or_none(iv_index_pct, 2),
+        "avg_leg_iv_pct": _round_or_none(avg_leg_iv_pct, 2),
+        "long_leg_iv_pct": _round_or_none(long_leg_iv_pct, 2),
+        "short_leg_iv_pct": _round_or_none(short_leg_iv_pct, 2),
+        "thresholds": thresholds,
     }
 
 
@@ -1603,7 +1687,7 @@ async def _fetch_option_quotes(option_symbols: List[str], token: str) -> Any:
     return payload
 
 
-async def _get_underlying_price(symbol: str, token: str) -> float:
+async def _get_underlying_quote_snapshot(symbol: str, token: str) -> Dict[str, Any]:
     payload = await _fetch_quotes([symbol], token)
     items = payload.get("data", {}).get("items", [])
     if not items:
@@ -1613,7 +1697,11 @@ async def _get_underlying_price(symbol: str, token: str) -> float:
     for field in ("mark", "last", "mid", "close"):
         value = _to_float(item.get(field))
         if value is not None:
-            return value
+            return {
+                "price": value,
+                "quote_item": item,
+                "iv_metrics": _extract_iv_metrics(item),
+            }
 
     raise HTTPException(status_code=500, detail="Could not determine underlying price")
 
@@ -1689,6 +1777,7 @@ def _merge_quotes_into_contracts(
     merged: List[Dict[str, Any]] = []
     for contract in near_contracts:
         quote = quote_map.get(contract["symbol"], {})
+        quote_iv_metrics = _extract_iv_metrics(quote)
         merged.append(
             {
                 **contract,
@@ -1697,6 +1786,9 @@ def _merge_quotes_into_contracts(
                 "mid": quote.get("mid"),
                 "mark": quote.get("mark"),
                 "last": quote.get("last"),
+                "quote_iv_pct": quote_iv_metrics.get("iv_index_pct"),
+                "quote_iv_rank_pct": quote_iv_metrics.get("iv_rank_pct"),
+                "quote_iv_percentile_pct": quote_iv_metrics.get("iv_percentile_pct"),
             }
         )
 
@@ -1794,6 +1886,11 @@ def _generate_debit_spread_candidates(
             if short_bid is not None and short_ask is not None:
                 short_leg_width = round(short_ask - short_bid, 4)
 
+            long_leg_iv_pct = _to_float(long_leg.get("quote_iv_pct"))
+            short_leg_iv_pct = _to_float(short_leg.get("quote_iv_pct"))
+            iv_values = [value for value in (long_leg_iv_pct, short_leg_iv_pct) if value is not None]
+            avg_leg_iv_pct = round(sum(iv_values) / len(iv_values), 2) if iv_values else None
+
             candidates.append(
                 {
                     "long_symbol": long_leg.get("symbol"),
@@ -1825,6 +1922,9 @@ def _generate_debit_spread_candidates(
                     "short_leg_width": _round_or_none(short_leg_width),
                     "long_leg_width_pct_of_mid": _calc_pct_of_mid(long_bid, long_ask, long_mid),
                     "short_leg_width_pct_of_mid": _calc_pct_of_mid(short_bid, short_ask, short_mid),
+                    "long_leg_iv_pct": _round_or_none(long_leg_iv_pct, 2),
+                    "short_leg_iv_pct": _round_or_none(short_leg_iv_pct, 2),
+                    "avg_leg_iv_pct": _round_or_none(avg_leg_iv_pct, 2),
                 }
             )
 
@@ -1905,6 +2005,9 @@ def _compact_candidate(candidate: Optional[Dict[str, Any]]) -> Optional[Dict[str
         "short_leg_width": candidate.get("short_leg_width"),
         "long_leg_width_pct_of_mid": candidate.get("long_leg_width_pct_of_mid"),
         "short_leg_width_pct_of_mid": candidate.get("short_leg_width_pct_of_mid"),
+        "long_leg_iv_pct": candidate.get("long_leg_iv_pct"),
+        "short_leg_iv_pct": candidate.get("short_leg_iv_pct"),
+        "avg_leg_iv_pct": candidate.get("avg_leg_iv_pct"),
     }
 
 
@@ -1916,6 +2019,7 @@ def _compact_ticker_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
         "expiration_date": summary.get("expiration_date"),
         "days_to_expiration": summary.get("days_to_expiration"),
         "underlying_price": summary.get("underlying_price"),
+        "underlying_iv_metrics": summary.get("underlying_iv_metrics"),
         "preferred_count": summary.get("preferred_count"),
         "fallback_count": summary.get("fallback_count"),
         "reason": summary.get("reason"),
@@ -2008,7 +2112,9 @@ async def _build_ticker_summary(
         }
 
     chosen_expiration = expirations[0]
-    underlying_price = await _get_underlying_price(symbol, token)
+    underlying_quote_snapshot = await _get_underlying_quote_snapshot(symbol, token)
+    underlying_price = underlying_quote_snapshot["price"]
+    underlying_iv_metrics = underlying_quote_snapshot.get("iv_metrics") or {}
 
     near_contracts = _build_near_contracts(
         chain_payload=chain_payload,
@@ -2036,7 +2142,9 @@ async def _build_ticker_summary(
 
     shortlist = _select_shortlist(all_candidates, allow_fallback)
 
-    if shortlist["selection_mode"] in {"preferred", "fallback"}:
+    if shortlist["selection_mode"] == "preferred":
+        verdict = "ACTIVE_NOW"
+    elif shortlist["selection_mode"] == "fallback":
         verdict = "PENDING"
     else:
         verdict = "NO_TRADE"
@@ -2049,6 +2157,7 @@ async def _build_ticker_summary(
         "expiration_date": chosen_expiration["expiration_date"],
         "days_to_expiration": chosen_expiration["days_to_expiration"],
         "underlying_price": underlying_price,
+        "underlying_iv_metrics": underlying_iv_metrics,
         "preferred_count": shortlist["preferred_count"],
         "fallback_count": shortlist["fallback_count"],
         "primary_candidate": shortlist["primary_candidate"],
@@ -2189,11 +2298,6 @@ def _normalize_engine_summary_for_session(
             market_context=market_context,
             time_day_gate=time_day_gate,
         )
-        if not normalized.get("best_ticker"):
-            normalized["reason"] = "No candidate available."
-            normalized["selection_mode"] = "none"
-            normalized["primary_candidate"] = None
-            normalized["backup_candidate"] = None
 
     return normalized
 
@@ -2861,6 +2965,7 @@ def _final_verdict(
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
 ) -> str:
     if request.open_positions > 0:
         return "NO_TRADE"
@@ -2875,6 +2980,8 @@ def _final_verdict(
     ):
         return "NO_TRADE"
     if liquidity_context.get("liquidity_pass") is False:
+        return "NO_TRADE"
+    if iv_context.get("status") == "high":
         return "NO_TRADE"
     if engine_status == "NO_TRADE":
         return "NO_TRADE"
@@ -2947,6 +3054,7 @@ def _build_user_facing_block(
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
@@ -2970,63 +3078,6 @@ def _build_user_facing_block(
             "setup_state": "NO TRADE",
             "why": "Weekly trade count is already at or above the SAFE-FAST max.",
         }
-
-    if engine_status == "NO_TRADE" or not best_ticker:
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": "No valid candidate engine setup is available.",
-            "setup_state": "NO TRADE",
-            "why": engine_reason,
-        }
-
-    if structure_context.get("ok"):
-        if structure_context.get("setup_type_allowed") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types.",
-            }
-        if structure_context.get("chop_risk") is True:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "1H structure around the 50 EMA is not clean.",
-            }
-        if structure_context.get("room_pass") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "Room to first wall is too tight for SAFE-FAST.",
-            }
-        if structure_context.get("wall_pass") is False:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "Wall thesis and strike placement do not match.",
-            }
-        if structure_context.get("extension_state") == "extended" or structure_context.get("extension_blocks_now") is True:
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": "stand down",
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
-            }
 
     if not market_context["is_open"]:
         return {
@@ -3070,6 +3121,64 @@ def _build_user_facing_block(
             "why": liquidity_context.get("why") or "Options liquidity is too wide for a clean SAFE-FAST entry.",
         }
 
+    if iv_context.get("status") == "high":
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "NO TRADE",
+            "why": iv_context.get("why") or "IV is too high for SAFE-FAST.",
+        }
+
+    if engine_status == "NO_TRADE" or not best_ticker:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "stand down",
+            "invalidation": "No valid candidate engine setup is available.",
+            "setup_state": "NO TRADE",
+            "why": engine_reason,
+        }
+
+    if structure_context.get("ok"):
+        if structure_context.get("room_pass") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "Room to first wall is too tight for SAFE-FAST.",
+            }
+        if structure_context.get("wall_pass") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "Wall thesis and strike placement do not match.",
+            }
+        if structure_context.get("extension_state") == "extended":
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
+            }
+        if structure_context.get("setup_type_allowed") is False:
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types.",
+            }
+
     if final_verdict == "NO_TRADE":
         why = "Best ticker failed the 1H EMA alignment check."
         if chart_check_error:
@@ -3102,6 +3211,26 @@ def _build_trigger_state(
 ) -> Dict[str, Any]:
     trigger_style = "close_above_recent_high" if option_type == "C" else "close_below_recent_low"
 
+    if not market_context.get("is_open"):
+        return {
+            "ok": True,
+            "trigger_present": False,
+            "trigger_style": trigger_style,
+            "trigger_level": None,
+            "current_close": chart_check.get("latest_close") if chart_check else None,
+            "why": "market_closed",
+        }
+
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return {
+            "ok": True,
+            "trigger_present": False,
+            "trigger_style": trigger_style,
+            "trigger_level": None,
+            "current_close": chart_check.get("latest_close") if chart_check else None,
+            "why": time_day_gate.get("reason", "time_day_gate_blocked"),
+        }
+
     if not chart_check or not chart_check.get("ok"):
         return {
             "ok": False,
@@ -3109,10 +3238,7 @@ def _build_trigger_state(
             "trigger_style": trigger_style,
             "trigger_level": None,
             "current_close": None,
-            "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h") if chart_check else None,
-            "structure_ready": None,
             "why": "chart_unavailable",
-            "gate_reason": None,
         }
 
     recent = chart_check.get("recent_candles") or []
@@ -3125,11 +3251,8 @@ def _build_trigger_state(
             "trigger_present": False,
             "trigger_style": trigger_style,
             "trigger_level": None,
-            "current_close": _round_or_none(current_close, 4),
-            "price_vs_ema50_1h": price_side,
-            "structure_ready": None,
+            "current_close": current_close,
             "why": "insufficient_recent_candles",
-            "gate_reason": None,
         }
 
     prior = recent[:-1] if len(recent) >= 2 else recent
@@ -3164,14 +3287,6 @@ def _build_trigger_state(
     elif not crossed:
         why = "close_trigger_not_hit"
 
-    gate_reason = None
-    if not market_context.get("is_open"):
-        gate_reason = "market_closed"
-        trigger_present = False
-    elif not time_day_gate.get("fresh_entry_allowed"):
-        gate_reason = time_day_gate.get("reason", "time_day_gate_blocked")
-        trigger_present = False
-
     return {
         "ok": True,
         "trigger_present": trigger_present,
@@ -3181,7 +3296,6 @@ def _build_trigger_state(
         "price_vs_ema50_1h": price_side,
         "structure_ready": structure_ok,
         "why": why,
-        "gate_reason": gate_reason,
     }
 
 
@@ -3231,34 +3345,35 @@ def _build_checklist_block(
     primary_candidate: Optional[Dict[str, Any]],
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    iv_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     ema_value = chart_check.get("ema50_1h") if chart_check else None
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
+
+    iv_ok_value: Optional[bool]
+    if iv_context.get("status") == "acceptable":
+        iv_ok_value = True
+    elif iv_context.get("status") == "high":
+        iv_ok_value = False
+    else:
+        iv_ok_value = None
 
     items = [
         {"item": "allowed_setup_type", "yes": _is_allowed_setup_type_name(structure_context.get("setup_type"))},
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
-        {"item": "early_enough", "yes": bool(time_day_gate.get("fresh_entry_allowed") and structure_context.get("extension_blocks_now") is not True)},
+        {"item": "early_enough", "yes": bool(time_day_gate.get("fresh_entry_allowed"))},
+        {"item": "iv_acceptable", "yes": iv_ok_value},
         {"item": "clear_trigger", "yes": bool(trigger_state.get("trigger_present") is True)},
         {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
         {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
         {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
         {"item": "open_trade_already", "yes": bool(request.open_positions > 0)},
-        {"item": "weekly_trade_cap_reached", "yes": bool(request.weekly_trade_count >= 4)},
     ]
 
-    failed_items = [
-        row["item"]
-        for row in items
-        if not row["yes"] and row["item"] not in {"open_trade_already", "weekly_trade_cap_reached"}
-    ]
+    failed_items = [row["item"] for row in items if row["yes"] is False and row["item"] != "open_trade_already"]
     global_gate_failures: List[str] = []
-    if request.open_positions > 0:
-        global_gate_failures.append("open_trade_already")
-    if request.weekly_trade_count >= 4:
-        global_gate_failures.append("weekly_trade_cap_reached")
     if time_day_gate.get("fresh_entry_allowed") is False:
         global_gate_failures.append("time_day_gate")
 
@@ -3268,18 +3383,18 @@ def _build_checklist_block(
             effective_failed_items.insert(0, item)
 
     priority_order = [
-        "open_trade_already",
-        "weekly_trade_cap_reached",
         "time_day_gate",
         "allowed_setup_type",
         "twentyfour_hour_supportive",
         "one_hour_clean_around_ema",
         "clear_room",
         "early_enough",
+        "iv_acceptable",
         "clear_trigger",
         "liquidity_ok",
         "invalidation_clear",
         "fits_risk",
+        "open_trade_already",
     ]
     priority_rank = {name: idx for idx, name in enumerate(priority_order)}
     decision_blockers_priority = sorted(failed_items, key=lambda item: (priority_rank.get(item, 999), item))
@@ -3307,6 +3422,7 @@ def _failed_reason_messages(
     structure_context: Dict[str, Any],
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    iv_context: Dict[str, Any],
 ) -> List[str]:
     reasons: List[str] = []
 
@@ -3315,16 +3431,19 @@ def _failed_reason_messages(
         "twentyfour_hour_supportive": "24H context is not supportive",
         "one_hour_clean_around_ema": "1H structure around the 50 EMA is not clean",
         "clear_room": "room to the first wall fails",
-        "early_enough": "entry is too late or overextended for SAFE-FAST",
+        "early_enough": "entry is outside the time/day window",
+        "iv_acceptable": "IV is too high for a SAFE-FAST debit spread without explicit acceptance",
         "clear_trigger": "no valid live trigger is present",
         "liquidity_ok": "options liquidity is too wide for a clean debit spread entry",
         "invalidation_clear": "invalidation is not clear",
         "fits_risk": "risk does not fit the SAFE-FAST budget",
         "open_trade_already": "an open trade already exists",
-        "weekly_trade_cap_reached": "weekly trade count is already at or above the SAFE-FAST max",
     }
 
     for item in checklist.get("failed_items", []):
+        if item == "iv_acceptable" and iv_context.get("why"):
+            reasons.append(iv_context.get("why"))
+            continue
         msg = mapping.get(item)
         if msg:
             reasons.append(msg)
@@ -3420,7 +3539,6 @@ def _should_freeze_winner_to_raw_engine(
     if global_gate_reason in {
         "market_closed",
         "past_monday_thursday_cutoff",
-        "past_friday_cutoff",
         "outside_time_window",
         "outside_day_window",
     }:
@@ -3436,88 +3554,6 @@ def _should_freeze_winner_to_raw_engine(
     return False
 
 
-
-
-def _candidate_materially_improves_over_raw(
-    raw_item: Optional[Dict[str, Any]],
-    challenger: Optional[Dict[str, Any]],
-) -> bool:
-    if not raw_item or not challenger:
-        return False
-
-    raw_final = raw_item.get("final_verdict")
-    challenger_final = challenger.get("final_verdict")
-
-    if raw_final != challenger_final:
-        verdict_rank = {"PENDING": 0, "NO_TRADE": 1}
-        return verdict_rank.get(challenger_final, 99) < verdict_rank.get(raw_final, 99)
-
-    raw_primary = raw_item.get("primary_candidate")
-    challenger_primary = challenger.get("primary_candidate")
-    if not raw_primary and challenger_primary:
-        return True
-    if raw_primary and not challenger_primary:
-        return False
-
-    raw_checklist = raw_item.get("checklist") or {}
-    challenger_checklist = challenger.get("checklist") or {}
-
-    raw_failed_list = list(raw_checklist.get("effective_failed_items") or raw_checklist.get("failed_items") or [])
-    challenger_failed_list = list(challenger_checklist.get("effective_failed_items") or challenger_checklist.get("failed_items") or [])
-
-    priority_order = {
-        "allowed_setup_type": 0,
-        "twentyfour_hour_supportive": 1,
-        "one_hour_clean_around_ema": 2,
-        "clear_room": 3,
-        "early_enough": 4,
-        "clear_trigger": 5,
-        "liquidity_ok": 6,
-        "invalidation_clear": 7,
-        "fits_risk": 8,
-        "open_trade_already": 9,
-    }
-
-    def _normalize_failed(items: List[str]) -> List[str]:
-        seen = set()
-        ordered: List[str] = []
-        for item in items:
-            if item in seen:
-                continue
-            seen.add(item)
-            ordered.append(item)
-        ordered.sort(key=lambda item: (priority_order.get(item, 999), item))
-        return ordered
-
-    raw_failed = _normalize_failed(raw_failed_list)
-    challenger_failed = _normalize_failed(challenger_failed_list)
-
-    if "allowed_setup_type" in raw_failed and "allowed_setup_type" not in challenger_failed:
-        return True
-
-    raw_structure = raw_item.get("structure_context") or {}
-    challenger_structure = challenger.get("structure_context") or {}
-    if raw_structure.get("allowed_setup") is False and challenger_structure.get("allowed_setup") is True:
-        return True
-
-    raw_primary_blocker = raw_failed[0] if raw_failed else None
-    challenger_primary_blocker = challenger_failed[0] if challenger_failed else None
-
-    if raw_primary_blocker and challenger_primary_blocker:
-        raw_rank = priority_order.get(raw_primary_blocker, 999)
-        challenger_rank = priority_order.get(challenger_primary_blocker, 999)
-        if challenger_rank < raw_rank:
-            return True
-
-    if len(challenger_failed) < len(raw_failed):
-        return True
-
-    if raw_primary_blocker and challenger_primary_blocker and raw_primary_blocker == challenger_primary_blocker:
-        if len(challenger_failed) < len(raw_failed):
-            return True
-
-    return False
-
 def _select_screened_best_candidate(
     screened_candidates: List[Dict[str, Any]],
     *,
@@ -3527,26 +3563,10 @@ def _select_screened_best_candidate(
     if not screened_candidates:
         return None
 
-    if raw_engine_best_ticker is None and not any(item.get("primary_candidate") for item in screened_candidates):
-        return None
-
-    raw_item = None
-    if raw_engine_best_ticker:
+    if freeze_to_raw_engine and raw_engine_best_ticker:
         for item in screened_candidates:
             if item.get("symbol") == raw_engine_best_ticker:
-                raw_item = item
-                break
-
-    if freeze_to_raw_engine and raw_item:
-        return raw_item
-
-    if raw_item:
-        best_challenger = screened_candidates[0]
-        if best_challenger.get("symbol") == raw_engine_best_ticker:
-            return raw_item
-        if _candidate_materially_improves_over_raw(raw_item, best_challenger):
-            return best_challenger
-        return raw_item
+                return item
 
     with_primary = [item for item in screened_candidates if item.get("primary_candidate")]
     if with_primary:
@@ -3611,88 +3631,33 @@ def _build_candidate_engine_normalized_block(
 ) -> Dict[str, Any]:
     normalized_reason = selected.get("reason", summary_payload.get("reason")) if selected else summary_payload.get("reason")
     selected_summary = selected.get("summary") if selected else None
-    raw_best_ticker = summary_payload.get("best_ticker")
-    no_candidate_branch = bool(
-        raw_best_ticker is None
-        and not (selected and selected.get("primary_candidate"))
-    )
 
     return {
         "ok": summary_payload.get("ok", True),
-        "raw_best_ticker": raw_best_ticker,
+        "raw_best_ticker": summary_payload.get("best_ticker"),
         "raw_verdict": summary_payload.get("verdict"),
         "raw_reason": summary_payload.get("reason"),
-        "normalized_best_ticker": None if no_candidate_branch else best_ticker,
+        "normalized_best_ticker": best_ticker,
         "normalized_verdict": engine_status,
         "normalized_final_verdict": final_verdict,
-        "normalized_reason": "No candidate available." if no_candidate_branch else normalized_reason,
+        "normalized_reason": normalized_reason,
         "selection_mode": (
-            "none"
-            if no_candidate_branch else (
-                selected_summary.get("selection_mode")
-                if selected_summary else summary_payload.get("selection_mode")
-            )
+            selected_summary.get("selection_mode")
+            if selected_summary else summary_payload.get("selection_mode")
         ),
     }
 
 
 
 
-def _is_no_candidate_reason(reason: Any) -> bool:
-    reason_text = str(reason or "").strip().lower()
-    if not reason_text:
-        return False
-    return (
-        reason_text in {"no candidate available.", "no candidate available"}
-        or "no feasible liquid candidates found" in reason_text
-    )
-
-
 def _resolve_global_gate_primary_blocker(
     screened_reason: Optional[str] = None,
     time_gate_reason: Optional[str] = None,
 ) -> Optional[str]:
-    if _is_no_candidate_reason(screened_reason):
-        return "no_candidate_available"
     gate_reason = time_gate_reason or screened_reason
-    if gate_reason in {"market_closed", "past_monday_thursday_cutoff", "past_friday_cutoff", "outside_time_window", "outside_day_window"}:
+    if gate_reason in {"market_closed", "past_monday_thursday_cutoff"}:
         return "time_day_gate"
     return None
-
-
-
-def _has_open_trade_already_blocker(checklist_block: Dict[str, Any]) -> bool:
-    for row in checklist_block.get("items", []):
-        if row.get("item") == "open_trade_already":
-            return bool(row.get("yes") is True)
-    return False
-
-
-def _has_weekly_trade_cap_reached_blocker(checklist_block: Dict[str, Any]) -> bool:
-    for row in checklist_block.get("items", []):
-        if row.get("item") == "weekly_trade_cap_reached":
-            return bool(row.get("yes") is True)
-    return False
-
-
-def _derive_account_gate_primary_blocker(checklist_block: Dict[str, Any]) -> Optional[str]:
-    if _has_open_trade_already_blocker(checklist_block):
-        return "open_trade_already"
-    if _has_weekly_trade_cap_reached_blocker(checklist_block):
-        return "weekly_trade_cap_reached"
-    return None
-
-
-def _prepend_account_gate_primary_blocker(
-    blockers: List[str],
-    checklist_block: Dict[str, Any],
-) -> List[str]:
-    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
-    if account_gate_primary_blocker:
-        return [account_gate_primary_blocker] + [
-            item for item in blockers if item != account_gate_primary_blocker
-        ]
-    return blockers
 
 
 def _effective_blockers(
@@ -3705,20 +3670,8 @@ def _effective_blockers(
         screened_reason=screened_reason,
         time_gate_reason=time_gate_reason,
     )
-
-    # Structural-first parity:
-    # - no_candidate_available should lead when there is no candidate
-    # - account gates should still lead when present
-    # - time_day_gate should remain visible, but should not displace a structural blocker
-    if gate_blocker == "no_candidate_available":
+    if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
-    elif gate_blocker == "time_day_gate":
-        if gate_blocker in blockers:
-            blockers = [item for item in blockers if item != gate_blocker] + [gate_blocker]
-        else:
-            blockers = blockers + [gate_blocker]
-
-    blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
     return blockers
 
 
@@ -3756,35 +3709,6 @@ def _build_decision_context_block(
         checklist_block,
         screened_reason=normalized_reason,
     )
-    no_candidate_primary_blocker = "no_candidate_available" if _is_no_candidate_reason(normalized_reason) else None
-    if no_candidate_primary_blocker:
-        effective_blockers = [no_candidate_primary_blocker] + [
-            item for item in effective_blockers if item != no_candidate_primary_blocker
-        ]
-        effective_primary_blocker = no_candidate_primary_blocker
-    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
-    if account_gate_primary_blocker:
-        effective_blockers = [account_gate_primary_blocker] + [
-            item for item in effective_blockers if item != account_gate_primary_blocker
-        ]
-        effective_primary_blocker = account_gate_primary_blocker
-
-    selected_structure_context = selected.get("structure_context") or {} if selected else {}
-    selected_trigger_state = selected.get("trigger_state") or {} if selected else {}
-    screened_route_next_flip = _derive_route_next_flip(
-        structure_context=selected_structure_context,
-        trigger_state=selected_trigger_state,
-        fallback=_derive_global_gate_next_flip(
-            selected_trigger_state.get("gate_reason") or selected_trigger_state.get("why")
-        ),
-    )
-    screened_route_blocker = _map_route_flip_to_blocker_name(screened_route_next_flip)
-
-    if screened_route_blocker and not account_gate_primary_blocker and not no_candidate_primary_blocker:
-        effective_blockers = [screened_route_blocker] + [
-            item for item in effective_blockers if item != screened_route_blocker
-        ]
-        effective_primary_blocker = effective_blockers[0] if effective_blockers else screened_route_blocker
 
     return {
         "ok": True,
@@ -3828,55 +3752,19 @@ def _build_blocker_context_block(
     final_verdict: str,
     user_facing: Dict[str, Any],
 ) -> Dict[str, Any]:
-    gate_reason = trigger_state.get("gate_reason") or trigger_state.get("why")
     blocker_items = _effective_blockers(
         checklist_block,
-        screened_reason=gate_reason,
-        time_gate_reason=trigger_state.get("gate_reason"),
+        screened_reason=trigger_state.get("why"),
     )
     primary_blocker = _effective_primary_blocker(
         checklist_block,
-        screened_reason=gate_reason,
-        time_gate_reason=trigger_state.get("gate_reason"),
-    )
-    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
-    if account_gate_primary_blocker:
-        blocker_items = [account_gate_primary_blocker] + [
-            item for item in blocker_items if item != account_gate_primary_blocker
-        ]
-        primary_blocker = account_gate_primary_blocker
-
-    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(user_facing.get("why"))
-    if no_candidate_primary_blocker:
-        blocker_items = [no_candidate_primary_blocker] + [
-            item for item in blocker_items if item != no_candidate_primary_blocker
-        ]
-        primary_blocker = no_candidate_primary_blocker
-
-    blocker_route_next_flip = _derive_route_next_flip(
-        structure_context=structure_context,
-        trigger_state=trigger_state,
-        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")),
-    )
-    blocker_route_primary_blocker = _map_route_flip_to_blocker_name(blocker_route_next_flip)
-    blocker_context_blockers = list(blocker_items)
-    if (
-        blocker_route_primary_blocker
-        and blocker_route_primary_blocker in blocker_context_blockers
-        and not account_gate_primary_blocker
-        and not no_candidate_primary_blocker
-    ):
-        blocker_context_blockers = [blocker_route_primary_blocker] + [
-            item for item in blocker_context_blockers if item != blocker_route_primary_blocker
-        ]
-    blocker_context_primary_blocker = (
-        blocker_context_blockers[0] if blocker_context_blockers else primary_blocker
+        screened_reason=trigger_state.get("why"),
     )
 
     return {
         "ok": True,
-        "primary_blocker": blocker_context_primary_blocker,
-        "blockers": blocker_context_blockers,
+        "primary_blocker": primary_blocker,
+        "blockers": blocker_items,
         "failed_reasons": failed_reasons,
         "trigger_present": trigger_state.get("trigger_present"),
         "trigger_reason": trigger_state.get("why"),
@@ -3925,7 +3813,9 @@ def _build_trigger_context_block(
 
 
 def _derive_global_gate_primary_blocker(trigger_reason: Any) -> Optional[str]:
-    if trigger_reason in {"market_closed", "past_monday_thursday_cutoff", "past_friday_cutoff", "outside_time_window", "outside_day_window"}:
+    if trigger_reason == "market_closed":
+        return "time_day_gate"
+    if trigger_reason == "past_monday_thursday_cutoff":
         return "time_day_gate"
     return None
 
@@ -3933,44 +3823,10 @@ def _derive_global_gate_primary_blocker(trigger_reason: Any) -> Optional[str]:
 def _derive_global_gate_next_flip(trigger_reason: Any) -> Optional[str]:
     if trigger_reason == "market_closed":
         return "market_open"
-    if trigger_reason in {"past_monday_thursday_cutoff", "past_friday_cutoff", "outside_time_window", "outside_day_window"}:
+    if trigger_reason == "past_monday_thursday_cutoff":
         return "fresh_entry_allowed"
     return None
 
-
-def _derive_route_next_flip(
-    structure_context: Dict[str, Any],
-    trigger_state: Dict[str, Any],
-    fallback: Optional[str],
-) -> Optional[str]:
-    setup_type = structure_context.get("setup_type")
-    if not _is_allowed_setup_type_name(setup_type):
-        return "allowed_setup_type"
-    if structure_context.get("room_pass") is not True:
-        return "room_pass"
-    if structure_context.get("extension_blocks_now") is True:
-        return "extension_clear"
-    if trigger_state.get("structure_ready") is not True:
-        return "structure_ready"
-    if trigger_state.get("trigger_present") is not True:
-        return "trigger_present"
-    return fallback
-
-
-
-
-def _map_route_flip_to_blocker_name(route_flip: Optional[str]) -> Optional[str]:
-    mapping = {
-        "allowed_setup_type": "allowed_setup_type",
-        "room_pass": "clear_room",
-        "extension_clear": "early_enough",
-        "structure_ready": "clear_trigger",
-        "trigger_present": "clear_trigger",
-        "fresh_entry_allowed": "time_day_gate",
-        "market_open": "time_day_gate",
-        "time_day_gate": "time_day_gate",
-    }
-    return mapping.get(route_flip, route_flip)
 
 def _build_entry_context_block(
     trigger_state: Dict[str, Any],
@@ -3983,29 +3839,10 @@ def _build_entry_context_block(
     current_bar = trigger_scan.get("current_bar") or {}
     completed_candle = trigger_scan.get("most_recent_completed_candle") or {}
     blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
-    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
-    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(user_facing.get("why"))
-    if no_candidate_primary_blocker:
-        blockers = [no_candidate_primary_blocker] + [item for item in blockers if item != no_candidate_primary_blocker]
-    blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
-    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
     primary_blocker = blockers[0] if blockers else None
-    next_flip_needed = _derive_route_next_flip(
-        structure_context=structure_context,
-        trigger_state=trigger_state,
-        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker,
-    )
-    if account_gate_primary_blocker:
-        next_flip_needed = account_gate_primary_blocker
-    elif no_candidate_primary_blocker:
-        next_flip_needed = no_candidate_primary_blocker
-        primary_blocker = no_candidate_primary_blocker
-        blockers = [no_candidate_primary_blocker] + [item for item in blockers if item != no_candidate_primary_blocker]
-    elif next_flip_needed:
-        primary_blocker = next_flip_needed
-        blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
 
     current_bar_raw_trigger_pass = bool(current_bar.get("raw_chart_trigger_pass") is True)
     current_bar_gated_trigger_pass = bool(current_bar.get("gated_trigger_pass") is True)
@@ -4031,13 +3868,11 @@ def _build_entry_context_block(
         "mid_candle_trade_available_now": current_bar_gated_trigger_pass,
         "mid_candle_entry_state": mid_candle_entry_state,
         "mid_candle_raw_trigger_detected_now": current_bar_raw_trigger_pass,
-        "mid_candle_block_reason": None if current_bar_gated_trigger_pass else current_bar.get("why"),
-        "mid_candle_gate_reason": None if current_bar_gated_trigger_pass else current_bar.get("gate_reason"),
+        "mid_candle_block_reason": None if current_bar_gated_trigger_pass else trigger_state.get("why"),
         "completed_candle_trade_available": completed_candle_gated_trigger_pass,
         "completed_candle_entry_state": completed_candle_entry_state,
         "completed_candle_raw_trigger_detected": completed_candle_raw_trigger_pass,
         "completed_candle_block_reason": None if completed_candle_gated_trigger_pass else completed_candle.get("why"),
-        "completed_candle_gate_reason": None if completed_candle_gated_trigger_pass else completed_candle.get("gate_reason"),
         "trigger_present": trigger_state.get("trigger_present"),
         "trigger_reason": trigger_state.get("why"),
         "structure_ready": trigger_state.get("structure_ready"),
@@ -4104,7 +3939,6 @@ def _build_intrabar_signal_context_block(
         "intrabar_trade_available_now": intrabar_trade_available_now,
         "intrabar_raw_signal_detected": intrabar_raw_signal_detected,
         "intrabar_block_reason": entry_context.get("mid_candle_block_reason"),
-        "intrabar_gate_reason": entry_context.get("mid_candle_gate_reason"),
         "intrabar_time_iso": current_bar.get("time_iso"),
         "intrabar_close": current_bar.get("close"),
         "intrabar_trigger_level_relation": current_bar.get("relation_to_trigger_level"),
@@ -4113,7 +3947,6 @@ def _build_intrabar_signal_context_block(
         "completed_trade_available": completed_trade_available,
         "completed_raw_signal_detected": completed_raw_signal_detected,
         "completed_block_reason": entry_context.get("completed_candle_block_reason"),
-        "completed_gate_reason": entry_context.get("completed_candle_gate_reason"),
         "completed_time_iso": completed_candle.get("time_iso"),
         "completed_close": completed_candle.get("close"),
         "primary_blocker": entry_context.get("primary_blocker"),
@@ -4138,28 +3971,11 @@ def _build_approval_context_block(
     user_facing: Dict[str, Any],
 ) -> Dict[str, Any]:
     blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
-    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
-    blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
-    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
-    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(user_facing.get("why"))
-    if no_candidate_primary_blocker:
-        blockers = [no_candidate_primary_blocker] + [item for item in blockers if item != no_candidate_primary_blocker]
     primary_blocker = blockers[0] if blockers else None
-    if account_gate_primary_blocker:
-        next_flip_needed = account_gate_primary_blocker
-    elif no_candidate_primary_blocker:
-        next_flip_needed = no_candidate_primary_blocker
-    else:
-        next_flip_needed = _derive_route_next_flip(
-            structure_context=structure_context,
-            trigger_state=trigger_state,
-            fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or primary_blocker,
-        )
-    if next_flip_needed and not account_gate_primary_blocker:
-        primary_blocker = next_flip_needed
-        blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
+    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("why")) or primary_blocker
     intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
     intrabar_trade_available_now = bool(entry_context.get("mid_candle_trade_available_now") is True)
     completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
@@ -4221,15 +4037,14 @@ def _build_approval_requirements_context_block(
     time_day_gate: Dict[str, Any],
     macro_context: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
     approval_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     checklist_items = {row.get("item"): bool(row.get("yes")) for row in checklist_block.get("items", [])}
     blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
-    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("gate_reason") or trigger_state.get("why"))
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
     if gate_blocker:
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
-    blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
-    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
 
     gate_statuses = [
         {
@@ -4255,6 +4070,12 @@ def _build_approval_requirements_context_block(
             "ready": bool(trigger_state.get("structure_ready") is True),
             "current_value": trigger_state.get("structure_ready"),
             "needed_state": True,
+        },
+        {
+            "gate": "iv_acceptable",
+            "ready": iv_context.get("status") != "high",
+            "current_value": iv_context.get("status"),
+            "needed_state": "acceptable or unconfirmed",
         },
         {
             "gate": "trigger_present",
@@ -4298,20 +4119,7 @@ def _build_approval_requirements_context_block(
     ]
 
     missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
-    no_candidate_primary_blocker = approval_context.get("primary_blocker") if approval_context.get("primary_blocker") == "no_candidate_available" else None
-    if no_candidate_primary_blocker:
-        blockers = [no_candidate_primary_blocker] + [item for item in blockers if item != no_candidate_primary_blocker]
-    next_flip_needed = (
-        account_gate_primary_blocker
-        or no_candidate_primary_blocker
-        or _derive_route_next_flip(
-            structure_context=structure_context,
-            trigger_state=trigger_state,
-            fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None)),
-        )
-    )
-    if next_flip_needed and next_flip_needed != "open_trade_already":
-        blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
+    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None))
 
     if approval_context.get("approval_ready_now") is True:
         approval_path_status = "APPROVED_NOW"
@@ -4332,7 +4140,7 @@ def _build_approval_requirements_context_block(
         "next_flip_needed": next_flip_needed,
         "missing_gates": missing_gates,
         "gate_statuses": gate_statuses,
-        "checklist_failed_items": blockers,
+        "checklist_failed_items": checklist_block.get("effective_failed_items", checklist_block.get("failed_items", [])),
         "raw_checklist_failed_items": checklist_block.get("failed_items", []),
         "global_gate_failures": checklist_block.get("global_gate_failures", []),
         "blockers": blockers,
@@ -4359,21 +4167,6 @@ def _build_screened_best_context(
     screened_candidates: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     if not selected:
-        if engine_best_ticker is None and screened_candidates and not any(item.get("primary_candidate") for item in screened_candidates):
-            return {
-                "ok": True,
-                "screened_best_ticker": None,
-                "raw_engine_best_ticker": None,
-                "normalized_engine_best_ticker": None,
-                "engine_best_ticker": None,
-                "changed_from_engine_best": False,
-                "screened_final_verdict": "NO_TRADE",
-                "screened_reason": "No candidate available.",
-                "screened_primary_blocker": "no_candidate_available",
-                "screened_checklist_failed_items": ["no_candidate_available"],
-                "engine_best_final_verdict_after_screen": None,
-                "engine_best_reason_after_screen": None,
-            }
         return {"ok": False, "why": "no screened candidates"}
 
     engine_pick = next(
@@ -4383,10 +4176,6 @@ def _build_screened_best_context(
 
     selected_checklist = selected.get("checklist") or {}
     selected_reason = selected.get("reason")
-    no_candidate_primary_blocker = "no_candidate_available" if _is_no_candidate_reason(selected_reason) else None
-    selected_structure_context = selected.get("structure_context") or {}
-    selected_trigger_state = selected.get("trigger_state") or {}
-
     effective_failed_items = _effective_blockers(
         selected_checklist,
         screened_reason=selected_reason,
@@ -4394,54 +4183,21 @@ def _build_screened_best_context(
     effective_primary_blocker = (
         effective_failed_items[0] if effective_failed_items else None
     )
-    account_gate_primary_blocker = _derive_account_gate_primary_blocker(selected_checklist)
-    if account_gate_primary_blocker:
-        effective_failed_items = [account_gate_primary_blocker] + [
-            item for item in effective_failed_items if item != account_gate_primary_blocker
-        ]
-        effective_primary_blocker = account_gate_primary_blocker
-
-    screened_route_next_flip = _derive_route_next_flip(
-        structure_context=selected_structure_context,
-        trigger_state=selected_trigger_state,
-        fallback=_derive_global_gate_next_flip(
-            selected_trigger_state.get("gate_reason") or selected_trigger_state.get("why")
-        ),
-    )
-    screened_route_primary_blocker = _map_route_flip_to_blocker_name(screened_route_next_flip)
-    screened_blockers = list(effective_failed_items)
-    if (
-        screened_route_primary_blocker
-        and screened_route_primary_blocker in screened_blockers
-        and not account_gate_primary_blocker
-    ):
-        screened_blockers = [screened_route_primary_blocker] + [
-            item for item in screened_blockers if item != screened_route_primary_blocker
-        ]
-    screened_primary_blocker = (
-        screened_blockers[0] if screened_blockers else effective_primary_blocker
-    )
-    if no_candidate_primary_blocker:
-        screened_blockers = [no_candidate_primary_blocker] + [
-            item for item in screened_blockers if item != no_candidate_primary_blocker
-        ]
-        screened_primary_blocker = no_candidate_primary_blocker
-
     engine_pick_reason = engine_pick.get("reason") if engine_pick else None
     engine_pick_verdict = engine_pick.get("final_verdict") if engine_pick else None
 
-    normalized_engine_best_ticker = None if no_candidate_primary_blocker == "no_candidate_available" else selected.get("symbol")
+    normalized_engine_best_ticker = selected.get("symbol")
     return {
         "ok": True,
-        "screened_best_ticker": normalized_engine_best_ticker,
+        "screened_best_ticker": selected.get("symbol"),
         "raw_engine_best_ticker": engine_best_ticker,
         "normalized_engine_best_ticker": normalized_engine_best_ticker,
         "engine_best_ticker": normalized_engine_best_ticker,
-        "changed_from_engine_best": normalized_engine_best_ticker != engine_best_ticker,
+        "changed_from_engine_best": selected.get("symbol") != engine_best_ticker,
         "screened_final_verdict": selected.get("final_verdict"),
         "screened_reason": selected_reason,
-        "screened_primary_blocker": screened_primary_blocker,
-        "screened_checklist_failed_items": screened_blockers,
+        "screened_primary_blocker": effective_primary_blocker,
+        "screened_checklist_failed_items": effective_failed_items,
         "engine_best_final_verdict_after_screen": engine_pick_verdict,
         "engine_best_reason_after_screen": engine_pick_reason,
     }
@@ -4476,6 +4232,8 @@ async def _screen_ticker_candidate(
     ) if symbol else {"ok": False, "why": "no symbol"}
 
     liquidity_context = _build_liquidity_block(primary_candidate)
+    iv_context = _build_iv_context(summary, primary_candidate)
+    structure_context = {**structure_context, "iv_state": iv_context.get("status")}
     trigger_state = _build_trigger_state(
         option_type=option_type,
         market_context=market_context,
@@ -4494,6 +4252,7 @@ async def _screen_ticker_candidate(
         structure_context=structure_context,
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
+        iv_context=iv_context,
     )
 
     checklist = _build_checklist_block(
@@ -4505,14 +4264,17 @@ async def _screen_ticker_candidate(
         primary_candidate=primary_candidate,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        iv_context=iv_context,
     )
 
     reason = summary.get("reason", "No summary available.")
     failed_items = checklist.get("failed_items", [])
     if "liquidity_ok" in failed_items:
         reason = liquidity_context.get("why") or "Options liquidity is too wide for a clean debit spread entry."
+    elif "iv_acceptable" in failed_items:
+        reason = iv_context.get("why") or "IV is too high for SAFE-FAST."
     elif "clear_trigger" in failed_items:
-        reason = trigger_state.get("gate_reason") or trigger_state.get("why") or "No valid live trigger is present."
+        reason = trigger_state.get("why") or "No valid live trigger is present."
     elif structure_context.get("ok"):
         if structure_context.get("room_pass") is False:
             reason = "Room to first wall is too tight for SAFE-FAST."
@@ -4537,6 +4299,7 @@ async def _screen_ticker_candidate(
         "chart_check_error": chart_check_error,
         "structure_context": structure_context,
         "liquidity_context": liquidity_context,
+        "iv_context": iv_context,
         "trigger_state": trigger_state,
         "checklist": checklist,
     }
@@ -4684,38 +4447,13 @@ def _build_candidate_context(
         screened_reason=gate_reason,
         time_gate_reason=time_day_gate.get("reason"),
     )
-    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist)
-    if account_gate_primary_blocker:
-        effective_blockers = [account_gate_primary_blocker] + [
-            item for item in effective_blockers if item != account_gate_primary_blocker
-        ]
-        effective_primary_blocker = account_gate_primary_blocker
-
-    candidate_route_next_flip = _derive_route_next_flip(
-        structure_context=structure_context,
-        trigger_state=trigger_state,
-        fallback=_derive_global_gate_next_flip(trigger_state.get("gate_reason") or trigger_state.get("why")),
-    )
-    candidate_route_primary_blocker = _map_route_flip_to_blocker_name(candidate_route_next_flip)
-    candidate_context_blockers = list(effective_blockers)
-    if (
-        candidate_route_primary_blocker
-        and candidate_route_primary_blocker in candidate_context_blockers
-        and not account_gate_primary_blocker
-    ):
-        candidate_context_blockers = [candidate_route_primary_blocker] + [
-            item for item in candidate_context_blockers if item != candidate_route_primary_blocker
-        ]
-    candidate_context_primary_blocker = (
-        candidate_context_blockers[0] if candidate_context_blockers else effective_primary_blocker
-    )
 
     return {
         "active": active,
         "ticker": best_ticker,
         "availability_reason": availability_reason,
-        "primary_blocker": candidate_context_primary_blocker if active else None,
-        "blockers": candidate_context_blockers if active else [],
+        "primary_blocker": effective_primary_blocker if active else None,
+        "blockers": effective_blockers if active else [],
         "good_idea_now": user_facing.get("good_idea_now") if active else "NO",
         "action": user_facing.get("action") if active else "stand down",
         "setup_state": user_facing.get("setup_state") if active else "NO TRADE",
@@ -4743,8 +4481,8 @@ def _build_candidate_context(
         "primary_candidate": primary_candidate if active else None,
         "backup_candidate": backup_candidate if active else None,
         "invalidation": invalidation_level_1h_ema50 if active else None,
-        "checklist_failed_items": candidate_context_blockers if active else [],
-        "decision_blockers_priority": candidate_context_blockers if active else [],
+        "checklist_failed_items": effective_blockers if active else [],
+        "decision_blockers_priority": effective_blockers if active else [],
         "execution": {
             "ideal_path": two_path.get("ideal_path"),
             "acceptable_path": two_path.get("acceptable_path"),
@@ -4779,6 +4517,13 @@ def _build_two_path_block(
             "invalidation_1h_ema50": ema,
         }
 
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return {
+            "ideal_path": "Wait for a valid SAFE-FAST entry window before considering a new trade.",
+            "acceptable_path": "Stand down until the time/day gate reopens.",
+            "invalidation_1h_ema50": ema,
+        }
+
     failed_items = set(checklist.get("failed_items", []))
     if failed_items:
         labels = []
@@ -4787,7 +4532,7 @@ def _build_two_path_block(
             "twentyfour_hour_supportive": "24H support",
             "one_hour_clean_around_ema": "clean 1H structure",
             "clear_room": "room pass",
-            "early_enough": "early enough / not overextended",
+            "early_enough": "time window pass",
             "clear_trigger": "live trigger",
             "liquidity_ok": "liquidity pass",
             "invalidation_clear": "clear invalidation",
@@ -4808,23 +4553,9 @@ def _build_two_path_block(
             if key in failed_items:
                 labels.append(label_map[key])
 
-        ideal_path = "Need " + ", ".join(labels) + " before entry." if labels else "Need full gate pass before entry."
-        acceptable_path = "Stand down until all failed gates pass."
-
-        if not time_day_gate.get("fresh_entry_allowed"):
-            ideal_path = ideal_path + " Time/day gate is also closed."
-            acceptable_path = "Stand down until all failed gates pass; the time/day gate reopening alone is not enough."
-
         return {
-            "ideal_path": ideal_path,
-            "acceptable_path": acceptable_path,
-            "invalidation_1h_ema50": ema,
-        }
-
-    if not time_day_gate.get("fresh_entry_allowed"):
-        return {
-            "ideal_path": "Wait for a valid SAFE-FAST entry window before considering a new trade.",
-            "acceptable_path": "Stand down until the time/day gate reopens.",
+            "ideal_path": "Need " + ", ".join(labels) + " before entry." if labels else "Need full gate pass before entry.",
+            "acceptable_path": "Stand down until all failed gates pass.",
             "invalidation_1h_ema50": ema,
         }
 
@@ -4892,15 +4623,9 @@ def _build_ten_second_checklist(
     ]
     failed_items = checklist_block.get("failed_items", [])
     effective_failed_items = checklist_block.get("effective_failed_items", failed_items)
-    if request.open_positions > 0 and "open_trade_already" not in effective_failed_items:
-        effective_failed_items = ["open_trade_already"] + list(effective_failed_items)
-    if request.weekly_trade_count >= 4 and "weekly_trade_cap_reached" not in effective_failed_items:
-        effective_failed_items = list(effective_failed_items)
-        insert_at = 1 if effective_failed_items and effective_failed_items[0] == "open_trade_already" else 0
-        effective_failed_items.insert(insert_at, "weekly_trade_cap_reached")
     global_gate_failures = checklist_block.get(
         "global_gate_failures",
-        [item for item in effective_failed_items if item not in failed_items and item not in {"open_trade_already", "weekly_trade_cap_reached"}],
+        [item for item in effective_failed_items if item not in failed_items],
     )
     return {
         "ok": True,
@@ -4989,43 +4714,14 @@ def _build_setup_eligibility_context_block(
         or checklist_block.get("failed_items")
         or []
     )
-
-    route_next_flip = _derive_route_next_flip(
-        structure_context=structure_context,
-        trigger_state={
-            "structure_ready": structure_context.get("setup_eligible_now"),
-            "trigger_present": live_map.get("trigger_present"),
-        },
-        fallback=approval_requirements_context.get("next_flip_needed") or (blockers[0] if blockers else None),
-    )
-    account_gate_primary_blocker = _derive_account_gate_primary_blocker(checklist_block)
-    no_candidate_primary_blocker = (
-        approval_requirements_context.get("next_flip_needed")
-        if approval_requirements_context.get("next_flip_needed") == "no_candidate_available"
-        else None
-    )
-    if account_gate_primary_blocker:
-        next_flip_needed = account_gate_primary_blocker
-        blockers = [account_gate_primary_blocker] + [
-            item for item in blockers if item != account_gate_primary_blocker
-        ]
-    elif no_candidate_primary_blocker:
-        next_flip_needed = no_candidate_primary_blocker
-        blockers = [no_candidate_primary_blocker] + [
-            item for item in blockers if item != no_candidate_primary_blocker
-        ]
-    else:
-        next_flip_needed = route_next_flip
-        if next_flip_needed:
-            blockers = [next_flip_needed] + [item for item in blockers if item != next_flip_needed]
     primary_blocker = blockers[0] if blockers else None
 
     if not setup_type:
         setup_type_status = "NO_SETUP_TYPE_DETECTED"
-    elif _is_allowed_setup_type_name(setup_type):
-        setup_type_status = "ELIGIBLE_NOW" if setup_eligible_now else "DETECTED_BUT_NOT_ELIGIBLE"
+    elif setup_eligible_now:
+        setup_type_status = "ELIGIBLE_NOW"
     else:
-        setup_type_status = "NOT_ALLOWED"
+        setup_type_status = "DETECTED_BUT_NOT_ELIGIBLE"
 
     return {
         "ok": True,
@@ -5036,13 +4732,12 @@ def _build_setup_eligibility_context_block(
         "ten_second_check_answer": "YES" if allowed_setup_type else "NO",
         "setup_route_status": route.get("setup_route_status"),
         "setup_route_reason": route.get("why_setup_route_passes_or_fails"),
-        "next_flip_needed": next_flip_needed,
+        "next_flip_needed": approval_requirements_context.get("next_flip_needed") or primary_blocker,
         "primary_blocker": primary_blocker,
         "blockers": blockers,
         "approval_path_status": approval_requirements_context.get("approval_path_status"),
         "note": "A setup label can be detected while SAFE-FAST still marks the setup as not eligible."
     }
-
 
 def _build_setup_check_context_block(
 
@@ -5139,19 +4834,11 @@ def _build_final_reason_context_block(
         screened_reason=screened_reason,
         time_gate_reason=time_gate_reason,
     )
-
-    screened_primary_blocker = screened_best_context.get("screened_primary_blocker")
-    if screened_primary_blocker:
-        blockers = [screened_primary_blocker] + [
-            item for item in blockers if item != screened_primary_blocker
-        ]
-        primary_blocker = screened_primary_blocker
-    else:
-        primary_blocker = _effective_primary_blocker(
-            checklist_block,
-            screened_reason=screened_reason,
-            time_gate_reason=time_gate_reason,
-        )
+    primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
 
     return {
         "ok": True,
@@ -5164,8 +4851,8 @@ def _build_final_reason_context_block(
         "primary_blocker": primary_blocker,
         "blockers": blockers,
         "note": (
-            "The top-line NO_TRADE reason may still be the time/day gate, "
-            "while primary_blocker leads with the structural blocker when one already exists."
+            "The final NO_TRADE reason can come from the time/day gate, "
+            "structural blockers, or both."
         ),
     }
 
@@ -5178,12 +4865,12 @@ def _build_reason_stack_context_block(
 ) -> Dict[str, Any]:
     screened_reason = final_reason_context.get("screened_reason")
     time_gate_reason = final_reason_context.get("time_gate_reason")
-    blockers = list(final_reason_context.get("blockers") or _effective_blockers(
+    blockers = _effective_blockers(
         checklist_block,
         screened_reason=screened_reason,
         time_gate_reason=time_gate_reason,
-    ))
-    primary_blocker = final_reason_context.get("primary_blocker") or _effective_primary_blocker(
+    )
+    primary_blocker = _effective_primary_blocker(
         checklist_block,
         screened_reason=screened_reason,
         time_gate_reason=time_gate_reason,
@@ -5217,29 +4904,16 @@ def _build_winner_shift_context_block(
     screened_live_winner_final_verdict: Optional[str],
     screened_reason: Optional[str],
 ) -> Dict[str, Any]:
-    raw_to_normalized_ticker_changed = raw_engine_winner_ticker != normalized_engine_winner_ticker
-    raw_to_normalized_status_changed = raw_engine_winner_status != normalized_engine_winner_status
-    normalized_to_screened_ticker_changed = normalized_engine_winner_ticker != screened_live_winner_ticker
-    normalized_to_screened_status_changed = normalized_engine_winner_final_verdict != screened_live_winner_final_verdict
-
-    raw_to_normalized_changed = bool(
-        raw_to_normalized_ticker_changed or raw_to_normalized_status_changed
-    )
-    normalized_to_screened_changed = bool(
-        normalized_to_screened_ticker_changed or normalized_to_screened_status_changed
-    )
+    raw_to_normalized_changed = raw_engine_winner_ticker != normalized_engine_winner_ticker
+    normalized_to_screened_changed = normalized_engine_winner_ticker != screened_live_winner_ticker
     any_shift = raw_to_normalized_changed or normalized_to_screened_changed
 
     if raw_to_normalized_changed and normalized_to_screened_changed:
         shift_path = "RAW_TO_NORMALIZED_TO_SCREENED_SHIFT"
-    elif raw_to_normalized_ticker_changed:
-        shift_path = "RAW_TO_NORMALIZED_TICKER_SHIFT"
-    elif raw_to_normalized_status_changed:
-        shift_path = "RAW_TO_NORMALIZED_STATUS_SHIFT"
-    elif normalized_to_screened_ticker_changed:
-        shift_path = "NORMALIZED_TO_SCREENED_TICKER_SHIFT"
-    elif normalized_to_screened_status_changed:
-        shift_path = "NORMALIZED_TO_SCREENED_STATUS_SHIFT"
+    elif raw_to_normalized_changed:
+        shift_path = "RAW_TO_NORMALIZED_SHIFT"
+    elif normalized_to_screened_changed:
+        shift_path = "NORMALIZED_TO_SCREENED_SHIFT"
     else:
         shift_path = "NO_SHIFT"
 
@@ -5253,10 +4927,6 @@ def _build_winner_shift_context_block(
         "normalized_engine_winner_final_verdict": normalized_engine_winner_final_verdict,
         "screened_live_winner_ticker": screened_live_winner_ticker,
         "screened_live_winner_final_verdict": screened_live_winner_final_verdict,
-        "raw_to_normalized_ticker_changed": raw_to_normalized_ticker_changed,
-        "raw_to_normalized_status_changed": raw_to_normalized_status_changed,
-        "normalized_to_screened_ticker_changed": normalized_to_screened_ticker_changed,
-        "normalized_to_screened_status_changed": normalized_to_screened_status_changed,
         "raw_to_normalized_changed": raw_to_normalized_changed,
         "normalized_to_screened_changed": normalized_to_screened_changed,
         "any_shift": any_shift,
@@ -5848,7 +5518,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             allow_fallback=request.allow_fallback,
             token=token,
         )
-        raw_summary_payload = copy.deepcopy(summary_payload)
     except httpx.TimeoutException:
         return _build_on_demand_unavailable_payload(
             request,
@@ -5880,7 +5549,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             status_code=503,
         )
     summary_payload = _normalize_engine_summary_for_session(
-        summary_payload=raw_summary_payload,
+        summary_payload=summary_payload,
         market_context=market_context,
         time_day_gate=time_day_gate,
     )
@@ -5905,29 +5574,27 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
     freeze_to_raw_engine = _should_freeze_winner_to_raw_engine(
-        summary_payload=raw_summary_payload,
+        summary_payload=summary_payload,
         market_context=market_context,
         time_day_gate=time_day_gate,
     )
     selected = _select_screened_best_candidate(
         screened_candidates,
-        raw_engine_best_ticker=raw_summary_payload.get("best_ticker"),
+        raw_engine_best_ticker=summary_payload.get("best_ticker"),
         freeze_to_raw_engine=freeze_to_raw_engine,
     )
 
-    best_ticker = (
-        None
-        if raw_summary_payload.get("best_ticker") is None and not selected
-        else (selected.get("symbol") if selected else raw_summary_payload.get("best_ticker"))
-    )
-    raw_engine_status = raw_summary_payload.get("verdict", "NO_TRADE")
+    best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
+    raw_engine_status = summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
     engine_status = _normalize_top_level_status(final_verdict)
     primary_candidate = selected.get("primary_candidate") if selected else summary_payload.get("primary_candidate")
     chart_check = selected.get("chart_check") if selected else None
     chart_check_error = selected.get("chart_check_error") if selected else None
     structure_context = selected.get("structure_context") if selected else {"ok": False, "why": "no screened candidates"}
+    selected_summary = selected.get("summary") if selected else None
     liquidity_context = selected.get("liquidity_context") if selected else _build_liquidity_block(primary_candidate)
+    iv_context = selected.get("iv_context") if selected else _build_iv_context(selected_summary, primary_candidate)
     trigger_state = selected.get("trigger_state") if selected else _build_trigger_state(
         option_type=clean_option_type,
         market_context=market_context,
@@ -5944,6 +5611,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         primary_candidate=primary_candidate,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        iv_context=iv_context,
     )
     selected_reason = selected.get("reason", summary_payload.get("reason", "No summary available.")) if selected else summary_payload.get("reason", "No summary available.")
 
@@ -5977,6 +5645,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         structure_context=structure_context,
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
+        iv_context=iv_context,
     )
     two_path_block = _build_two_path_block(
         market_context=market_context,
@@ -5986,7 +5655,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         chart_check=chart_check,
     )
     targets_block = _build_targets_block(primary_candidate)
-    iv_context = _build_iv_context()
     python_validation_block = _build_python_validation(
         request=request,
         best_ticker=best_ticker,
@@ -6001,8 +5669,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         iv_context=iv_context,
     )
 
-    raw_engine_winner_ticker = raw_summary_payload.get("best_ticker")
-    raw_engine_winner_status = raw_summary_payload.get("verdict")
+    raw_engine_winner_ticker = summary_payload.get("best_ticker")
+    raw_engine_winner_status = summary_payload.get("verdict")
     normalized_engine_winner_ticker = best_ticker
     normalized_engine_winner_status = engine_status
     normalized_engine_winner_final_verdict = final_verdict
@@ -6019,6 +5687,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         structure_context=structure_context,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        iv_context=iv_context,
     )
 
     live_map_block = _build_live_map_block(
@@ -6077,6 +5746,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         time_day_gate=time_day_gate,
         macro_context=macro_context,
         liquidity_context=liquidity_context,
+        iv_context=iv_context,
         approval_context=approval_context_block,
     )
     approval_flip_context_block = _build_approval_flip_context_block(
@@ -6103,7 +5773,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     )
     screened_best_context_block = _build_screened_best_context(
         selected=selected,
-        engine_best_ticker=raw_summary_payload.get("best_ticker"),
+        engine_best_ticker=summary_payload.get("best_ticker"),
         screened_candidates=screened_candidates,
     )
     final_reason_context_block = _build_final_reason_context_block(
@@ -6133,15 +5803,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         screened_reason=screened_best_context_block.get("screened_reason"),
         time_gate_reason=time_day_gate.get("reason"),
     )
-    screened_primary_blocker = screened_best_context_block.get("screened_primary_blocker")
-    if screened_primary_blocker:
-        effective_payload_checklist_block["effective_failed_items"] = [
-            screened_primary_blocker
-        ] + [
-            item
-            for item in effective_payload_checklist_block["effective_failed_items"]
-            if item != screened_primary_blocker
-        ]
     effective_payload_checklist_block["effective_decision_blockers_priority"] = list(
         effective_payload_checklist_block["effective_failed_items"]
     )
@@ -6150,24 +5811,18 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         for item in effective_payload_checklist_block["effective_failed_items"]
         if item not in (checklist_block.get("failed_items") or [])
     ]
-    ten_second_checklist_block = _build_ten_second_checklist(
-        request=request,
-        checklist_block=effective_payload_checklist_block,
-        structure_context=structure_context,
-        iv_context=iv_context,
-    )
 
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "schema_patch_core_approval_context_next_flip_open_position_parity_2026_04_10",
+        "build_tag": "schema_patch_core_ten_second_effective_gate_2026_04_09",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
         "candidate_engine_status": engine_status,
         "final_verdict": final_verdict,
         "best_ticker": best_ticker,
-        "raw_engine_best_ticker": raw_summary_payload.get("best_ticker"),
+        "raw_engine_best_ticker": raw_engine_winner_ticker,
         "engine_best_ticker": normalized_engine_winner_ticker,
         "winner_context": {
             "raw_engine_winner_ticker": raw_engine_winner_ticker,
@@ -6181,14 +5836,14 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             "why_changed_after_screening": why_changed_after_screening,
         },
         "engine_context": _build_engine_context_block(
-            summary_payload=raw_summary_payload,
+            summary_payload=summary_payload,
             selected=selected,
             engine_status=engine_status,
             final_verdict=final_verdict,
             best_ticker=best_ticker,
         ),
         "decision_context": _build_decision_context_block(
-            summary_payload=raw_summary_payload,
+            summary_payload=summary_payload,
             selected=selected,
             engine_status=engine_status,
             final_verdict=final_verdict,
@@ -6243,9 +5898,9 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "failed_reasons": failed_reasons_block,
         "other_ticker_candidates": _screened_other_candidates(screened_candidates, best_ticker),
         "request": request.model_dump(),
-        "candidate_engine": raw_summary_payload,
+        "candidate_engine": summary_payload,
         "candidate_engine_normalized": _build_candidate_engine_normalized_block(
-            summary_payload=raw_summary_payload,
+            summary_payload=summary_payload,
             selected=selected,
             engine_status=engine_status,
             final_verdict=final_verdict,
