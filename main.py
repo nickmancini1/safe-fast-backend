@@ -6608,6 +6608,7 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     primary_blocker = snapshot.get("primary_blocker")
     next_flip_needed = snapshot.get("next_flip_needed")
     decision_blockers = snapshot.get("decision_blockers") or []
+    failed_reasons = snapshot.get("failed_reasons") or []
     summary = snapshot.get("summary") or {}
     iv_status = snapshot.get("iv_status")
     market_open = snapshot.get("market_open")
@@ -6631,6 +6632,17 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
 
     if iv_status == "high":
         return "BLOCKED_IV_HIGH"
+
+    # Prefer explicit time/day states before the generic no-candidate fallback.
+    if market_open is False and fresh_entry_allowed is False:
+        if time_gate_reason == "market_closed":
+            return "WAIT_MARKET_OPEN"
+        if time_gate_reason:
+            return "BLOCKED_TIME_GATE"
+    if time_gate_reason == "market_closed":
+        return "WAIT_MARKET_OPEN"
+    if time_gate_reason:
+        return "BLOCKED_TIME_GATE"
 
     blocker_state_map = {
         "allowed_setup_type": "BLOCKED_SETUP_TYPE",
@@ -6657,91 +6669,36 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
             return blocker_state_map[blocker]
 
     if primary_blocker == "early_enough" or "early_enough" in decision_blockers:
-        if time_gate_reason == "market_closed":
-            return "WAIT_MARKET_OPEN"
-        if time_gate_reason:
-            return "BLOCKED_TIME_GATE"
         return "BLOCKED_EXTENSION"
 
-    if not market_open and fresh_entry_allowed is False:
-        if time_gate_reason == "market_closed":
-            return "WAIT_MARKET_OPEN"
-        if time_gate_reason:
-            return "BLOCKED_TIME_GATE"
+    failed_reason_state_map = {
+        "market is closed": "WAIT_MARKET_OPEN",
+        "setup type is not allowed": "BLOCKED_SETUP_TYPE",
+        "24H context is not supportive": "BLOCKED_24H_CONTEXT",
+        "1H structure around the 50 EMA is not clean": "BLOCKED_1H_STRUCTURE",
+        "room to the first wall fails": "BLOCKED_ROOM",
+        "entry is too late or overextended for SAFE-FAST": "BLOCKED_EXTENSION",
+        "no valid live trigger is present": "BLOCKED_TRIGGER",
+        "options liquidity is too wide for a clean debit spread entry": "BLOCKED_LIQUIDITY",
+        "invalidation is not clear": "BLOCKED_INVALIDATION",
+        "risk does not fit the SAFE-FAST budget": "BLOCKED_RISK",
+    }
+
+    for failed_reason in failed_reasons:
+        mapped_state = failed_reason_state_map.get(str(failed_reason).strip().lower())
+        if mapped_state:
+            return mapped_state
 
     # Only fall back to the generic no-candidate bucket after explicit
-    # non-account states have had a chance to win.
+    # non-account time/structure states have had a chance to win.
     if primary_blocker == "no_candidate_available":
         return "NO_CANDIDATE"
-    if summary.get("ticker") == "UNKNOWN" and not primary_blocker and not decision_blockers:
+    if summary.get("ticker") == "UNKNOWN" and not primary_blocker and not decision_blockers and not failed_reasons:
         return "NO_CANDIDATE"
 
     if primary_blocker:
         return "BLOCKED_STRUCTURAL"
     return "STALE_OR_UNCONFIRMED"
-
-def _build_continuous_snapshot(
-    *,
-    on_demand_payload: Dict[str, Any],
-    request: OnDemandRequest,
-    profile_name: str,
-    profile_key: str,
-) -> Dict[str, Any]:
-    request_payload = _model_dump(request)
-    simple_output = on_demand_payload.get("simple_output") or {}
-    user_facing = on_demand_payload.get("user_facing") or {}
-    decision_context = on_demand_payload.get("decision_context") or {}
-    approval_context = on_demand_payload.get("approval_context") or {}
-    approval_requirements_context = on_demand_payload.get("approval_requirements_context") or {}
-    trigger_context = on_demand_payload.get("trigger_context") or {}
-    market_context = on_demand_payload.get("market_context") or {}
-    winner_shift_context = on_demand_payload.get("winner_shift_context") or {}
-    iv_context = on_demand_payload.get("iv_context") or {}
-    time_day_gate = on_demand_payload.get("time_day_gate") or {}
-
-    snapshot: Dict[str, Any] = {
-        "timestamp_et": market_context.get("as_of_et") or datetime.now(NY_TZ).isoformat(),
-        "profile_name": profile_name,
-        "profile_key": profile_key,
-        "request_profile": request_payload,
-        "build_tag": on_demand_payload.get("build_tag"),
-        "on_demand_ok": bool(on_demand_payload.get("ok")),
-        "best_ticker": on_demand_payload.get("best_ticker"),
-        "final_verdict": on_demand_payload.get("final_verdict"),
-        "user_facing_why": user_facing.get("why"),
-        "primary_blocker": decision_context.get("primary_blocker"),
-        "decision_blockers": decision_context.get("blockers") or [],
-        "failed_reasons": decision_context.get("failed_reasons") or [],
-        "next_flip_needed": approval_context.get("next_flip_needed")
-        or approval_requirements_context.get("next_flip_needed"),
-        "trigger_present": trigger_context.get("trigger_present"),
-        "trigger_reason": trigger_context.get("trigger_reason"),
-        "structure_ready": trigger_context.get("structure_ready"),
-        "approval_ready_now": approval_context.get("approval_ready_now"),
-        "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
-        "open_positions": request_payload.get("open_positions"),
-        "weekly_trade_count": request_payload.get("weekly_trade_count"),
-        "invalidation": simple_output.get("invalidation"),
-        "invalidation_level_1h_ema50": on_demand_payload.get("invalidation_level_1h_ema50"),
-        "targets": on_demand_payload.get("targets") or {},
-        "winner_shift_context": winner_shift_context,
-        "iv_context": iv_context,
-        "iv_status": iv_context.get("status"),
-        "market_context": market_context,
-        "market_open": market_context.get("is_open"),
-        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
-        "time_gate_reason": time_day_gate.get("reason"),
-        "time_day_gate": time_day_gate,
-        "summary": {
-            "ticker": simple_output.get("ticker"),
-            "action": simple_output.get("action"),
-            "setup_state": simple_output.get("setup_state"),
-            "good_idea_now": simple_output.get("good_idea_now"),
-            "why": simple_output.get("why"),
-        },
-    }
-    snapshot["current_state"] = _derive_continuous_state_from_snapshot(snapshot)
-    return snapshot
 
 
 def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
