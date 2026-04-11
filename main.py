@@ -6625,10 +6625,13 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     next_flip_needed = snapshot.get("next_flip_needed")
     summary = snapshot.get("summary") or {}
 
-    if primary_blocker in {"open_trade_already", "weekly_trade_cap_reached"}:
-        return "BLOCKED_ACCOUNT"
-    if next_flip_needed in {"open_trade_already", "weekly_trade_cap_reached"}:
-        return "BLOCKED_ACCOUNT"
+    # Account-state blockers need distinct shadow taxonomy buckets so
+    # transitions like open-position -> weekly-cap become true state
+    # changes instead of collapsing into one generic account block.
+    if primary_blocker == "open_trade_already" or next_flip_needed == "open_trade_already":
+        return "BLOCKED_OPEN_POSITION"
+    if primary_blocker == "weekly_trade_cap_reached" or next_flip_needed == "weekly_trade_cap_reached":
+        return "BLOCKED_WEEKLY_CAP"
 
     if primary_blocker == "no_candidate_available" or (
         summary.get("ticker") == "UNKNOWN" and not primary_blocker
