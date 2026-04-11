@@ -6601,14 +6601,174 @@ def _save_continuous_state(profile_key: str, payload: Dict[str, Any]) -> None:
     temp_path.replace(state_path)
 
 
+
+_CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP: Dict[str, str] = {
+    "allowed_setup_type": "BLOCKED_SETUP_TYPE",
+    "twentyfour_hour_supportive": "BLOCKED_24H_CONTEXT",
+    "one_hour_clean_around_ema": "BLOCKED_1H_STRUCTURE",
+    "clear_room": "BLOCKED_ROOM",
+    "early_enough": "BLOCKED_EXTENSION",
+    "clear_trigger": "BLOCKED_TRIGGER",
+    "liquidity_ok": "BLOCKED_LIQUIDITY",
+    "invalidation_clear": "BLOCKED_INVALIDATION",
+    "fits_risk": "BLOCKED_RISK",
+}
+
+_CONTINUOUS_STRUCTURE_FAILED_REASON_STATE_MAP: Dict[str, str] = {
+    "setup type is not allowed": "BLOCKED_SETUP_TYPE",
+    "24h context is not supportive": "BLOCKED_24H_CONTEXT",
+    "1h structure around the 50 ema is not clean": "BLOCKED_1H_STRUCTURE",
+    "room to the first wall fails": "BLOCKED_ROOM",
+    "entry is too late or overextended for safe-fast": "BLOCKED_EXTENSION",
+    "no valid live trigger is present": "BLOCKED_TRIGGER",
+    "options liquidity is too wide for a clean debit spread entry": "BLOCKED_LIQUIDITY",
+    "invalidation is not clear": "BLOCKED_INVALIDATION",
+    "risk does not fit the safe-fast budget": "BLOCKED_RISK",
+}
+
+_CONTINUOUS_STATE_FAMILY_MAP: Dict[str, str] = {
+    "STALE_OR_UNCONFIRMED": "SYSTEM",
+    "EXIT_NOW": "EXIT",
+    "APPROVAL_READY": "SIGNAL",
+    "PENDING_COMPLETED_CANDLE_APPROVAL": "SIGNAL",
+    "PENDING_TRIGGER_CONFIRMATION": "SIGNAL",
+    "BLOCKED_OPEN_POSITION": "ACCOUNT",
+    "BLOCKED_WEEKLY_CAP": "ACCOUNT",
+    "BLOCKED_IV_HIGH": "IV",
+    "WAIT_MARKET_OPEN": "TIME",
+    "BLOCKED_TIME_GATE": "TIME",
+    "BLOCKED_SETUP_TYPE": "STRUCTURE",
+    "BLOCKED_24H_CONTEXT": "STRUCTURE",
+    "BLOCKED_1H_STRUCTURE": "STRUCTURE",
+    "BLOCKED_ROOM": "STRUCTURE",
+    "BLOCKED_EXTENSION": "STRUCTURE",
+    "BLOCKED_TRIGGER": "STRUCTURE",
+    "BLOCKED_LIQUIDITY": "STRUCTURE",
+    "BLOCKED_INVALIDATION": "STRUCTURE",
+    "BLOCKED_RISK": "STRUCTURE",
+    "NO_CANDIDATE": "CANDIDATE",
+    "BLOCKED_STRUCTURAL": "STRUCTURE",
+}
+
+
+def _ordered_unique_strings(values: List[Any]) -> List[str]:
+    ordered: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ordered
+
+
+def _derive_continuous_structure_state(snapshot: Dict[str, Any]) -> Optional[str]:
+    primary_blocker = snapshot.get("primary_blocker")
+    decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
+    failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
+
+    blocker_priority: List[str] = []
+    if isinstance(primary_blocker, str) and primary_blocker.strip():
+        blocker_priority.append(primary_blocker.strip())
+    blocker_priority.extend(
+        blocker
+        for blocker in decision_blockers
+        if blocker not in blocker_priority
+    )
+
+    for blocker in blocker_priority:
+        mapped_state = _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP.get(blocker)
+        if mapped_state:
+            return mapped_state
+
+    for failed_reason in failed_reasons:
+        mapped_state = _CONTINUOUS_STRUCTURE_FAILED_REASON_STATE_MAP.get(
+            failed_reason.lower()
+        )
+        if mapped_state:
+            return mapped_state
+
+    return None
+
+
+def _continuous_state_family(state: Optional[str]) -> str:
+    if not state:
+        return "UNKNOWN"
+    return _CONTINUOUS_STATE_FAMILY_MAP.get(str(state), "UNKNOWN")
+
+
+def _derive_continuous_state_source(
+    snapshot: Dict[str, Any],
+    current_state: Optional[str],
+    latent_structure_state: Optional[str],
+) -> str:
+    if current_state in {"BLOCKED_OPEN_POSITION", "BLOCKED_WEEKLY_CAP"}:
+        return "account_gate"
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"}:
+        return "time_gate"
+    if current_state == "BLOCKED_IV_HIGH":
+        return "iv_gate"
+    if current_state in {"APPROVAL_READY", "PENDING_COMPLETED_CANDLE_APPROVAL", "PENDING_TRIGGER_CONFIRMATION"}:
+        return "signal_state"
+    if current_state == "EXIT_NOW":
+        return "exit_state"
+    if current_state == "NO_CANDIDATE":
+        return "candidate_engine"
+    if current_state == latent_structure_state and current_state is not None:
+        decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
+        primary_blocker = snapshot.get("primary_blocker")
+        if isinstance(primary_blocker, str) and primary_blocker in _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP:
+            return "primary_blocker"
+        for blocker in decision_blockers:
+            if blocker in _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP:
+                return "decision_blocker"
+        return "failed_reason"
+    if current_state == "BLOCKED_STRUCTURAL":
+        return "structural_fallback"
+    return "system"
+
+
+def _derive_continuous_state_reason(
+    snapshot: Dict[str, Any],
+    current_state: Optional[str],
+    latent_structure_state: Optional[str],
+) -> Optional[str]:
+    if current_state in {"BLOCKED_OPEN_POSITION", "BLOCKED_WEEKLY_CAP"}:
+        return snapshot.get("primary_blocker") or snapshot.get("next_flip_needed")
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"}:
+        return snapshot.get("time_gate_reason") or (snapshot.get("time_day_gate") or {}).get("reason")
+    if current_state == "BLOCKED_IV_HIGH":
+        return snapshot.get("iv_status")
+    if current_state == "EXIT_NOW":
+        return "exit_now"
+    if current_state in {"APPROVAL_READY", "PENDING_COMPLETED_CANDLE_APPROVAL", "PENDING_TRIGGER_CONFIRMATION"}:
+        return current_state.lower()
+    if current_state == "NO_CANDIDATE":
+        return snapshot.get("primary_blocker") or "no_candidate_available"
+    if current_state == latent_structure_state and current_state is not None:
+        primary_blocker = snapshot.get("primary_blocker")
+        if isinstance(primary_blocker, str) and primary_blocker in _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP:
+            return primary_blocker
+        for blocker in _ordered_unique_strings(snapshot.get("decision_blockers") or []):
+            if blocker in _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP:
+                return blocker
+        for failed_reason in _ordered_unique_strings(snapshot.get("failed_reasons") or []):
+            if failed_reason.lower() in _CONTINUOUS_STRUCTURE_FAILED_REASON_STATE_MAP:
+                return failed_reason
+    if current_state == "BLOCKED_STRUCTURAL":
+        return snapshot.get("primary_blocker")
+    return None
+
+
 def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     if not snapshot.get("on_demand_ok", False):
         return "STALE_OR_UNCONFIRMED"
 
     primary_blocker = snapshot.get("primary_blocker")
     next_flip_needed = snapshot.get("next_flip_needed")
-    decision_blockers = snapshot.get("decision_blockers") or []
-    failed_reasons = snapshot.get("failed_reasons") or []
+    decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
+    failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
     summary = snapshot.get("summary") or {}
     iv_status = snapshot.get("iv_status")
     market_open = snapshot.get("market_open")
@@ -6644,50 +6804,9 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     if time_gate_reason:
         return "BLOCKED_TIME_GATE"
 
-    blocker_state_map = {
-        "allowed_setup_type": "BLOCKED_SETUP_TYPE",
-        "twentyfour_hour_supportive": "BLOCKED_24H_CONTEXT",
-        "one_hour_clean_around_ema": "BLOCKED_1H_STRUCTURE",
-        "clear_room": "BLOCKED_ROOM",
-        "clear_trigger": "BLOCKED_TRIGGER",
-        "liquidity_ok": "BLOCKED_LIQUIDITY",
-        "invalidation_clear": "BLOCKED_INVALIDATION",
-        "fits_risk": "BLOCKED_RISK",
-    }
-
-    explicit_blockers_in_priority_order: List[str] = []
-    if primary_blocker:
-        explicit_blockers_in_priority_order.append(primary_blocker)
-    explicit_blockers_in_priority_order.extend(
-        blocker
-        for blocker in decision_blockers
-        if blocker not in explicit_blockers_in_priority_order
-    )
-
-    for blocker in explicit_blockers_in_priority_order:
-        if blocker in blocker_state_map:
-            return blocker_state_map[blocker]
-
-    if primary_blocker == "early_enough" or "early_enough" in decision_blockers:
-        return "BLOCKED_EXTENSION"
-
-    failed_reason_state_map = {
-        "market is closed": "WAIT_MARKET_OPEN",
-        "setup type is not allowed": "BLOCKED_SETUP_TYPE",
-        "24H context is not supportive": "BLOCKED_24H_CONTEXT",
-        "1H structure around the 50 EMA is not clean": "BLOCKED_1H_STRUCTURE",
-        "room to the first wall fails": "BLOCKED_ROOM",
-        "entry is too late or overextended for SAFE-FAST": "BLOCKED_EXTENSION",
-        "no valid live trigger is present": "BLOCKED_TRIGGER",
-        "options liquidity is too wide for a clean debit spread entry": "BLOCKED_LIQUIDITY",
-        "invalidation is not clear": "BLOCKED_INVALIDATION",
-        "risk does not fit the SAFE-FAST budget": "BLOCKED_RISK",
-    }
-
-    for failed_reason in failed_reasons:
-        mapped_state = failed_reason_state_map.get(str(failed_reason).strip().lower())
-        if mapped_state:
-            return mapped_state
+    structure_state = _derive_continuous_structure_state(snapshot)
+    if structure_state:
+        return structure_state
 
     # Only fall back to the generic no-candidate bucket after explicit
     # non-account time/structure states have had a chance to win.
@@ -6703,6 +6822,7 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
 
 
 def _build_continuous_snapshot(
+
     *,
     on_demand_payload: Dict[str, Any],
     request: OnDemandRequest,
@@ -6762,13 +6882,29 @@ def _build_continuous_snapshot(
             "why": simple_output.get("why"),
         },
     }
+    snapshot["latent_structure_state"] = _derive_continuous_structure_state(snapshot)
     snapshot["current_state"] = _derive_continuous_state_from_snapshot(snapshot)
+    snapshot["state_family"] = _continuous_state_family(snapshot.get("current_state"))
+    snapshot["state_source"] = _derive_continuous_state_source(
+        snapshot,
+        snapshot.get("current_state"),
+        snapshot.get("latent_structure_state"),
+    )
+    snapshot["state_reason"] = _derive_continuous_state_reason(
+        snapshot,
+        snapshot.get("current_state"),
+        snapshot.get("latent_structure_state"),
+    )
     return snapshot
 
 
 def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     tracked_fields = [
         "current_state",
+        "latent_structure_state",
+        "state_family",
+        "state_source",
+        "state_reason",
         "best_ticker",
         "final_verdict",
         "primary_blocker",
