@@ -6607,24 +6607,18 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
 
     primary_blocker = snapshot.get("primary_blocker")
     next_flip_needed = snapshot.get("next_flip_needed")
+    decision_blockers = snapshot.get("decision_blockers") or []
     summary = snapshot.get("summary") or {}
     iv_status = snapshot.get("iv_status")
     market_open = snapshot.get("market_open")
     fresh_entry_allowed = snapshot.get("fresh_entry_allowed")
     time_gate_reason = snapshot.get("time_gate_reason")
 
-    # Account-state blockers need distinct shadow taxonomy buckets so
-    # transitions like open-position -> weekly-cap become true state
-    # changes instead of collapsing into one generic account block.
+    # Account-state blockers keep explicit dedicated buckets.
     if primary_blocker == "open_trade_already" or next_flip_needed == "open_trade_already":
         return "BLOCKED_OPEN_POSITION"
     if primary_blocker == "weekly_trade_cap_reached" or next_flip_needed == "weekly_trade_cap_reached":
         return "BLOCKED_WEEKLY_CAP"
-
-    if primary_blocker == "no_candidate_available" or (
-        summary.get("ticker") == "UNKNOWN" and not primary_blocker
-    ):
-        return "NO_CANDIDATE"
 
     if summary.get("setup_state") == "INVALIDATED" or str(summary.get("action", "")).lower() == "exit now":
         return "EXIT_NOW"
@@ -6648,10 +6642,21 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
         "invalidation_clear": "BLOCKED_INVALIDATION",
         "fits_risk": "BLOCKED_RISK",
     }
-    if primary_blocker in blocker_state_map:
-        return blocker_state_map[primary_blocker]
 
-    if primary_blocker == "early_enough":
+    explicit_blockers_in_priority_order: List[str] = []
+    if primary_blocker:
+        explicit_blockers_in_priority_order.append(primary_blocker)
+    explicit_blockers_in_priority_order.extend(
+        blocker
+        for blocker in decision_blockers
+        if blocker not in explicit_blockers_in_priority_order
+    )
+
+    for blocker in explicit_blockers_in_priority_order:
+        if blocker in blocker_state_map:
+            return blocker_state_map[blocker]
+
+    if primary_blocker == "early_enough" or "early_enough" in decision_blockers:
         if time_gate_reason == "market_closed":
             return "WAIT_MARKET_OPEN"
         if time_gate_reason:
@@ -6664,10 +6669,16 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
         if time_gate_reason:
             return "BLOCKED_TIME_GATE"
 
+    # Only fall back to the generic no-candidate bucket after explicit
+    # non-account states have had a chance to win.
+    if primary_blocker == "no_candidate_available":
+        return "NO_CANDIDATE"
+    if summary.get("ticker") == "UNKNOWN" and not primary_blocker and not decision_blockers:
+        return "NO_CANDIDATE"
+
     if primary_blocker:
         return "BLOCKED_STRUCTURAL"
     return "STALE_OR_UNCONFIRMED"
-
 
 def _build_continuous_snapshot(
     *,
