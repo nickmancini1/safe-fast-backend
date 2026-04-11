@@ -6701,6 +6701,71 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     return "STALE_OR_UNCONFIRMED"
 
 
+
+def _build_continuous_snapshot(
+    *,
+    on_demand_payload: Dict[str, Any],
+    request: OnDemandRequest,
+    profile_name: str,
+    profile_key: str,
+) -> Dict[str, Any]:
+    request_payload = _model_dump(request)
+    simple_output = on_demand_payload.get("simple_output") or {}
+    user_facing = on_demand_payload.get("user_facing") or {}
+    decision_context = on_demand_payload.get("decision_context") or {}
+    approval_context = on_demand_payload.get("approval_context") or {}
+    approval_requirements_context = on_demand_payload.get("approval_requirements_context") or {}
+    trigger_context = on_demand_payload.get("trigger_context") or {}
+    market_context = on_demand_payload.get("market_context") or {}
+    winner_shift_context = on_demand_payload.get("winner_shift_context") or {}
+    iv_context = on_demand_payload.get("iv_context") or {}
+    time_day_gate = on_demand_payload.get("time_day_gate") or {}
+
+    snapshot: Dict[str, Any] = {
+        "timestamp_et": market_context.get("as_of_et") or datetime.now(NY_TZ).isoformat(),
+        "profile_name": profile_name,
+        "profile_key": profile_key,
+        "request_profile": request_payload,
+        "build_tag": on_demand_payload.get("build_tag"),
+        "on_demand_ok": bool(on_demand_payload.get("ok")),
+        "best_ticker": on_demand_payload.get("best_ticker"),
+        "final_verdict": on_demand_payload.get("final_verdict"),
+        "user_facing_why": user_facing.get("why"),
+        "primary_blocker": decision_context.get("primary_blocker"),
+        "decision_blockers": decision_context.get("blockers") or [],
+        "failed_reasons": decision_context.get("failed_reasons") or [],
+        "next_flip_needed": approval_context.get("next_flip_needed")
+        or approval_requirements_context.get("next_flip_needed"),
+        "trigger_present": trigger_context.get("trigger_present"),
+        "trigger_reason": trigger_context.get("trigger_reason"),
+        "structure_ready": trigger_context.get("structure_ready"),
+        "approval_ready_now": approval_context.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
+        "open_positions": request_payload.get("open_positions"),
+        "weekly_trade_count": request_payload.get("weekly_trade_count"),
+        "invalidation": simple_output.get("invalidation"),
+        "invalidation_level_1h_ema50": on_demand_payload.get("invalidation_level_1h_ema50"),
+        "targets": on_demand_payload.get("targets") or {},
+        "winner_shift_context": winner_shift_context,
+        "iv_context": iv_context,
+        "iv_status": iv_context.get("status"),
+        "market_context": market_context,
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "time_gate_reason": time_day_gate.get("reason"),
+        "time_day_gate": time_day_gate,
+        "summary": {
+            "ticker": simple_output.get("ticker"),
+            "action": simple_output.get("action"),
+            "setup_state": simple_output.get("setup_state"),
+            "good_idea_now": simple_output.get("good_idea_now"),
+            "why": simple_output.get("why"),
+        },
+    }
+    snapshot["current_state"] = _derive_continuous_state_from_snapshot(snapshot)
+    return snapshot
+
+
 def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     tracked_fields = [
         "current_state",
