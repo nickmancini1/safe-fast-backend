@@ -4372,6 +4372,7 @@ def _build_screened_best_context(
 
     selected_checklist = selected.get("checklist") or {}
     selected_reason = selected.get("reason")
+    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(selected_reason)
     selected_structure_context = selected.get("structure_context") or {}
     selected_trigger_state = selected.get("trigger_state") or {}
 
@@ -4418,7 +4419,6 @@ def _build_screened_best_context(
     engine_pick_reason = engine_pick.get("reason") if engine_pick else None
     engine_pick_verdict = engine_pick.get("final_verdict") if engine_pick else None
 
-    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(selected_reason)
     normalized_engine_best_ticker = None if no_candidate_primary_blocker == "no_candidate_available" else selected.get("symbol")
     return {
         "ok": True,
