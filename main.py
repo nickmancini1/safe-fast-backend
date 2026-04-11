@@ -3414,10 +3414,13 @@ def _build_checklist_block(
         {"item": "weekly_trade_cap_reached", "yes": bool(request.weekly_trade_count >= 4)},
     ]
 
+    # Only confirmed-false checklist items become blockers.
+    # Unconfirmed items (None), such as IV when rank/percentile are unavailable,
+    # must stay informational and must not be promoted into failed blockers.
     failed_items = [
         row["item"]
         for row in items
-        if not row["yes"] and row["item"] not in {"open_trade_already", "weekly_trade_cap_reached"}
+        if row["yes"] is False and row["item"] not in {"open_trade_already", "weekly_trade_cap_reached"}
     ]
     global_gate_failures: List[str] = []
     if request.open_positions > 0:
