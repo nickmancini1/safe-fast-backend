@@ -6608,6 +6608,10 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     primary_blocker = snapshot.get("primary_blocker")
     next_flip_needed = snapshot.get("next_flip_needed")
     summary = snapshot.get("summary") or {}
+    iv_status = snapshot.get("iv_status")
+    market_open = snapshot.get("market_open")
+    fresh_entry_allowed = snapshot.get("fresh_entry_allowed")
+    time_gate_reason = snapshot.get("time_gate_reason")
 
     # Account-state blockers need distinct shadow taxonomy buckets so
     # transitions like open-position -> weekly-cap become true state
@@ -6626,8 +6630,40 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
         return "EXIT_NOW"
     if snapshot.get("approval_ready_now"):
         return "APPROVAL_READY"
-    if snapshot.get("approval_ready_on_completed_candle") or snapshot.get("trigger_present"):
-        return "PENDING_MONITOR"
+    if snapshot.get("approval_ready_on_completed_candle"):
+        return "PENDING_COMPLETED_CANDLE_APPROVAL"
+    if snapshot.get("trigger_present"):
+        return "PENDING_TRIGGER_CONFIRMATION"
+
+    if iv_status == "high":
+        return "BLOCKED_IV_HIGH"
+
+    blocker_state_map = {
+        "allowed_setup_type": "BLOCKED_SETUP_TYPE",
+        "twentyfour_hour_supportive": "BLOCKED_24H_CONTEXT",
+        "one_hour_clean_around_ema": "BLOCKED_1H_STRUCTURE",
+        "clear_room": "BLOCKED_ROOM",
+        "clear_trigger": "BLOCKED_TRIGGER",
+        "liquidity_ok": "BLOCKED_LIQUIDITY",
+        "invalidation_clear": "BLOCKED_INVALIDATION",
+        "fits_risk": "BLOCKED_RISK",
+    }
+    if primary_blocker in blocker_state_map:
+        return blocker_state_map[primary_blocker]
+
+    if primary_blocker == "early_enough":
+        if time_gate_reason == "market_closed":
+            return "WAIT_MARKET_OPEN"
+        if time_gate_reason:
+            return "BLOCKED_TIME_GATE"
+        return "BLOCKED_EXTENSION"
+
+    if not market_open and fresh_entry_allowed is False:
+        if time_gate_reason == "market_closed":
+            return "WAIT_MARKET_OPEN"
+        if time_gate_reason:
+            return "BLOCKED_TIME_GATE"
+
     if primary_blocker:
         return "BLOCKED_STRUCTURAL"
     return "STALE_OR_UNCONFIRMED"
@@ -6650,6 +6686,7 @@ def _build_continuous_snapshot(
     market_context = on_demand_payload.get("market_context") or {}
     winner_shift_context = on_demand_payload.get("winner_shift_context") or {}
     iv_context = on_demand_payload.get("iv_context") or {}
+    time_day_gate = on_demand_payload.get("time_day_gate") or {}
 
     snapshot: Dict[str, Any] = {
         "timestamp_et": market_context.get("as_of_et") or datetime.now(NY_TZ).isoformat(),
@@ -6662,6 +6699,8 @@ def _build_continuous_snapshot(
         "final_verdict": on_demand_payload.get("final_verdict"),
         "user_facing_why": user_facing.get("why"),
         "primary_blocker": decision_context.get("primary_blocker"),
+        "decision_blockers": decision_context.get("blockers") or [],
+        "failed_reasons": decision_context.get("failed_reasons") or [],
         "next_flip_needed": approval_context.get("next_flip_needed")
         or approval_requirements_context.get("next_flip_needed"),
         "trigger_present": trigger_context.get("trigger_present"),
@@ -6676,7 +6715,12 @@ def _build_continuous_snapshot(
         "targets": on_demand_payload.get("targets") or {},
         "winner_shift_context": winner_shift_context,
         "iv_context": iv_context,
+        "iv_status": iv_context.get("status"),
         "market_context": market_context,
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "time_gate_reason": time_day_gate.get("reason"),
+        "time_day_gate": time_day_gate,
         "summary": {
             "ticker": simple_output.get("ticker"),
             "action": simple_output.get("action"),
@@ -6866,6 +6910,7 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
         "winner_shift_context": on_demand_payload.get("winner_shift_context"),
         "iv_context": on_demand_payload.get("iv_context"),
         "market_context": on_demand_payload.get("market_context"),
+        "time_day_gate": on_demand_payload.get("time_day_gate"),
     }
 
 
