@@ -3705,8 +3705,19 @@ def _effective_blockers(
         screened_reason=screened_reason,
         time_gate_reason=time_gate_reason,
     )
-    if gate_blocker:
+
+    # Structural-first parity:
+    # - no_candidate_available should lead when there is no candidate
+    # - account gates should still lead when present
+    # - time_day_gate should remain visible, but should not displace a structural blocker
+    if gate_blocker == "no_candidate_available":
         blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    elif gate_blocker == "time_day_gate":
+        if gate_blocker in blockers:
+            blockers = [item for item in blockers if item != gate_blocker] + [gate_blocker]
+        else:
+            blockers = blockers + [gate_blocker]
+
     blockers = _prepend_account_gate_primary_blocker(blockers, checklist_block)
     return blockers
 
