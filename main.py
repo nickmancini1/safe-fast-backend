@@ -6580,10 +6580,18 @@ def _continuous_shadow_to_on_demand_request(request: ContinuousShadowRequest) ->
     return OnDemandRequest(**payload)
 
 
-def _continuous_profile_key(profile_name: str, request: OnDemandRequest) -> str:
+def _continuous_profile_identity_payload(request: OnDemandRequest) -> Dict[str, Any]:
     request_payload = _model_dump(request)
+    stable_payload = dict(request_payload)
+    stable_payload.pop("open_positions", None)
+    stable_payload.pop("weekly_trade_count", None)
+    return stable_payload
+
+
+def _continuous_profile_key(profile_name: str, request: OnDemandRequest) -> str:
+    stable_payload = _continuous_profile_identity_payload(request)
     digest = hashlib.sha1(
-        json.dumps(request_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(stable_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:12]
     return f"{profile_name}__{digest}"
 
@@ -6614,11 +6622,19 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
         return "STALE_OR_UNCONFIRMED"
 
     primary_blocker = snapshot.get("primary_blocker")
+    next_flip_needed = snapshot.get("next_flip_needed")
     summary = snapshot.get("summary") or {}
-    if primary_blocker == "no_candidate_available" or summary.get("ticker") == "UNKNOWN":
-        return "NO_CANDIDATE"
+
     if primary_blocker in {"open_trade_already", "weekly_trade_cap_reached"}:
         return "BLOCKED_ACCOUNT"
+    if next_flip_needed in {"open_trade_already", "weekly_trade_cap_reached"}:
+        return "BLOCKED_ACCOUNT"
+
+    if primary_blocker == "no_candidate_available" or (
+        summary.get("ticker") == "UNKNOWN" and not primary_blocker
+    ):
+        return "NO_CANDIDATE"
+
     if summary.get("setup_state") == "INVALIDATED" or str(summary.get("action", "")).lower() == "exit now":
         return "EXIT_NOW"
     if snapshot.get("approval_ready_now"):
