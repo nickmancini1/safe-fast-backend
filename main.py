@@ -6011,7 +6011,10 @@ def _build_on_demand_unavailable_payload(
 
 
 
-async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
+async def _build_on_demand_payload(
+    request: OnDemandRequest,
+    include_continuous_shadow_debug: bool = True,
+) -> Dict[str, Any]:
 
     clean_option_type = _clean_option_type(request.option_type)
     market_context = _market_context_now()
@@ -6353,7 +6356,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         iv_context=iv_context,
     )
 
-    return {
+    payload = {
         "ok": True,
         "mode": "on_demand",
         "build_tag": "schema_patch_core_approval_context_next_flip_open_position_parity_2026_04_10",
@@ -6478,6 +6481,22 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         ),
         "two_path": two_path_block,
     }
+
+    if include_continuous_shadow_debug:
+        try:
+            payload["continuous_shadow_debug"] = _build_on_demand_continuous_shadow_debug_block(
+                on_demand_payload=payload,
+                request=request,
+            )
+        except Exception as exc:
+            payload["continuous_shadow_debug"] = {
+                "ok": False,
+                "bridge_mode": "on_demand_temp_debug",
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+            }
+
+    return payload
 
 
 @app.get("/")
@@ -6847,6 +6866,103 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     }
 
 
+def _build_on_demand_continuous_shadow_debug_block(
+    *,
+    on_demand_payload: Dict[str, Any],
+    request: OnDemandRequest,
+) -> Dict[str, Any]:
+    profile_name = os.getenv("SAFE_FAST_ON_DEMAND_SHADOW_DEBUG_PROFILE", "__on_demand_shadow_debug")
+    persist_state = os.getenv("SAFE_FAST_ON_DEMAND_SHADOW_DEBUG_PERSIST", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+    profile_key = _continuous_profile_key(profile_name, request)
+    stored_state = _load_continuous_state(profile_key) if persist_state else {}
+    previous_snapshot = stored_state.get("latest_snapshot")
+
+    current_snapshot = _build_continuous_snapshot(
+        on_demand_payload=on_demand_payload,
+        request=request,
+        profile_name=profile_name,
+        profile_key=profile_key,
+    )
+    transition_summary = _compare_continuous_snapshots(previous_snapshot, current_snapshot)
+    transition_fingerprint = _continuous_transition_fingerprint(
+        current_snapshot=current_snapshot,
+        transition_summary=transition_summary,
+    )
+
+    last_alert_fingerprint = stored_state.get("last_alert_fingerprint")
+    deduped = bool(
+        previous_snapshot
+        and transition_summary.get("should_alert_candidate")
+        and transition_fingerprint == last_alert_fingerprint
+    )
+    should_alert = bool(
+        previous_snapshot
+        and transition_summary.get("should_alert_candidate")
+        and not deduped
+    )
+
+    alert_payload = _build_continuous_alert_payload(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_summary=transition_summary,
+        should_alert=should_alert,
+    )
+
+    persisted = False
+    state_file = None
+    if persist_state:
+        persisted = True
+        state_file = str(_continuous_state_path(profile_key))
+        _save_continuous_state(
+            profile_key,
+            {
+                "profile_name": profile_name,
+                "profile_key": profile_key,
+                "updated_at": current_snapshot.get("timestamp_et"),
+                "latest_snapshot": current_snapshot,
+                "previous_snapshot": previous_snapshot,
+                "last_transition": transition_summary,
+                "last_transition_fingerprint": transition_fingerprint,
+                "last_alert_fingerprint": transition_fingerprint if should_alert else last_alert_fingerprint,
+                "last_alert_timestamp": (
+                    current_snapshot.get("timestamp_et")
+                    if should_alert
+                    else stored_state.get("last_alert_timestamp")
+                ),
+                "bridge_source": "on_demand_temp_debug",
+            },
+        )
+
+    return {
+        "ok": True,
+        "bridge_mode": "on_demand_temp_debug",
+        "source_of_truth": "frozen_on_demand_baseline",
+        "profile_name": profile_name,
+        "profile_key": profile_key,
+        "current_snapshot": current_snapshot,
+        "previous_snapshot": previous_snapshot,
+        "transition_summary": {
+            **transition_summary,
+            "should_alert": should_alert,
+            "deduped": deduped,
+            "transition_fingerprint": transition_fingerprint,
+        },
+        "alert_payload": alert_payload,
+        "persistence": {
+            "enabled": persist_state,
+            "persisted": persisted,
+            "state_file": state_file,
+            "previous_snapshot_found": bool(previous_snapshot),
+        },
+    }
+
+
 async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
     profile_name = _sanitize_continuous_profile_name(request.profile_name)
     on_demand_request = _continuous_shadow_to_on_demand_request(request)
@@ -6855,7 +6971,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
     previous_snapshot = stored_state.get("latest_snapshot")
 
-    on_demand_payload = await _build_on_demand_payload(on_demand_request)
+    on_demand_payload = await _build_on_demand_payload(on_demand_request, include_continuous_shadow_debug=False)
     current_snapshot = _build_continuous_snapshot(
         on_demand_payload=on_demand_payload,
         request=on_demand_request,
