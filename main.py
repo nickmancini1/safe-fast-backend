@@ -2,12 +2,14 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 
 import os
 import re
 from datetime import datetime, time, timedelta
 from html import unescape
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -6525,6 +6527,421 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
         return await _build_chart_check_payload(clean_symbol, token)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+
+
+class ContinuousShadowRequest(OnDemandRequest):
+    profile_name: str = "default"
+    persist_state: bool = True
+
+
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
+def _sanitize_continuous_profile_name(profile_name: Optional[str]) -> str:
+    raw_name = (profile_name or "default").strip()
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_name).strip("._-")
+    return (cleaned or "default")[:64]
+
+
+def _continuous_state_dir() -> Path:
+    state_dir = Path(os.getenv("SAFE_FAST_CONTINUOUS_STATE_DIR", "/tmp/safe_fast_continuous"))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir
+
+
+def _continuous_shadow_to_on_demand_request(request: ContinuousShadowRequest) -> OnDemandRequest:
+    payload = _model_dump(request)
+    payload.pop("profile_name", None)
+    payload.pop("persist_state", None)
+    return OnDemandRequest(**payload)
+
+
+def _continuous_profile_key(profile_name: str, request: OnDemandRequest) -> str:
+    request_payload = _model_dump(request)
+    digest = hashlib.sha1(
+        json.dumps(request_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{profile_name}__{digest}"
+
+
+def _continuous_state_path(profile_key: str) -> Path:
+    return _continuous_state_dir() / f"{profile_key}.json"
+
+
+def _load_continuous_state(profile_key: str) -> Dict[str, Any]:
+    state_path = _continuous_state_path(profile_key)
+    if not state_path.exists():
+        return {}
+    try:
+        return json.loads(state_path.read_text())
+    except Exception:
+        return {}
+
+
+def _save_continuous_state(profile_key: str, payload: Dict[str, Any]) -> None:
+    state_path = _continuous_state_path(profile_key)
+    temp_path = state_path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    temp_path.replace(state_path)
+
+
+def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
+    if not snapshot.get("on_demand_ok", False):
+        return "STALE_OR_UNCONFIRMED"
+
+    primary_blocker = snapshot.get("primary_blocker")
+    summary = snapshot.get("summary") or {}
+    if primary_blocker == "no_candidate_available" or summary.get("ticker") == "UNKNOWN":
+        return "NO_CANDIDATE"
+    if primary_blocker in {"open_trade_already", "weekly_trade_cap_reached"}:
+        return "BLOCKED_ACCOUNT"
+    if summary.get("setup_state") == "INVALIDATED" or str(summary.get("action", "")).lower() == "exit now":
+        return "EXIT_NOW"
+    if snapshot.get("approval_ready_now"):
+        return "APPROVAL_READY"
+    if snapshot.get("approval_ready_on_completed_candle") or snapshot.get("trigger_present"):
+        return "PENDING_MONITOR"
+    if primary_blocker:
+        return "BLOCKED_STRUCTURAL"
+    return "STALE_OR_UNCONFIRMED"
+
+
+def _build_continuous_snapshot(
+    *,
+    on_demand_payload: Dict[str, Any],
+    request: OnDemandRequest,
+    profile_name: str,
+    profile_key: str,
+) -> Dict[str, Any]:
+    request_payload = _model_dump(request)
+    simple_output = on_demand_payload.get("simple_output") or {}
+    user_facing = on_demand_payload.get("user_facing") or {}
+    decision_context = on_demand_payload.get("decision_context") or {}
+    approval_context = on_demand_payload.get("approval_context") or {}
+    approval_requirements_context = on_demand_payload.get("approval_requirements_context") or {}
+    trigger_context = on_demand_payload.get("trigger_context") or {}
+    market_context = on_demand_payload.get("market_context") or {}
+    winner_shift_context = on_demand_payload.get("winner_shift_context") or {}
+    iv_context = on_demand_payload.get("iv_context") or {}
+
+    snapshot: Dict[str, Any] = {
+        "timestamp_et": market_context.get("as_of_et") or datetime.now(NY_TZ).isoformat(),
+        "profile_name": profile_name,
+        "profile_key": profile_key,
+        "request_profile": request_payload,
+        "build_tag": on_demand_payload.get("build_tag"),
+        "on_demand_ok": bool(on_demand_payload.get("ok")),
+        "best_ticker": on_demand_payload.get("best_ticker"),
+        "final_verdict": on_demand_payload.get("final_verdict"),
+        "user_facing_why": user_facing.get("why"),
+        "primary_blocker": decision_context.get("primary_blocker"),
+        "next_flip_needed": approval_context.get("next_flip_needed")
+        or approval_requirements_context.get("next_flip_needed"),
+        "trigger_present": trigger_context.get("trigger_present"),
+        "trigger_reason": trigger_context.get("trigger_reason"),
+        "structure_ready": trigger_context.get("structure_ready"),
+        "approval_ready_now": approval_context.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
+        "open_positions": request_payload.get("open_positions"),
+        "weekly_trade_count": request_payload.get("weekly_trade_count"),
+        "invalidation": simple_output.get("invalidation"),
+        "invalidation_level_1h_ema50": on_demand_payload.get("invalidation_level_1h_ema50"),
+        "targets": on_demand_payload.get("targets") or {},
+        "winner_shift_context": winner_shift_context,
+        "iv_context": iv_context,
+        "market_context": market_context,
+        "summary": {
+            "ticker": simple_output.get("ticker"),
+            "action": simple_output.get("action"),
+            "setup_state": simple_output.get("setup_state"),
+            "good_idea_now": simple_output.get("good_idea_now"),
+            "why": simple_output.get("why"),
+        },
+    }
+    snapshot["current_state"] = _derive_continuous_state_from_snapshot(snapshot)
+    return snapshot
+
+
+def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    tracked_fields = [
+        "current_state",
+        "best_ticker",
+        "final_verdict",
+        "primary_blocker",
+        "next_flip_needed",
+        "trigger_present",
+        "structure_ready",
+        "approval_ready_now",
+        "approval_ready_on_completed_candle",
+        "open_positions",
+        "weekly_trade_count",
+    ]
+    changes: Dict[str, Dict[str, Any]] = {}
+    for field in tracked_fields:
+        previous_value = previous.get(field)
+        current_value = current.get(field)
+        if previous_value != current_value:
+            changes[field] = {"previous": previous_value, "current": current_value}
+    return changes
+
+
+def _compare_continuous_snapshots(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not previous:
+        return {
+            "transition_type": "INITIAL_SNAPSHOT",
+            "severity": "info",
+            "meaningful_transition": False,
+            "should_alert_candidate": False,
+            "changed_fields": {},
+            "summary": "Initial shadow snapshot created.",
+        }
+
+    changed_fields = _continuous_changed_fields(previous, current)
+    meaningful_transition = bool(changed_fields)
+
+    if not meaningful_transition:
+        transition_type = "NO_MEANINGFUL_CHANGE"
+        severity = "info"
+        summary = "No meaningful state change."
+    elif previous.get("current_state") != current.get("current_state"):
+        transition_type = "STATE_CHANGED"
+        severity = "high" if current.get("current_state") in {"APPROVAL_READY", "EXIT_NOW"} else "medium"
+        summary = (
+            f"State changed from {previous.get('current_state')} to {current.get('current_state')}."
+        )
+    elif previous.get("best_ticker") != current.get("best_ticker"):
+        transition_type = "WINNER_CHANGED"
+        severity = "medium"
+        summary = f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')}."
+    elif previous.get("primary_blocker") != current.get("primary_blocker"):
+        transition_type = "PRIMARY_BLOCKER_CHANGED"
+        severity = "medium"
+        summary = (
+            f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}."
+        )
+    elif previous.get("next_flip_needed") != current.get("next_flip_needed"):
+        transition_type = "NEXT_FLIP_CHANGED"
+        severity = "medium"
+        summary = (
+            f"Next flip needed changed from {previous.get('next_flip_needed')} to {current.get('next_flip_needed')}."
+        )
+    elif (
+        previous.get("approval_ready_now") != current.get("approval_ready_now")
+        or previous.get("approval_ready_on_completed_candle")
+        != current.get("approval_ready_on_completed_candle")
+    ):
+        transition_type = "APPROVAL_STATE_CHANGED"
+        severity = "high" if current.get("approval_ready_now") else "medium"
+        summary = "Approval state changed."
+    elif previous.get("trigger_present") != current.get("trigger_present"):
+        transition_type = "TRIGGER_STATE_CHANGED"
+        severity = "medium"
+        summary = "Trigger state changed."
+    elif (
+        previous.get("open_positions") != current.get("open_positions")
+        or previous.get("weekly_trade_count") != current.get("weekly_trade_count")
+    ):
+        transition_type = "ACCOUNT_STATE_CHANGED"
+        severity = "medium"
+        summary = "Account state changed."
+    else:
+        transition_type = "DETAIL_CHANGED"
+        severity = "info"
+        summary = "Tracked shadow fields changed."
+
+    return {
+        "transition_type": transition_type,
+        "severity": severity,
+        "meaningful_transition": meaningful_transition,
+        "should_alert_candidate": meaningful_transition,
+        "changed_fields": changed_fields,
+        "summary": summary,
+    }
+
+
+def _continuous_transition_fingerprint(
+    *,
+    current_snapshot: Dict[str, Any],
+    transition_summary: Dict[str, Any],
+) -> str:
+    payload = {
+        "transition_type": transition_summary.get("transition_type"),
+        "current_state": current_snapshot.get("current_state"),
+        "best_ticker": current_snapshot.get("best_ticker"),
+        "primary_blocker": current_snapshot.get("primary_blocker"),
+        "next_flip_needed": current_snapshot.get("next_flip_needed"),
+        "trigger_present": current_snapshot.get("trigger_present"),
+        "approval_ready_now": current_snapshot.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": current_snapshot.get("approval_ready_on_completed_candle"),
+        "open_positions": current_snapshot.get("open_positions"),
+        "weekly_trade_count": current_snapshot.get("weekly_trade_count"),
+    }
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _build_continuous_alert_payload(
+    *,
+    previous_snapshot: Optional[Dict[str, Any]],
+    current_snapshot: Dict[str, Any],
+    transition_summary: Dict[str, Any],
+    should_alert: bool,
+) -> Optional[Dict[str, Any]]:
+    if not previous_snapshot or not transition_summary.get("meaningful_transition"):
+        return None
+
+    summary = current_snapshot.get("summary") or {}
+    return {
+        "should_alert": should_alert,
+        "transition_type": transition_summary.get("transition_type"),
+        "severity": transition_summary.get("severity"),
+        "message": transition_summary.get("summary"),
+        "ticker": summary.get("ticker"),
+        "state": current_snapshot.get("current_state"),
+        "primary_blocker": current_snapshot.get("primary_blocker"),
+        "next_flip_needed": current_snapshot.get("next_flip_needed"),
+        "good_idea_now": summary.get("good_idea_now"),
+        "action": summary.get("action"),
+    }
+
+
+def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Dict[str, Any]:
+    decision_context = on_demand_payload.get("decision_context") or {}
+    approval_context = on_demand_payload.get("approval_context") or {}
+    trigger_context = on_demand_payload.get("trigger_context") or {}
+
+    return {
+        "build_tag": on_demand_payload.get("build_tag"),
+        "simple_output": on_demand_payload.get("simple_output"),
+        "user_facing": on_demand_payload.get("user_facing"),
+        "decision_context": {
+            "primary_blocker": decision_context.get("primary_blocker"),
+            "blockers": decision_context.get("blockers"),
+            "failed_reasons": decision_context.get("failed_reasons"),
+        },
+        "approval_context": {
+            "primary_blocker": approval_context.get("primary_blocker"),
+            "next_flip_needed": approval_context.get("next_flip_needed"),
+            "approval_ready_now": approval_context.get("approval_ready_now"),
+            "approval_ready_on_completed_candle": approval_context.get(
+                "approval_ready_on_completed_candle"
+            ),
+        },
+        "trigger_context": {
+            "trigger_present": trigger_context.get("trigger_present"),
+            "trigger_reason": trigger_context.get("trigger_reason"),
+            "structure_ready": trigger_context.get("structure_ready"),
+        },
+        "winner_shift_context": on_demand_payload.get("winner_shift_context"),
+        "iv_context": on_demand_payload.get("iv_context"),
+        "market_context": on_demand_payload.get("market_context"),
+    }
+
+
+async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
+    profile_name = _sanitize_continuous_profile_name(request.profile_name)
+    on_demand_request = _continuous_shadow_to_on_demand_request(request)
+    profile_key = _continuous_profile_key(profile_name, on_demand_request)
+
+    stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
+    previous_snapshot = stored_state.get("latest_snapshot")
+
+    on_demand_payload = await _build_on_demand_payload(on_demand_request)
+    current_snapshot = _build_continuous_snapshot(
+        on_demand_payload=on_demand_payload,
+        request=on_demand_request,
+        profile_name=profile_name,
+        profile_key=profile_key,
+    )
+    transition_summary = _compare_continuous_snapshots(previous_snapshot, current_snapshot)
+    transition_fingerprint = _continuous_transition_fingerprint(
+        current_snapshot=current_snapshot,
+        transition_summary=transition_summary,
+    )
+
+    last_alert_fingerprint = stored_state.get("last_alert_fingerprint")
+    deduped = bool(
+        previous_snapshot
+        and transition_summary.get("should_alert_candidate")
+        and transition_fingerprint == last_alert_fingerprint
+    )
+    should_alert = bool(
+        previous_snapshot
+        and transition_summary.get("should_alert_candidate")
+        and not deduped
+    )
+
+    alert_payload = _build_continuous_alert_payload(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_summary=transition_summary,
+        should_alert=should_alert,
+    )
+
+    persisted = False
+    state_file = None
+    if request.persist_state:
+        persisted = True
+        state_file = str(_continuous_state_path(profile_key))
+        _save_continuous_state(
+            profile_key,
+            {
+                "profile_name": profile_name,
+                "profile_key": profile_key,
+                "updated_at": current_snapshot.get("timestamp_et"),
+                "latest_snapshot": current_snapshot,
+                "previous_snapshot": previous_snapshot,
+                "last_transition": transition_summary,
+                "last_transition_fingerprint": transition_fingerprint,
+                "last_alert_fingerprint": transition_fingerprint if should_alert else last_alert_fingerprint,
+                "last_alert_timestamp": current_snapshot.get("timestamp_et") if should_alert else stored_state.get("last_alert_timestamp"),
+            },
+        )
+
+    return {
+        "ok": bool(on_demand_payload.get("ok")),
+        "mode": "continuous_shadow",
+        "shadow_mode": "snapshot_compare_only",
+        "build_tag": on_demand_payload.get("build_tag"),
+        "source_of_truth": "frozen_on_demand_baseline",
+        "profile_name": profile_name,
+        "profile_key": profile_key,
+        "current_snapshot": current_snapshot,
+        "previous_snapshot": previous_snapshot,
+        "transition_summary": {
+            **transition_summary,
+            "should_alert": should_alert,
+            "deduped": deduped,
+            "transition_fingerprint": transition_fingerprint,
+        },
+        "alert_payload": alert_payload,
+        "persistence": {
+            "enabled": request.persist_state,
+            "persisted": persisted,
+            "state_file": state_file,
+            "previous_snapshot_found": bool(previous_snapshot),
+        },
+        "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
+    }
+
+
+@app.post("/safe-fast/continuous/shadow")
+async def safe_fast_continuous_shadow(request: ContinuousShadowRequest) -> Any:
+    return await _build_continuous_shadow_payload(request)
+
+
+@app.get("/safe-fast/continuous/shadow/default")
+async def safe_fast_continuous_shadow_default() -> Any:
+    return await _build_continuous_shadow_payload(ContinuousShadowRequest())
 
 
 def _default_on_demand_request() -> OnDemandRequest:
