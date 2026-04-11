@@ -3756,7 +3756,7 @@ def _build_decision_context_block(
         checklist_block,
         screened_reason=normalized_reason,
     )
-    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(normalized_reason)
+    no_candidate_primary_blocker = "no_candidate_available" if _is_no_candidate_reason(normalized_reason) else None
     if no_candidate_primary_blocker:
         effective_blockers = [no_candidate_primary_blocker] + [
             item for item in effective_blockers if item != no_candidate_primary_blocker
@@ -4383,7 +4383,7 @@ def _build_screened_best_context(
 
     selected_checklist = selected.get("checklist") or {}
     selected_reason = selected.get("reason")
-    no_candidate_primary_blocker = _resolve_global_gate_primary_blocker(selected_reason)
+    no_candidate_primary_blocker = "no_candidate_available" if _is_no_candidate_reason(selected_reason) else None
     selected_structure_context = selected.get("structure_context") or {}
     selected_trigger_state = selected.get("trigger_state") or {}
 
