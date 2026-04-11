@@ -6013,7 +6013,6 @@ def _build_on_demand_unavailable_payload(
 
 async def _build_on_demand_payload(
     request: OnDemandRequest,
-    include_continuous_shadow_debug: bool = True,
 ) -> Dict[str, Any]:
 
     clean_option_type = _clean_option_type(request.option_type)
@@ -6481,21 +6480,6 @@ async def _build_on_demand_payload(
         ),
         "two_path": two_path_block,
     }
-
-    if include_continuous_shadow_debug:
-        try:
-            payload["continuous_shadow_debug"] = _build_on_demand_continuous_shadow_debug_block(
-                on_demand_payload=payload,
-                request=request,
-            )
-        except Exception as exc:
-            payload["continuous_shadow_debug"] = {
-                "ok": False,
-                "bridge_mode": "on_demand_temp_debug",
-                "error_type": exc.__class__.__name__,
-                "error": str(exc),
-            }
-
     return payload
 
 
@@ -6990,7 +6974,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
     previous_snapshot = stored_state.get("latest_snapshot")
 
-    on_demand_payload = await _build_on_demand_payload(on_demand_request, include_continuous_shadow_debug=False)
+    on_demand_payload = await _build_on_demand_payload(on_demand_request)
     current_snapshot = _build_continuous_snapshot(
         on_demand_payload=on_demand_payload,
         request=on_demand_request,
