@@ -111,6 +111,14 @@ def _round_or_none(value: Optional[float], places: int = 4) -> Optional[float]:
     return round(value, places)
 
 
+
+
+def _decorate_why(why_text: Optional[str], market_closed_context: bool = False) -> str:
+    text_value = why_text or "unconfirmed"
+    if market_closed_context:
+        return f"{text_value} Market is closed right now, so no live entry can be taken."
+    return text_value
+
 def _build_price_zone(
     low: Optional[float],
     high: Optional[float],
