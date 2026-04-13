@@ -4433,10 +4433,21 @@ def _build_screened_best_context(
     engine_pick_reason = engine_pick.get("reason") if engine_pick else None
     engine_pick_verdict = engine_pick.get("final_verdict") if engine_pick else None
 
-    normalized_engine_best_ticker = selected.get("symbol")
+    selected_has_primary_candidate = bool(selected.get("primary_candidate"))
+    selected_reason_text = str(selected_reason or "").strip().lower()
+    no_candidate_markers = (
+        "no candidate available.",
+        "no candidate available",
+        "no feasible liquid candidates found",
+    )
+    normalized_engine_best_ticker = (
+        None
+        if (engine_best_ticker is None and not selected_has_primary_candidate and any(marker in selected_reason_text for marker in no_candidate_markers))
+        else selected.get("symbol")
+    )
     return {
         "ok": True,
-        "screened_best_ticker": selected.get("symbol"),
+        "screened_best_ticker": normalized_engine_best_ticker,
         "raw_engine_best_ticker": engine_best_ticker,
         "normalized_engine_best_ticker": normalized_engine_best_ticker,
         "engine_best_ticker": normalized_engine_best_ticker,
@@ -4545,6 +4556,32 @@ async def _screen_ticker_candidate(
     }
 
 
+def _normalized_selected_ticker(
+    selected: Optional[Dict[str, Any]],
+    summary_payload: Dict[str, Any],
+) -> Optional[str]:
+    raw_best_ticker = summary_payload.get("best_ticker")
+    if selected is None:
+        return raw_best_ticker
+
+    if selected.get("primary_candidate"):
+        return selected.get("symbol")
+
+    selected_reason = str(selected.get("reason") or "").strip().lower()
+    summary_reason = str(summary_payload.get("reason") or "").strip().lower()
+    no_candidate_markers = (
+        "no candidate available.",
+        "no candidate available",
+        "no feasible liquid candidates found",
+    )
+    if raw_best_ticker is None and any(marker in selected_reason for marker in no_candidate_markers):
+        return None
+    if raw_best_ticker is None and any(marker in summary_reason for marker in no_candidate_markers):
+        return None
+
+    return raw_best_ticker or selected.get("symbol")
+
+
 def _build_candidate_context(
     best_ticker: Optional[str],
     option_type: str,
@@ -4583,7 +4620,7 @@ def _build_candidate_context(
     options_structure = None
     wall_thesis_fit = None
     adx_filter = None
-    trap_check_context = None
+    trap_check_context = _build_trap_check_context(structure_context)
     trigger_scan = None
 
     if active:
@@ -4714,7 +4751,7 @@ def _build_candidate_context(
         "options_structure": options_structure if active else None,
         "wall_thesis_fit": wall_thesis_fit if active else None,
         "adx_filter": adx_filter if active else None,
-        "trap_check_context": trap_check_context if active else None,
+        "trap_check_context": trap_check_context,
         "trigger_scan": trigger_scan if active else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
@@ -5827,7 +5864,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         freeze_to_raw_engine=freeze_to_raw_engine,
     )
 
-    best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
+    best_ticker = _normalized_selected_ticker(
+        selected=selected,
+        summary_payload=summary_payload,
+    )
     raw_engine_status = summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
     engine_status = _normalize_top_level_status(final_verdict)
