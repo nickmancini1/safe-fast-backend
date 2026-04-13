@@ -1237,9 +1237,6 @@ def _market_context_now() -> Dict[str, Any]:
 
 
 def _time_day_gate(market_context: Dict[str, Any]) -> Dict[str, Any]:
-    now_et = datetime.fromisoformat(market_context["as_of_et"])
-    weekday = now_et.weekday()
-
     if not market_context.get("is_open"):
         return {
             "fresh_entry_allowed": False,
@@ -1247,27 +1244,9 @@ def _time_day_gate(market_context: Dict[str, Any]) -> Dict[str, Any]:
             "cutoff_et": None,
         }
 
-    if weekday <= 3:
-        cutoff = time(14, 0)
-        allowed = now_et.time() < cutoff
-        return {
-            "fresh_entry_allowed": allowed,
-            "reason": "within_time_window" if allowed else "past_monday_thursday_cutoff",
-            "cutoff_et": "14:00:00",
-        }
-
-    if weekday == 4:
-        cutoff = time(12, 0)
-        allowed = now_et.time() < cutoff
-        return {
-            "fresh_entry_allowed": allowed,
-            "reason": "within_time_window" if allowed else "past_friday_cutoff",
-            "cutoff_et": "12:00:00",
-        }
-
     return {
-        "fresh_entry_allowed": False,
-        "reason": "weekend",
+        "fresh_entry_allowed": True,
+        "reason": "within_time_window",
         "cutoff_et": None,
     }
 
@@ -3727,7 +3706,7 @@ def _build_checklist_block(
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
-        {"item": "early_enough", "yes": bool(time_day_gate.get("fresh_entry_allowed"))},
+        {"item": "early_enough", "yes": bool(structure_context.get("extension_blocks_now") is not True)},
         {"item": "clear_trigger", "yes": bool(trigger_state.get("trigger_present") is True)},
         {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
         {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
@@ -3737,7 +3716,7 @@ def _build_checklist_block(
 
     failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
     global_gate_failures: List[str] = []
-    if time_day_gate.get("fresh_entry_allowed") is False:
+    if market_context.get("is_open") is False:
         global_gate_failures.append("time_day_gate")
 
     effective_failed_items = list(failed_items)
@@ -3792,7 +3771,7 @@ def _failed_reason_messages(
         "twentyfour_hour_supportive": "24H context is not supportive",
         "one_hour_clean_around_ema": "1H structure around the 50 EMA is not clean",
         "clear_room": "room to the first wall fails",
-        "early_enough": "entry is outside the time/day window",
+        "early_enough": "entry is too late or overextended for SAFE-FAST",
         "clear_trigger": "no valid live trigger is present",
         "liquidity_ok": "options liquidity is too wide for a clean debit spread entry",
         "invalidation_clear": "invalidation is not clear",
@@ -3807,8 +3786,6 @@ def _failed_reason_messages(
 
     if not market_context.get("is_open"):
         reasons.insert(0, "market is closed")
-    elif time_day_gate.get("fresh_entry_allowed") is False and time_day_gate.get("reason") not in {"market_closed", None}:
-        reasons.insert(0, "fresh entry is outside the SAFE-FAST time/day window")
 
     if structure_context.get("extension_state") == "extended":
         reasons.append("move is extended versus the 1H 50 EMA")
@@ -4891,7 +4868,7 @@ def _build_two_path_block(
             "twentyfour_hour_supportive": "24H support",
             "one_hour_clean_around_ema": "clean 1H structure",
             "clear_room": "room pass",
-            "early_enough": "time window pass",
+            "early_enough": "early enough / not overextended",
             "clear_trigger": "live trigger",
             "liquidity_ok": "liquidity pass",
             "invalidation_clear": "clear invalidation",
@@ -5345,7 +5322,7 @@ def _build_on_demand_unavailable_payload(
     status_code: int = 503,
 ) -> Dict[str, Any]:
     reason_text = _coerce_error_reason(reason)
-    build_tag = "schema_patch_core_approval_requirements_effective_gate_2026_04_10"
+    build_tag = "time_gate_removed_continuous_readable_summary_2026_04_13"
     failed_reasons = [reason_text]
     primary_blocker = "data_unavailable"
 
@@ -6211,7 +6188,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "trap_check_context_additive_patch_2026_04_12",
+        "build_tag": "time_gate_removed_continuous_readable_summary_2026_04_13",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -6745,6 +6722,7 @@ def _build_continuous_snapshot(
         snapshot.get("current_state"),
         snapshot.get("latent_structure_state"),
     )
+    snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
 
 
@@ -6933,6 +6911,55 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     }
 
 
+def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    current_state = snapshot.get("current_state")
+    latent_structure_state = snapshot.get("latent_structure_state")
+    primary_blocker = snapshot.get("primary_blocker")
+    next_flip_needed = snapshot.get("next_flip_needed")
+    summary = snapshot.get("summary") or {}
+    time_gate_reason = snapshot.get("time_gate_reason")
+    market_open = snapshot.get("market_open")
+    decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
+    failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
+
+    underlying_state = current_state
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and latent_structure_state:
+        underlying_state = latent_structure_state
+
+    top_blockers: List[str] = []
+    if isinstance(primary_blocker, str) and primary_blocker.strip():
+        top_blockers.append(primary_blocker.strip())
+    for blocker in decision_blockers:
+        if blocker not in top_blockers:
+            top_blockers.append(blocker)
+        if len(top_blockers) >= 3:
+            break
+
+    summary_note = summary.get("why")
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
+        summary_note = f"{summary.get('why')} Underneath that, structure is still {underlying_state}."
+
+    return {
+        "ticker": summary.get("ticker"),
+        "good_idea_now": summary.get("good_idea_now"),
+        "action": summary.get("action"),
+        "setup_state": summary.get("setup_state"),
+        "now_state": current_state,
+        "underlying_state": underlying_state,
+        "primary_blocker": primary_blocker,
+        "next_flip_needed": next_flip_needed,
+        "top_blockers": top_blockers,
+        "trigger_present": snapshot.get("trigger_present"),
+        "trigger_reason": snapshot.get("trigger_reason"),
+        "structure_ready": snapshot.get("structure_ready"),
+        "market_open": market_open,
+        "time_gate_reason": time_gate_reason,
+        "why_now": summary_note,
+        "first_failed_reason": failed_reasons[0] if failed_reasons else None,
+        "invalidation": snapshot.get("invalidation"),
+    }
+
+
 async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
     profile_name = _sanitize_continuous_profile_name(request.profile_name)
     on_demand_request = _continuous_shadow_to_on_demand_request(request)
@@ -7016,6 +7043,8 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "state_file": state_file,
             "previous_snapshot_found": bool(previous_snapshot),
         },
+        "read_this_first": "readable_summary",
+        "readable_summary": current_snapshot.get("readable_summary"),
         "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
     }
     return _json_safe_for_response(response_payload)
