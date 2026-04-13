@@ -5291,6 +5291,33 @@ def _build_winner_shift_context_block(
         ),
     }
 
+
+
+def _json_safe_for_response(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe_for_response(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_for_response(item) for item in value]
+    if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+        try:
+            return _json_safe_for_response(value.model_dump())
+        except Exception:
+            return str(value)
+    if hasattr(value, "dict") and callable(getattr(value, "dict")):
+        try:
+            return _json_safe_for_response(value.dict())
+        except Exception:
+            return str(value)
+    return str(value)
+
 def _coerce_error_reason(value: Any) -> str:
     if value is None:
         return "Candidate engine unavailable for this run."
@@ -6961,7 +6988,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             },
         )
 
-    return {
+    response_payload = {
         "ok": bool(on_demand_payload.get("ok")),
         "mode": "continuous_shadow",
         "shadow_mode": "snapshot_compare_only",
@@ -6986,16 +7013,43 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         },
         "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
     }
+    return _json_safe_for_response(response_payload)
 
 
 @app.post("/safe-fast/continuous/shadow")
 async def safe_fast_continuous_shadow(request: ContinuousShadowRequest) -> Any:
-    return await _build_continuous_shadow_payload(request)
+    try:
+        return await _build_continuous_shadow_payload(request)
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_shadow",
+                "shadow_mode": "snapshot_compare_only",
+                "error_type": "continuous_shadow_runtime_error",
+                "reason": str(e),
+                "profile_name": _sanitize_continuous_profile_name(request.profile_name),
+                "request_profile": _model_dump(request),
+            }
+        )
 
 
 @app.get("/safe-fast/continuous/shadow/default")
 async def safe_fast_continuous_shadow_default() -> Any:
-    return await _build_continuous_shadow_payload(ContinuousShadowRequest())
+    try:
+        return await _build_continuous_shadow_payload(ContinuousShadowRequest())
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_shadow",
+                "shadow_mode": "snapshot_compare_only",
+                "error_type": "continuous_shadow_runtime_error",
+                "reason": str(e),
+                "profile_name": "default",
+                "request_profile": _model_dump(ContinuousShadowRequest()),
+            }
+        )
 
 def _default_on_demand_request() -> OnDemandRequest:
     return OnDemandRequest(
