@@ -4106,7 +4106,7 @@ def _build_decision_context_block(
             "final_verdict": final_verdict,
             "reason": normalized_reason,
         },
-        "primary_blocker": effective_primary_blocker,
+        "primary_blocker": primary_blocker,
         "blockers": effective_blockers,
         "failed_reasons": failed_reasons,
         "changed_from_raw_engine": (
