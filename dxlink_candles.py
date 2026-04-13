@@ -26,6 +26,10 @@ CANDLE_FIELDS = [
     "openInterest",
 ]
 
+# Deeper warmup reduces 50 EMA startup bias versus charting platforms that carry
+# substantially more history behind the indicator.
+EMA50_MIN_WARMUP_DAYS = 60
+
 
 def _iso_from_ms(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
@@ -206,8 +210,11 @@ async def get_1h_ema50_snapshot(
         user_agent=user_agent,
     )
 
-    candle_symbol = f"{symbol}{{=1h,tho=true}}"
-    from_time_ms = int((time.time() - (days_back * 24 * 60 * 60)) * 1000)
+    # Align 1H bars to the regular-session start (9:30 ET) instead of midnight/clock-hour.
+    candle_symbol = f"{symbol}{{=h,a=s,tho=true}}"
+
+    effective_days_back = max(int(days_back), EMA50_MIN_WARMUP_DAYS)
+    from_time_ms = int((time.time() - (effective_days_back * 24 * 60 * 60)) * 1000)
 
     seen_by_time: Dict[int, Dict[str, Any]] = {}
     last_raw_message: Optional[Dict[str, Any]] = None
@@ -343,6 +350,7 @@ async def get_1h_ema50_snapshot(
         "symbol": symbol,
         "candle_symbol": candle_symbol,
         "history_days_requested": days_back,
+        "history_days_effective": effective_days_back,
         "candle_count": len(candle_list),
         "ema_length": 50,
         "ema50_1h": ema50,
