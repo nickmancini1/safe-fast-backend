@@ -6408,7 +6408,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_replay_transition_profile_sandbox_2026_04_14",
+        "build_tag": "continuous_alert_stage_shadow_2026_04_14",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -7045,8 +7045,92 @@ def _build_continuous_snapshot(
     snapshot["replay_timestamp_et"] = replay_test_context.get("resolved_replay_timestamp_et")
     snapshot["replay_market_open"] = replay_test_context.get("replay_market_open")
     snapshot["replay_fresh_entry_allowed"] = replay_test_context.get("replay_fresh_entry_allowed")
+    snapshot["alert_candidate_context"] = _derive_continuous_alert_candidate_context(snapshot)
+    snapshot["alert_stage"] = snapshot["alert_candidate_context"].get("alert_stage")
+    snapshot["alert_reason"] = snapshot["alert_candidate_context"].get("alert_reason")
+    snapshot["alert_severity"] = snapshot["alert_candidate_context"].get("alert_severity")
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
+
+
+def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    decision_blockers = [str(item) for item in (snapshot.get("decision_blockers") or [])]
+    setup_type = snapshot.get("setup_type")
+    setup_allowed = _is_allowed_setup_type_name(setup_type)
+    trigger_present = bool(snapshot.get("trigger_present"))
+    approval_ready_now = bool(snapshot.get("approval_ready_now"))
+    approval_ready_on_completed_candle = bool(snapshot.get("approval_ready_on_completed_candle"))
+    invalidation_hit = bool(snapshot.get("invalidation_hit"))
+    market_open = bool(snapshot.get("market_open"))
+    fresh_entry_allowed = bool(snapshot.get("fresh_entry_allowed"))
+    next_flip_needed = snapshot.get("next_flip_needed")
+
+    hard_blockers = {"allowed_setup_type", "clear_room", "early_enough"}
+    hard_blockers_active = [item for item in decision_blockers if item in hard_blockers]
+    trigger_path_open = (
+        setup_allowed
+        and market_open
+        and fresh_entry_allowed
+        and not hard_blockers_active
+    )
+    pre_alert_gates = {"clear_trigger", "trigger_present", "structure_ready"}
+    waiting_on_last_gates = bool(trigger_path_open and next_flip_needed in pre_alert_gates)
+
+    if invalidation_hit:
+        alert_stage = "EXIT_NOW"
+        alert_reason = "Invalidation hit."
+        should_alert_candidate = True
+        alert_severity = "high"
+    elif approval_ready_now:
+        alert_stage = "APPROVAL_READY_NOW"
+        alert_reason = "SAFE-FAST approval is ready intrabar."
+        should_alert_candidate = True
+        alert_severity = "high"
+    elif approval_ready_on_completed_candle:
+        alert_stage = "APPROVAL_READY_ON_COMPLETED_CANDLE"
+        alert_reason = "SAFE-FAST approval is ready on the completed candle."
+        should_alert_candidate = True
+        alert_severity = "high"
+    elif trigger_present and trigger_path_open:
+        alert_stage = "TRIGGER_PRESENT_WAITING_APPROVAL"
+        alert_reason = "Trigger is present and only final approval gates remain."
+        should_alert_candidate = True
+        alert_severity = "medium"
+    elif waiting_on_last_gates:
+        alert_stage = "SETUP_POTENTIALLY_FORMING"
+        alert_reason = "Setup is allowed and nearing trigger readiness."
+        should_alert_candidate = True
+        alert_severity = "medium"
+    else:
+        alert_stage = "TRACK_ONLY"
+        if not market_open or not fresh_entry_allowed:
+            alert_reason = "Entry window is closed."
+        elif not setup_allowed:
+            alert_reason = "Setup type is not one of the 3 allowed SAFE-FAST routes."
+        elif hard_blockers_active:
+            alert_reason = f"Hard blockers still active: {', '.join(hard_blockers_active)}."
+        else:
+            alert_reason = "No alert-worthy continuous setup state yet."
+        should_alert_candidate = False
+        alert_severity = "info"
+
+    return {
+        "ok": True,
+        "alert_stage": alert_stage,
+        "alert_reason": alert_reason,
+        "alert_severity": alert_severity,
+        "should_alert_candidate": should_alert_candidate,
+        "setup_allowed": setup_allowed,
+        "hard_blockers_active": hard_blockers_active,
+        "trigger_path_open": trigger_path_open,
+        "waiting_on_last_gates": waiting_on_last_gates,
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "trigger_present": trigger_present,
+        "approval_ready_now": approval_ready_now,
+        "approval_ready_on_completed_candle": approval_ready_on_completed_candle,
+        "next_flip_needed": next_flip_needed,
+    }
 
 
 def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -7071,6 +7155,8 @@ def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]
         "replay_trade_allowed",
         "replay_market_open",
         "replay_fresh_entry_allowed",
+        "alert_stage",
+        "alert_reason",
     ]
     changes: Dict[str, Dict[str, Any]] = {}
     for field in tracked_fields:
@@ -7200,6 +7286,8 @@ def _continuous_transition_fingerprint(
         "replay_trade_allowed": current_snapshot.get("replay_trade_allowed"),
         "replay_market_open": current_snapshot.get("replay_market_open"),
         "replay_fresh_entry_allowed": current_snapshot.get("replay_fresh_entry_allowed"),
+        "alert_stage": current_snapshot.get("alert_stage"),
+        "alert_reason": current_snapshot.get("alert_reason"),
     }
     return hashlib.sha1(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -7224,6 +7312,8 @@ def _build_true_transition_context(
         "replay_trade_allowed",
         "replay_market_open",
         "replay_fresh_entry_allowed",
+        "alert_stage",
+        "alert_reason",
     ]
 
     if not previous:
@@ -7383,6 +7473,27 @@ def _build_true_transition_context(
             summary="Replay time gate changed.",
         )
 
+    if (
+        previous.get("alert_stage") != current.get("alert_stage")
+        or previous.get("alert_reason") != current.get("alert_reason")
+    ):
+        current_alert_context = current.get("alert_candidate_context") or {}
+        _add_event(
+            "ALERT_STAGE_CHANGED",
+            previous_value={
+                "alert_stage": previous.get("alert_stage"),
+                "alert_reason": previous.get("alert_reason"),
+            },
+            current_value={
+                "alert_stage": current.get("alert_stage"),
+                "alert_reason": current.get("alert_reason"),
+            },
+            severity=current_alert_context.get("alert_severity") or "medium",
+            summary=(
+                f"Alert stage changed from {previous.get('alert_stage')} to {current.get('alert_stage')}."
+            ),
+        )
+
     transition_detected = bool(events)
     if not transition_detected:
         transition_type = "NO_TRUE_TRANSITION"
@@ -7406,7 +7517,10 @@ def _build_true_transition_context(
         "transition_type": transition_type,
         "severity": severity,
         "meaningful_transition": transition_detected,
-        "should_alert_candidate": transition_detected,
+        "should_alert_candidate": bool(
+            transition_detected
+            and ((current.get("alert_candidate_context") or {}).get("should_alert_candidate"))
+        ),
         "transition_detected": transition_detected,
         "summary": summary,
         "primary_event": primary_event,
@@ -7427,6 +7541,7 @@ def _build_continuous_alert_payload(
         return None
 
     summary = current_snapshot.get("summary") or {}
+    alert_candidate_context = current_snapshot.get("alert_candidate_context") or {}
     return {
         "should_alert": should_alert,
         "transition_type": transition_summary.get("transition_type"),
@@ -7434,10 +7549,18 @@ def _build_continuous_alert_payload(
         "message": transition_summary.get("summary"),
         "ticker": summary.get("ticker"),
         "state": current_snapshot.get("current_state"),
+        "alert_stage": current_snapshot.get("alert_stage"),
+        "alert_reason": current_snapshot.get("alert_reason"),
         "primary_blocker": current_snapshot.get("primary_blocker"),
         "next_flip_needed": current_snapshot.get("next_flip_needed"),
         "good_idea_now": summary.get("good_idea_now"),
         "action": summary.get("action"),
+        "market_open": current_snapshot.get("market_open"),
+        "fresh_entry_allowed": current_snapshot.get("fresh_entry_allowed"),
+        "trigger_present": current_snapshot.get("trigger_present"),
+        "approval_ready_now": current_snapshot.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": current_snapshot.get("approval_ready_on_completed_candle"),
+        "should_alert_candidate": alert_candidate_context.get("should_alert_candidate"),
     }
 
 
@@ -7538,6 +7661,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_test_enabled": replay_test_context.get("enabled"),
         "replay_trade_allowed": replay_test_context.get("replay_trade_allowed"),
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
+        "alert_stage": snapshot.get("alert_stage"),
+        "alert_reason": snapshot.get("alert_reason"),
         "why_now": summary_note,
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "invalidation": snapshot.get("invalidation"),
@@ -7646,6 +7771,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "canonical_on_demand_post": "/safe-fast/on-demand",
         },
         "readable_summary": current_snapshot.get("readable_summary"),
+        "alert_candidate_context": current_snapshot.get("alert_candidate_context"),
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
         "replay_test_context": current_snapshot.get("replay_test_context"),
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
