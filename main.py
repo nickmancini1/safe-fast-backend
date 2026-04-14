@@ -6552,7 +6552,7 @@ def health() -> Dict[str, bool]:
     return {"ok": True}
 
 
-@app.get("/tt/safe-fast-summary-compact")
+@app.get("/tt/safe-fast-summary-compact", include_in_schema=False)
 async def tt_safe_fast_summary_compact(
     option_type: str = Query("C"),
     min_dte: int = Query(14),
@@ -6581,7 +6581,7 @@ async def tt_safe_fast_summary_compact(
     )
 
 
-@app.get("/tt/safe-fast-chart-check")
+@app.get("/tt/safe-fast-chart-check", include_in_schema=False)
 async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
     clean_symbol = _clean_symbol(symbol)
     token = await get_access_token()
@@ -7716,12 +7716,12 @@ def _default_on_demand_request() -> OnDemandRequest:
     )
 
 
-@app.get("/safe-fast/on-demand/default")
+@app.get("/safe-fast/on-demand/default", include_in_schema=False)
 async def safe_fast_on_demand_default() -> Any:
     return await _build_on_demand_payload(_default_on_demand_request())
 
 
-@app.get("/safe-fast/on-demand/default/simple")
+@app.get("/safe-fast/on-demand/default/simple", include_in_schema=False)
 async def safe_fast_on_demand_default_simple() -> Any:
     payload = await _build_on_demand_payload(_default_on_demand_request())
     return {
