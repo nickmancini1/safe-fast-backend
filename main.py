@@ -6745,7 +6745,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_forming_alerts_live_watch_2026_04_14",
+        "build_tag": "continuous_alert_first_watch_2026_04_14",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -7324,7 +7324,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_forming_alerts_live_watch_2026_04_14",
+        "build_tag": "continuous_alert_first_watch_2026_04_14",
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
@@ -8753,6 +8753,179 @@ async def safe_fast_continuous_monitor_default_simple() -> Any:
             }
         )
 
+
+
+_CONTINUOUS_ALERT_KIND_PRIORITY = {
+    "forming_setup": 0,
+    "state_transition": 1,
+    "profile_divergence": 2,
+}
+
+
+def _continuous_alert_sort_key(alert: Dict[str, Any]) -> tuple:
+    alert_kind = str(alert.get("alert_kind") or alert.get("alert_type") or "")
+    severity = str(alert.get("severity") or "info").lower()
+    severity_rank = {"high": 0, "medium": 1, "low": 2, "info": 3}.get(severity, 4)
+    lane = str(alert.get("alert_lane") or "")
+    lane_rank = 0 if lane == "current_profile" else 1
+    priority = _CONTINUOUS_ALERT_KIND_PRIORITY.get(alert_kind, 99)
+    ticker = str(alert.get("ticker") or "")
+    return (priority, severity_rank, lane_rank, ticker)
+
+
+def _continuous_primary_alert(alerts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not alerts:
+        return None
+    ordered = sorted((a for a in alerts if isinstance(a, dict)), key=_continuous_alert_sort_key)
+    return ordered[0] if ordered else None
+
+
+def _build_continuous_watch_summary(monitor_payload: Dict[str, Any]) -> Dict[str, Any]:
+    monitor_summary = monitor_payload.get("monitor_summary") or {}
+    alerts = monitor_payload.get("alerts") or []
+    primary_alert = _continuous_primary_alert(alerts)
+    default_lane = monitor_payload.get("default_lane") or {}
+    replay_lane = monitor_payload.get("replay_lane") or {}
+    default_live_summary = default_lane.get("live_summary") or {}
+    replay_live_summary = replay_lane.get("live_summary") or {}
+    paired_transition = monitor_payload.get("paired_profile_transition_context") or {}
+    replay_context = monitor_payload.get("replay_test_context") or {}
+
+    return {
+        "watch_status": "ALERT" if alerts else "NO_ALERT",
+        "alert_count": len(alerts),
+        "primary_alert_kind": (primary_alert or {}).get("alert_kind") or (primary_alert or {}).get("alert_type"),
+        "primary_alert_message": (primary_alert or {}).get("message") or (primary_alert or {}).get("summary"),
+        "primary_alert_ticker": (primary_alert or {}).get("ticker"),
+        "ticker": monitor_summary.get("ticker") or default_live_summary.get("ticker"),
+        "good_idea_now": monitor_summary.get("good_idea_now") or default_live_summary.get("good_idea_now"),
+        "action": monitor_summary.get("action") or default_live_summary.get("action"),
+        "setup_state": monitor_summary.get("setup_state") or default_live_summary.get("setup_state"),
+        "default_now_state": monitor_summary.get("default_now_state") or default_live_summary.get("now_state"),
+        "default_primary_blocker": monitor_summary.get("default_primary_blocker") or default_live_summary.get("primary_blocker"),
+        "default_next_flip_needed": monitor_summary.get("default_next_flip_needed") or default_live_summary.get("next_flip_needed"),
+        "default_forming_status": monitor_summary.get("default_forming_status") or default_live_summary.get("forming_status"),
+        "default_forming_type": monitor_summary.get("default_forming_type") or default_live_summary.get("forming_type"),
+        "default_forming_summary": monitor_summary.get("default_forming_summary") or default_live_summary.get("forming_summary"),
+        "default_market_open": monitor_summary.get("default_market_open") or default_live_summary.get("market_open"),
+        "default_why_now": default_live_summary.get("why_now"),
+        "replay_profile_enabled": bool(monitor_summary.get("replay_profile_enabled") or replay_lane),
+        "replay_trade_allowed": monitor_summary.get("replay_trade_allowed"),
+        "replay_timestamp_et": monitor_summary.get("replay_timestamp_et"),
+        "replay_forming_status": monitor_summary.get("replay_forming_status") or replay_live_summary.get("forming_status"),
+        "replay_forming_type": monitor_summary.get("replay_forming_type") or replay_live_summary.get("forming_type"),
+        "replay_why_now": monitor_summary.get("replay_effective_why") or replay_live_summary.get("why_now"),
+        "paired_profile_transition_type": monitor_summary.get("paired_profile_transition_type") or paired_transition.get("transition_type"),
+        "paired_profile_should_alert": bool(monitor_summary.get("paired_profile_should_alert") or paired_transition.get("should_alert")),
+        "paired_profile_summary": monitor_summary.get("paired_profile_summary") or paired_transition.get("summary"),
+        "replay_compare_takeaway": monitor_summary.get("replay_compare_takeaway") or replay_context.get("replay_takeaway"),
+    }
+
+
+async def _build_continuous_watch_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
+    monitor_payload = await _build_continuous_monitor_payload(request)
+    alerts = monitor_payload.get("alerts") or []
+    primary_alert = _continuous_primary_alert(alerts)
+    watch_summary = _build_continuous_watch_summary(monitor_payload)
+
+    return _json_safe_for_response(
+        {
+            "ok": monitor_payload.get("ok"),
+            "mode": "continuous_watch",
+            "watch_mode": "alert_first",
+            "build_tag": monitor_payload.get("build_tag"),
+            "source_of_truth": monitor_payload.get("source_of_truth"),
+            "profile_name": monitor_payload.get("profile_name"),
+            "base_profile_key": monitor_payload.get("base_profile_key"),
+            "default_profile_key": monitor_payload.get("default_profile_key"),
+            "replay_profile_key": monitor_payload.get("replay_profile_key"),
+            "replay_profile_active": monitor_payload.get("replay_profile_active"),
+            "should_alert": bool(alerts),
+            "alert_count": len(alerts),
+            "primary_alert": primary_alert,
+            "alerts": alerts,
+            "read_this_first": "watch_summary",
+            "watch_summary": watch_summary,
+            "monitor_summary": monitor_payload.get("monitor_summary"),
+            "paired_profile_transition_context": monitor_payload.get("paired_profile_transition_context"),
+            "paired_profile_context": monitor_payload.get("paired_profile_context"),
+            "replay_test_context": monitor_payload.get("replay_test_context"),
+            "default_lane": monitor_payload.get("default_lane"),
+            "replay_lane": monitor_payload.get("replay_lane"),
+        }
+    )
+
+
+@app.post("/safe-fast/continuous/watch")
+async def safe_fast_continuous_watch(request: ContinuousShadowRequest) -> Any:
+    try:
+        return await _build_continuous_watch_payload(request)
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_watch",
+                "watch_mode": "alert_first",
+                "error_type": "continuous_watch_runtime_error",
+                "reason": str(e),
+                "profile_name": _sanitize_continuous_profile_name(request.profile_name),
+                "request_profile": _model_dump(request),
+            }
+        )
+
+
+@app.get("/safe-fast/continuous/watch/default")
+async def safe_fast_continuous_watch_default() -> Any:
+    try:
+        return await _build_continuous_watch_payload(ContinuousShadowRequest())
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_watch",
+                "watch_mode": "alert_first",
+                "error_type": "continuous_watch_runtime_error",
+                "reason": str(e),
+                "profile_name": "default",
+                "request_profile": _model_dump(ContinuousShadowRequest()),
+            }
+        )
+
+
+@app.get("/safe-fast/continuous/watch/default/simple")
+async def safe_fast_continuous_watch_default_simple() -> Any:
+    try:
+        payload = await _build_continuous_watch_payload(ContinuousShadowRequest())
+        return _json_safe_for_response(
+            {
+                "ok": payload.get("ok"),
+                "mode": payload.get("mode"),
+                "watch_mode": payload.get("watch_mode"),
+                "build_tag": payload.get("build_tag"),
+                "profile_name": payload.get("profile_name"),
+                "base_profile_key": payload.get("base_profile_key"),
+                "default_profile_key": payload.get("default_profile_key"),
+                "replay_profile_key": payload.get("replay_profile_key"),
+                "replay_profile_active": payload.get("replay_profile_active"),
+                "should_alert": payload.get("should_alert"),
+                "alert_count": payload.get("alert_count"),
+                "primary_alert": payload.get("primary_alert"),
+                "read_this_first": payload.get("read_this_first"),
+                "watch_summary": payload.get("watch_summary"),
+            }
+        )
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_watch",
+                "watch_mode": "alert_first",
+                "error_type": "continuous_watch_runtime_error",
+                "reason": str(e),
+                "profile_name": "default",
+                "request_profile": _model_dump(ContinuousShadowRequest()),
+            }
+        )
 
 
 def _default_on_demand_request() -> OnDemandRequest:
