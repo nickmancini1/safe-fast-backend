@@ -6875,6 +6875,7 @@ def _build_continuous_snapshot(
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
         "time_gate_reason": time_day_gate.get("reason"),
         "time_day_gate": time_day_gate,
+        "setup_type": market_closed_tester.get("setup_type"),
         "summary": {
             "ticker": simple_output.get("ticker"),
             "action": simple_output.get("action"),
@@ -6898,6 +6899,7 @@ def _build_continuous_snapshot(
         snapshot.get("current_state"),
         snapshot.get("latent_structure_state"),
     )
+    snapshot["invalidation_hit"] = snapshot.get("current_state") == "EXIT_NOW"
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
 
@@ -7026,6 +7028,164 @@ def _continuous_transition_fingerprint(
     return hashlib.sha1(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _build_true_transition_context(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+) -> Dict[str, Any]:
+    watched_fields = [
+        "best_ticker",
+        "primary_blocker",
+        "setup_type",
+        "trigger_present",
+        "approval_ready_now",
+        "approval_ready_on_completed_candle",
+        "current_state",
+        "invalidation_hit",
+    ]
+
+    if not previous:
+        return {
+            "ok": True,
+            "transition_type": "INITIAL_SNAPSHOT",
+            "severity": "info",
+            "meaningful_transition": False,
+            "should_alert_candidate": False,
+            "transition_detected": False,
+            "summary": "Initial shadow snapshot created.",
+            "primary_event": None,
+            "events": [],
+            "watched_fields": watched_fields,
+            "changed_fields": {},
+        }
+
+    events: List[Dict[str, Any]] = []
+    changed_fields: Dict[str, Dict[str, Any]] = {}
+
+    def _add_event(
+        event: str,
+        *,
+        previous_value: Any,
+        current_value: Any,
+        severity: str,
+        summary: str,
+    ) -> None:
+        events.append(
+            {
+                "event": event,
+                "previous": previous_value,
+                "current": current_value,
+                "severity": severity,
+                "summary": summary,
+            }
+        )
+        changed_fields[event] = {"previous": previous_value, "current": current_value}
+
+    prev_invalidated = bool(previous.get("invalidation_hit") or previous.get("current_state") == "EXIT_NOW")
+    curr_invalidated = bool(current.get("invalidation_hit") or current.get("current_state") == "EXIT_NOW")
+    if not prev_invalidated and curr_invalidated:
+        _add_event(
+            "INVALIDATION_HIT",
+            previous_value=previous.get("current_state"),
+            current_value=current.get("current_state"),
+            severity="high",
+            summary="Invalidation hit. Exit now.",
+        )
+
+    prev_approval_ready = bool(
+        previous.get("approval_ready_now") or previous.get("approval_ready_on_completed_candle")
+    )
+    curr_approval_ready = bool(
+        current.get("approval_ready_now") or current.get("approval_ready_on_completed_candle")
+    )
+    if not prev_approval_ready and curr_approval_ready:
+        approval_mode = "intrabar" if current.get("approval_ready_now") else "completed_candle"
+        _add_event(
+            "APPROVAL_BECAME_READY",
+            previous_value=prev_approval_ready,
+            current_value=approval_mode,
+            severity="high",
+            summary=f"Approval became ready on {approval_mode}.",
+        )
+
+    if previous.get("best_ticker") != current.get("best_ticker"):
+        _add_event(
+            "WINNER_CHANGED",
+            previous_value=previous.get("best_ticker"),
+            current_value=current.get("best_ticker"),
+            severity="medium",
+            summary=f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')}.",
+        )
+
+    if previous.get("primary_blocker") != current.get("primary_blocker"):
+        _add_event(
+            "PRIMARY_BLOCKER_CHANGED",
+            previous_value=previous.get("primary_blocker"),
+            current_value=current.get("primary_blocker"),
+            severity="medium",
+            summary=(
+                f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}."
+            ),
+        )
+
+    if previous.get("setup_type") != current.get("setup_type"):
+        _add_event(
+            "SETUP_TYPE_CHANGED",
+            previous_value=previous.get("setup_type"),
+            current_value=current.get("setup_type"),
+            severity="medium",
+            summary=f"Setup type changed from {previous.get('setup_type')} to {current.get('setup_type')}.",
+        )
+
+    if previous.get("trigger_present") is not True and current.get("trigger_present") is True:
+        _add_event(
+            "TRIGGER_APPEARED",
+            previous_value=previous.get("trigger_present"),
+            current_value=current.get("trigger_present"),
+            severity="medium",
+            summary="Trigger appeared.",
+        )
+    elif previous.get("trigger_present") is True and current.get("trigger_present") is not True:
+        _add_event(
+            "TRIGGER_DISAPPEARED",
+            previous_value=previous.get("trigger_present"),
+            current_value=current.get("trigger_present"),
+            severity="medium",
+            summary="Trigger disappeared.",
+        )
+
+    transition_detected = bool(events)
+    if not transition_detected:
+        transition_type = "NO_TRUE_TRANSITION"
+        severity = "info"
+        summary = "No true transition."
+        primary_event = None
+    elif len(events) == 1:
+        transition_type = events[0]["event"]
+        severity = events[0]["severity"]
+        summary = events[0]["summary"]
+        primary_event = events[0]["event"]
+    else:
+        transition_type = "MULTIPLE_TRUE_TRANSITIONS"
+        highest = {"info": 0, "medium": 1, "high": 2}
+        severity = max((event["severity"] for event in events), key=lambda x: highest.get(x, 0))
+        summary = " | ".join(event["summary"] for event in events)
+        primary_event = events[0]["event"]
+
+    return {
+        "ok": True,
+        "transition_type": transition_type,
+        "severity": severity,
+        "meaningful_transition": transition_detected,
+        "should_alert_candidate": transition_detected,
+        "transition_detected": transition_detected,
+        "summary": summary,
+        "primary_event": primary_event,
+        "events": events,
+        "watched_fields": watched_fields,
+        "changed_fields": changed_fields,
+    }
 
 
 def _build_continuous_alert_payload(
@@ -7168,27 +7328,28 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         profile_key=profile_key,
     )
     transition_summary = _compare_continuous_snapshots(previous_snapshot, current_snapshot)
+    true_transition_context = _build_true_transition_context(previous_snapshot, current_snapshot)
     transition_fingerprint = _continuous_transition_fingerprint(
         current_snapshot=current_snapshot,
-        transition_summary=transition_summary,
+        transition_summary=true_transition_context,
     )
 
     last_alert_fingerprint = stored_state.get("last_alert_fingerprint")
     deduped = bool(
         previous_snapshot
-        and transition_summary.get("should_alert_candidate")
+        and true_transition_context.get("should_alert_candidate")
         and transition_fingerprint == last_alert_fingerprint
     )
     should_alert = bool(
         previous_snapshot
-        and transition_summary.get("should_alert_candidate")
+        and true_transition_context.get("should_alert_candidate")
         and not deduped
     )
 
     alert_payload = _build_continuous_alert_payload(
         previous_snapshot=previous_snapshot,
         current_snapshot=current_snapshot,
-        transition_summary=transition_summary,
+        transition_summary=true_transition_context,
         should_alert=should_alert,
     )
 
@@ -7206,6 +7367,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
                 "latest_snapshot": current_snapshot,
                 "previous_snapshot": previous_snapshot,
                 "last_transition": transition_summary,
+                "last_true_transition": true_transition_context,
                 "last_transition_fingerprint": transition_fingerprint,
                 "last_alert_fingerprint": transition_fingerprint if should_alert else last_alert_fingerprint,
                 "last_alert_timestamp": current_snapshot.get("timestamp_et") if should_alert else stored_state.get("last_alert_timestamp"),
@@ -7224,6 +7386,12 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "previous_snapshot": previous_snapshot,
         "transition_summary": {
             **transition_summary,
+            "should_alert": should_alert,
+            "deduped": deduped,
+            "transition_fingerprint": transition_fingerprint,
+        },
+        "true_transition_context": {
+            **true_transition_context,
             "should_alert": should_alert,
             "deduped": deduped,
             "transition_fingerprint": transition_fingerprint,
