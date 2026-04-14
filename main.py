@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# fresh full main.py build with canonical continuous live minimal route surface 2026-04-14T06:20:00Z
+# fresh full main.py build with entry_context bridge 2026-04-09T16:05:00Z
 
 import asyncio
 
@@ -23,10 +23,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.10")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.5")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.10"
+USER_AGENT = "safe-fast-backend/1.8.5"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1381,410 +1381,6 @@ def _build_replay_test_context(
         "would_be_trade_if_open": would_be_trade_if_open,
         "replay_trade_allowed": replay_trade_allowed,
         "replay_takeaway": replay_takeaway,
-    }
-
-
-def _build_replay_compare_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    replay_test_context = snapshot.get("replay_test_context") or {}
-    live_market_open = snapshot.get("market_open")
-    live_fresh_entry_allowed = snapshot.get("fresh_entry_allowed")
-    replay_enabled = bool(replay_test_context.get("enabled"))
-
-    if not replay_enabled:
-        return {
-            "ok": True,
-            "enabled": False,
-            "status": "disabled",
-            "effective_user_facing_why": snapshot.get("user_facing_why"),
-            "effective_why_now": (snapshot.get("readable_summary") or {}).get("why_now"),
-        }
-
-    replay_market_open = replay_test_context.get("replay_market_open")
-    replay_fresh_entry_allowed = replay_test_context.get("replay_fresh_entry_allowed")
-    replay_trade_allowed = replay_test_context.get("replay_trade_allowed")
-    structural_verdict = replay_test_context.get("underlying_structural_verdict")
-    primary_blocker = replay_test_context.get("underlying_structural_primary_blocker") or snapshot.get("primary_blocker")
-    structural_blockers = _ordered_unique_strings(
-        replay_test_context.get("underlying_structural_blockers")
-        or snapshot.get("decision_blockers")
-        or []
-    )
-
-    changed_fields: List[str] = []
-    if live_market_open != replay_market_open:
-        changed_fields.append("market_open")
-    if live_fresh_entry_allowed != replay_fresh_entry_allowed:
-        changed_fields.append("fresh_entry_allowed")
-
-    if replay_trade_allowed is True:
-        effective_user_facing_why = (
-            "Replay time is inside the regular session and inside the entry window. "
-            "This frozen baseline would qualify there."
-        )
-    elif replay_market_open is False:
-        effective_user_facing_why = (
-            "Replay time is outside the regular session, so entry would still be blocked there."
-        )
-    elif structural_verdict == "NO_TRADE":
-        blocker_text = f" Primary blocker: {primary_blocker}." if primary_blocker else ""
-        effective_user_facing_why = (
-            "Replay time is inside the entry window, but the frozen structural baseline still fails SAFE-FAST."
-            f"{blocker_text}"
-        )
-    else:
-        effective_user_facing_why = (
-            "Replay time is inside the entry window, but approval would still not be ready from the frozen baseline."
-        )
-
-    if replay_market_open is True and live_market_open is False:
-        compare_takeaway = (
-            "Replay flips the time/day gate open, but the structural baseline still does not approve a trade."
-        )
-    elif replay_trade_allowed is True:
-        compare_takeaway = "Replay would allow the trade while live right now would not."
-    else:
-        compare_takeaway = replay_test_context.get("replay_takeaway")
-
-    return {
-        "ok": True,
-        "enabled": True,
-        "status": "ready",
-        "changed_fields": changed_fields,
-        "live_market_open": live_market_open,
-        "live_fresh_entry_allowed": live_fresh_entry_allowed,
-        "replay_market_open": replay_market_open,
-        "replay_fresh_entry_allowed": replay_fresh_entry_allowed,
-        "replay_trade_allowed": replay_trade_allowed,
-        "underlying_structural_verdict": structural_verdict,
-        "underlying_structural_primary_blocker": primary_blocker,
-        "underlying_structural_blockers": structural_blockers,
-        "effective_user_facing_why": effective_user_facing_why,
-        "effective_why_now": effective_user_facing_why,
-        "compare_takeaway": compare_takeaway,
-    }
-
-
-
-def _build_effective_profile_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    replay_profile_active = bool(snapshot.get("replay_profile_active"))
-    replay_test_context = snapshot.get("replay_test_context") or {}
-    replay_compare_context = snapshot.get("replay_compare_context") or {}
-
-    live_market_open = snapshot.get("market_open")
-    live_fresh_entry_allowed = snapshot.get("fresh_entry_allowed")
-    live_time_gate_reason = snapshot.get("time_gate_reason")
-    live_trigger_present = snapshot.get("trigger_present")
-    live_trigger_reason = snapshot.get("trigger_reason")
-
-    if not replay_profile_active:
-        return {
-            "ok": True,
-            "profile_view": "live",
-            "market_open": live_market_open,
-            "fresh_entry_allowed": live_fresh_entry_allowed,
-            "time_gate_reason": live_time_gate_reason,
-            "trigger_present": live_trigger_present,
-            "trigger_reason": live_trigger_reason,
-            "user_facing_why": replay_compare_context.get("effective_user_facing_why") or snapshot.get("user_facing_why"),
-        }
-
-    replay_enabled = bool(replay_test_context.get("enabled"))
-    replay_market_open = replay_test_context.get("replay_market_open")
-    replay_fresh_entry_allowed = replay_test_context.get("replay_fresh_entry_allowed")
-    replay_time_day_gate = replay_test_context.get("replay_time_day_gate") or {}
-
-    effective_market_open = replay_market_open if replay_enabled else live_market_open
-    effective_fresh_entry_allowed = (
-        replay_fresh_entry_allowed if replay_enabled else live_fresh_entry_allowed
-    )
-    effective_time_gate_reason = (
-        replay_time_day_gate.get("reason") if replay_enabled else live_time_gate_reason
-    )
-
-    if replay_enabled and replay_market_open is False:
-        effective_trigger_reason = replay_time_day_gate.get("reason") or "replay_market_closed"
-    elif replay_enabled and replay_fresh_entry_allowed is False:
-        effective_trigger_reason = replay_time_day_gate.get("reason") or "replay_time_gate_blocked"
-    elif replay_enabled and replay_test_context.get("replay_trade_allowed") is True:
-        effective_trigger_reason = "replay_trade_allowed"
-    elif replay_enabled:
-        effective_trigger_reason = "replay_structure_blocked"
-    else:
-        effective_trigger_reason = live_trigger_reason
-
-    effective_trigger_present = bool(live_trigger_present)
-    effective_user_facing_why = (
-        replay_compare_context.get("effective_user_facing_why")
-        or snapshot.get("effective_user_facing_why")
-        or snapshot.get("user_facing_why")
-    )
-
-    return {
-        "ok": True,
-        "profile_view": "replay",
-        "market_open": effective_market_open,
-        "fresh_entry_allowed": effective_fresh_entry_allowed,
-        "time_gate_reason": effective_time_gate_reason,
-        "trigger_present": effective_trigger_present,
-        "trigger_reason": effective_trigger_reason,
-        "user_facing_why": effective_user_facing_why,
-    }
-
-
-def _build_paired_profile_context(
-    current_snapshot: Dict[str, Any],
-    sibling_snapshot: Optional[Dict[str, Any]],
-    current_profile_key: str,
-    sibling_profile_key: str,
-    replay_profile_active: bool,
-) -> Dict[str, Any]:
-    if not sibling_snapshot:
-        return {
-            "ok": True,
-            "available": False,
-            "status": "unavailable",
-            "current_profile_key": current_profile_key,
-            "sibling_profile_key": sibling_profile_key,
-            "current_replay_profile_active": replay_profile_active,
-            "sibling_replay_profile_active": not replay_profile_active,
-            "why": "no_sibling_snapshot_found",
-        }
-
-    watched_fields = [
-        "current_state",
-        "primary_blocker",
-        "setup_type",
-        "trigger_present",
-        "approval_ready_now",
-        "approval_ready_on_completed_candle",
-        "invalidation_hit",
-        "replay_test_enabled",
-        "replay_trade_allowed",
-        "replay_market_open",
-        "replay_fresh_entry_allowed",
-    ]
-    changed_fields: Dict[str, Dict[str, Any]] = {}
-    for field in watched_fields:
-        current_value = current_snapshot.get(field)
-        sibling_value = sibling_snapshot.get(field)
-        if current_value != sibling_value:
-            changed_fields[field] = {
-                "current": current_value,
-                "sibling": sibling_value,
-            }
-
-    current_readable = current_snapshot.get("readable_summary") or {}
-    sibling_readable = sibling_snapshot.get("readable_summary") or {}
-
-    if changed_fields:
-        pair_takeaway = (
-            "Live and replay profile lanes are now isolated. Use this block to compare the two persisted summaries side by side."
-        )
-    else:
-        pair_takeaway = "Live and replay profile lanes currently agree on all watched fields."
-
-    return {
-        "ok": True,
-        "available": True,
-        "status": "ready",
-        "current_profile_key": current_profile_key,
-        "sibling_profile_key": sibling_profile_key,
-        "current_replay_profile_active": replay_profile_active,
-        "sibling_replay_profile_active": not replay_profile_active,
-        "changed_fields": changed_fields,
-        "watched_fields": watched_fields,
-        "pair_takeaway": pair_takeaway,
-        "current": {
-            "profile_key": current_profile_key,
-            "timestamp_et": current_snapshot.get("timestamp_et"),
-            "replay_profile_active": replay_profile_active,
-            "market_open": current_snapshot.get("market_open"),
-            "fresh_entry_allowed": current_snapshot.get("fresh_entry_allowed"),
-            "replay_test_enabled": current_snapshot.get("replay_test_enabled"),
-            "replay_timestamp_et": current_snapshot.get("replay_timestamp_et"),
-            "replay_trade_allowed": current_snapshot.get("replay_trade_allowed"),
-            "current_state": current_snapshot.get("current_state"),
-            "primary_blocker": current_snapshot.get("primary_blocker"),
-            "effective_user_facing_why": current_snapshot.get("effective_user_facing_why"),
-            "readable_summary": current_readable,
-        },
-        "sibling": {
-            "profile_key": sibling_profile_key,
-            "timestamp_et": sibling_snapshot.get("timestamp_et"),
-            "replay_profile_active": bool(sibling_snapshot.get("replay_profile_active")),
-            "market_open": sibling_snapshot.get("market_open"),
-            "fresh_entry_allowed": sibling_snapshot.get("fresh_entry_allowed"),
-            "replay_test_enabled": sibling_snapshot.get("replay_test_enabled"),
-            "replay_timestamp_et": sibling_snapshot.get("replay_timestamp_et"),
-            "replay_trade_allowed": sibling_snapshot.get("replay_trade_allowed"),
-            "current_state": sibling_snapshot.get("current_state"),
-            "primary_blocker": sibling_snapshot.get("primary_blocker"),
-            "effective_user_facing_why": sibling_snapshot.get("effective_user_facing_why"),
-            "readable_summary": sibling_readable,
-        },
-    }
-
-
-
-
-def _build_paired_profile_transition_context(
-    current_snapshot: Dict[str, Any],
-    sibling_snapshot: Optional[Dict[str, Any]],
-    current_profile_key: str,
-    sibling_profile_key: str,
-    replay_profile_active: bool,
-) -> Dict[str, Any]:
-    pair_context = _build_paired_profile_context(
-        current_snapshot=current_snapshot,
-        sibling_snapshot=sibling_snapshot,
-        current_profile_key=current_profile_key,
-        sibling_profile_key=sibling_profile_key,
-        replay_profile_active=replay_profile_active,
-    )
-    if not pair_context.get("available"):
-        return {
-            "ok": True,
-            "available": False,
-            "status": "unavailable",
-            "transition_detected": False,
-            "meaningful_transition": False,
-            "should_alert_candidate": False,
-            "summary": "No sibling profile snapshot is available yet.",
-            "primary_event": None,
-            "events": [],
-            "changed_fields": {},
-            "current_profile_key": current_profile_key,
-            "sibling_profile_key": sibling_profile_key,
-        }
-
-    changed_fields = pair_context.get("changed_fields") or {}
-    events: List[str] = []
-    if "replay_trade_allowed" in changed_fields:
-        events.append("PAIR_REPLAY_TRADE_ALLOWED_DIFF")
-    if "approval_ready_now" in changed_fields or "approval_ready_on_completed_candle" in changed_fields:
-        events.append("PAIR_APPROVAL_DIFF")
-    if "trigger_present" in changed_fields:
-        events.append("PAIR_TRIGGER_DIFF")
-    if "current_state" in changed_fields:
-        events.append("PAIR_STATE_DIFF")
-    if "primary_blocker" in changed_fields or "setup_type" in changed_fields:
-        events.append("PAIR_STRUCTURE_DIFF")
-    if "replay_market_open" in changed_fields or "replay_fresh_entry_allowed" in changed_fields or "replay_test_enabled" in changed_fields:
-        events.append("PAIR_REPLAY_GATE_DIFF")
-
-    primary_event = events[0] if events else None
-    transition_detected = bool(changed_fields)
-    alert_watched_fields = {
-        "current_state",
-        "primary_blocker",
-        "setup_type",
-        "trigger_present",
-        "approval_ready_now",
-        "approval_ready_on_completed_candle",
-        "replay_test_enabled",
-        "replay_trade_allowed",
-        "replay_market_open",
-        "replay_fresh_entry_allowed",
-    }
-    should_alert_candidate = any(field in alert_watched_fields for field in changed_fields)
-
-    current_readable = (pair_context.get("current") or {}).get("readable_summary") or {}
-    sibling_readable = (pair_context.get("sibling") or {}).get("readable_summary") or {}
-    if not transition_detected:
-        summary = "Live and replay lanes still match on all watched fields."
-    elif primary_event == "PAIR_REPLAY_TRADE_ALLOWED_DIFF":
-        summary = "Replay trade-allowed status differs from the sibling lane."
-    elif primary_event == "PAIR_APPROVAL_DIFF":
-        summary = "Approval readiness differs between live and replay lanes."
-    elif primary_event == "PAIR_TRIGGER_DIFF":
-        summary = "Trigger presence differs between live and replay lanes."
-    elif primary_event == "PAIR_STATE_DIFF":
-        summary = "Current state differs between live and replay lanes."
-    else:
-        summary = "Live and replay lanes diverge on one or more watched fields."
-
-    return {
-        "ok": True,
-        "available": True,
-        "status": "ready",
-        "transition_detected": transition_detected,
-        "meaningful_transition": transition_detected,
-        "should_alert_candidate": should_alert_candidate,
-        "primary_event": primary_event,
-        "events": events,
-        "summary": summary,
-        "changed_fields": changed_fields,
-        "current_profile_key": current_profile_key,
-        "sibling_profile_key": sibling_profile_key,
-        "current_replay_profile_active": replay_profile_active,
-        "sibling_replay_profile_active": not replay_profile_active,
-        "current_lane": {
-            "profile_key": current_profile_key,
-            "replay_profile_active": replay_profile_active,
-            "current_state": current_snapshot.get("current_state"),
-            "primary_blocker": current_snapshot.get("primary_blocker"),
-            "trigger_present": current_snapshot.get("trigger_present"),
-            "approval_ready_now": current_snapshot.get("approval_ready_now"),
-            "approval_ready_on_completed_candle": current_snapshot.get("approval_ready_on_completed_candle"),
-            "replay_test_enabled": current_snapshot.get("replay_test_enabled"),
-            "replay_trade_allowed": current_snapshot.get("replay_trade_allowed"),
-            "replay_market_open": current_snapshot.get("replay_market_open"),
-            "replay_fresh_entry_allowed": current_snapshot.get("replay_fresh_entry_allowed"),
-            "why_now": current_readable.get("why_now"),
-        },
-        "sibling_lane": {
-            "profile_key": sibling_profile_key,
-            "replay_profile_active": bool(sibling_snapshot.get("replay_profile_active")),
-            "current_state": sibling_snapshot.get("current_state"),
-            "primary_blocker": sibling_snapshot.get("primary_blocker"),
-            "trigger_present": sibling_snapshot.get("trigger_present"),
-            "approval_ready_now": sibling_snapshot.get("approval_ready_now"),
-            "approval_ready_on_completed_candle": sibling_snapshot.get("approval_ready_on_completed_candle"),
-            "replay_test_enabled": sibling_snapshot.get("replay_test_enabled"),
-            "replay_trade_allowed": sibling_snapshot.get("replay_trade_allowed"),
-            "replay_market_open": sibling_snapshot.get("replay_market_open"),
-            "replay_fresh_entry_allowed": sibling_snapshot.get("replay_fresh_entry_allowed"),
-            "why_now": sibling_readable.get("why_now"),
-        },
-    }
-
-
-def _paired_profile_transition_fingerprint(pair_transition_context: Dict[str, Any]) -> Optional[str]:
-    if not pair_transition_context.get("available"):
-        return None
-    payload = {
-        "current_profile_key": pair_transition_context.get("current_profile_key"),
-        "sibling_profile_key": pair_transition_context.get("sibling_profile_key"),
-        "primary_event": pair_transition_context.get("primary_event"),
-        "changed_fields": pair_transition_context.get("changed_fields") or {},
-    }
-    raw = json.dumps(_json_safe_for_response(payload), sort_keys=True, default=str)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def _build_paired_profile_alert_payload(
-    pair_transition_context: Dict[str, Any],
-    *,
-    should_alert: bool,
-    deduped: bool,
-    transition_fingerprint: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    if not should_alert or not pair_transition_context.get("available"):
-        return None
-    current_lane = pair_transition_context.get("current_lane") or {}
-    sibling_lane = pair_transition_context.get("sibling_lane") or {}
-    return {
-        "ok": True,
-        "alert_type": "paired_profile_divergence",
-        "should_alert": True,
-        "deduped": deduped,
-        "transition_fingerprint": transition_fingerprint,
-        "primary_event": pair_transition_context.get("primary_event"),
-        "events": pair_transition_context.get("events") or [],
-        "summary": pair_transition_context.get("summary"),
-        "current_lane": current_lane,
-        "sibling_lane": sibling_lane,
-        "changed_fields": pair_transition_context.get("changed_fields") or {},
     }
 
 
@@ -6812,7 +6408,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_live_minimal_surface_2026_04_14",
+        "build_tag": "continuous_replay_transition_profile_sandbox_2026_04_14",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -7048,10 +6644,6 @@ def _continuous_profile_key(profile_name: str, request: OnDemandRequest) -> str:
 
 def _continuous_state_path(profile_key: str) -> Path:
     return _continuous_state_dir() / f"{profile_key}.json"
-
-
-def _continuous_sibling_profile_key(base_profile_key: str, replay_profile_active: bool) -> str:
-    return base_profile_key if replay_profile_active else f"{base_profile_key}__replay"
 
 
 def _load_continuous_state(profile_key: str) -> Dict[str, Any]:
@@ -7391,12 +6983,11 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_live_minimal_surface_2026_04_14",
+        "build_tag": "continuous_replay_transition_profile_sandbox_2026_04_14",
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
         "user_facing_why": user_facing.get("why"),
-        "effective_user_facing_why": user_facing.get("why"),
         "primary_blocker": decision_context.get("primary_blocker"),
         "decision_blockers": decision_context.get("blockers") or [],
         "failed_reasons": decision_context.get("failed_reasons") or [],
@@ -7407,12 +6998,6 @@ def _build_continuous_snapshot(
         "structure_ready": trigger_context.get("structure_ready"),
         "approval_ready_now": approval_context.get("approval_ready_now"),
         "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
-        "intrabar_raw_signal_detected": approval_context.get("intrabar_raw_signal_detected"),
-        "completed_raw_signal_detected": approval_context.get("completed_raw_signal_detected"),
-        "raw_signal_present_if_open": market_closed_tester.get("raw_signal_present_if_open"),
-        "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
-        "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
-        "underlying_structural_primary_blocker": market_closed_tester.get("underlying_structural_primary_blocker"),
         "open_positions": request_payload.get("open_positions"),
         "weekly_trade_count": request_payload.get("weekly_trade_count"),
         "invalidation": simple_output.get("invalidation"),
@@ -7436,7 +7021,6 @@ def _build_continuous_snapshot(
         },
         "market_closed_tester": market_closed_tester,
         "replay_test_context": {},
-        "replay_compare_context": {},
         "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
     }
     snapshot["latent_structure_state"] = _derive_continuous_structure_state(snapshot)
@@ -7461,18 +7045,6 @@ def _build_continuous_snapshot(
     snapshot["replay_timestamp_et"] = replay_test_context.get("resolved_replay_timestamp_et")
     snapshot["replay_market_open"] = replay_test_context.get("replay_market_open")
     snapshot["replay_fresh_entry_allowed"] = replay_test_context.get("replay_fresh_entry_allowed")
-    replay_compare_context = _build_replay_compare_context(snapshot)
-    snapshot["replay_compare_context"] = replay_compare_context
-    snapshot["effective_user_facing_why"] = replay_compare_context.get("effective_user_facing_why") or snapshot.get("user_facing_why")
-    effective_profile_context = _build_effective_profile_context(snapshot)
-    snapshot["effective_profile_context"] = effective_profile_context
-    snapshot["effective_profile_view"] = effective_profile_context.get("profile_view")
-    snapshot["effective_market_open"] = effective_profile_context.get("market_open")
-    snapshot["effective_fresh_entry_allowed"] = effective_profile_context.get("fresh_entry_allowed")
-    snapshot["effective_time_gate_reason"] = effective_profile_context.get("time_gate_reason")
-    snapshot["effective_trigger_present"] = effective_profile_context.get("trigger_present")
-    snapshot["effective_trigger_reason"] = effective_profile_context.get("trigger_reason")
-    snapshot["effective_user_facing_why"] = effective_profile_context.get("user_facing_why") or snapshot.get("effective_user_facing_why")
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
 
@@ -7492,12 +7064,6 @@ def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]
         "structure_ready",
         "approval_ready_now",
         "approval_ready_on_completed_candle",
-        "intrabar_raw_signal_detected",
-        "completed_raw_signal_detected",
-        "raw_signal_present_if_open",
-        "would_be_trade_if_open",
-        "underlying_structural_verdict",
-        "underlying_structural_primary_blocker",
         "open_positions",
         "weekly_trade_count",
         "replay_test_enabled",
@@ -7566,14 +7132,6 @@ def _compare_continuous_snapshots(
         transition_type = "APPROVAL_STATE_CHANGED"
         severity = "high" if current.get("approval_ready_now") else "medium"
         summary = "Approval state changed."
-    elif previous.get("raw_signal_present_if_open") != current.get("raw_signal_present_if_open"):
-        transition_type = "RAW_SIGNAL_STATE_CHANGED"
-        severity = "medium"
-        summary = "Raw signal state changed."
-    elif previous.get("would_be_trade_if_open") != current.get("would_be_trade_if_open"):
-        transition_type = "WOULD_BE_TRADE_IF_OPEN_CHANGED"
-        severity = "medium"
-        summary = "After-hours structural trade status changed."
     elif previous.get("trigger_present") != current.get("trigger_present"):
         transition_type = "TRIGGER_STATE_CHANGED"
         severity = "medium"
@@ -7659,11 +7217,6 @@ def _build_true_transition_context(
         "trigger_present",
         "approval_ready_now",
         "approval_ready_on_completed_candle",
-        "intrabar_raw_signal_detected",
-        "completed_raw_signal_detected",
-        "raw_signal_present_if_open",
-        "would_be_trade_if_open",
-        "underlying_structural_verdict",
         "current_state",
         "invalidation_hit",
         "replay_test_enabled",
@@ -7783,43 +7336,6 @@ def _build_true_transition_context(
             summary="Trigger disappeared.",
         )
 
-    prev_raw_signal = bool(previous.get("raw_signal_present_if_open") is True)
-    curr_raw_signal = bool(current.get("raw_signal_present_if_open") is True)
-    if not prev_raw_signal and curr_raw_signal:
-        _add_event(
-            "RAW_SIGNAL_APPEARED",
-            previous_value=prev_raw_signal,
-            current_value=curr_raw_signal,
-            severity="medium",
-            summary="Raw signal appeared. SAFE-FAST approval is still pending.",
-        )
-    elif prev_raw_signal and not curr_raw_signal:
-        _add_event(
-            "RAW_SIGNAL_CLEARED",
-            previous_value=prev_raw_signal,
-            current_value=curr_raw_signal,
-            severity="medium",
-            summary="Raw signal cleared before approval.",
-        )
-
-    if previous.get("would_be_trade_if_open") != current.get("would_be_trade_if_open"):
-        _add_event(
-            "WOULD_BE_TRADE_IF_OPEN_CHANGED",
-            previous_value=previous.get("would_be_trade_if_open"),
-            current_value=current.get("would_be_trade_if_open"),
-            severity="medium",
-            summary="After-hours structural trade status changed.",
-        )
-
-    if previous.get("underlying_structural_verdict") != current.get("underlying_structural_verdict"):
-        _add_event(
-            "UNDERLYING_STRUCTURAL_VERDICT_CHANGED",
-            previous_value=previous.get("underlying_structural_verdict"),
-            current_value=current.get("underlying_structural_verdict"),
-            severity="medium",
-            summary="Underlying structural verdict changed.",
-        )
-
     if previous.get("replay_test_enabled") != current.get("replay_test_enabled"):
         _add_event(
             "REPLAY_MODE_CHANGED",
@@ -7911,7 +7427,6 @@ def _build_continuous_alert_payload(
         return None
 
     summary = current_snapshot.get("summary") or {}
-    readable_summary = current_snapshot.get("readable_summary") or {}
     return {
         "should_alert": should_alert,
         "transition_type": transition_summary.get("transition_type"),
@@ -7923,418 +7438,8 @@ def _build_continuous_alert_payload(
         "next_flip_needed": current_snapshot.get("next_flip_needed"),
         "good_idea_now": summary.get("good_idea_now"),
         "action": summary.get("action"),
-        "trigger_present": current_snapshot.get("trigger_present"),
-        "raw_signal_present_if_open": current_snapshot.get("raw_signal_present_if_open"),
-        "would_be_trade_if_open": current_snapshot.get("would_be_trade_if_open"),
-        "underlying_structural_verdict": current_snapshot.get("underlying_structural_verdict"),
-        "effective_user_facing_why": current_snapshot.get("effective_user_facing_why"),
-        "replay_test_enabled": current_snapshot.get("replay_test_enabled"),
-        "replay_trade_allowed": current_snapshot.get("replay_trade_allowed"),
-        "replay_timestamp_et": current_snapshot.get("replay_timestamp_et"),
-        "why_now": readable_summary.get("why_now"),
     }
 
-
-
-def _build_continuous_forming_context(current_snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    summary = current_snapshot.get("summary") or {}
-    readable_summary = current_snapshot.get("readable_summary") or {}
-    setup_type = current_snapshot.get("setup_type")
-    allowed_setup = _is_allowed_setup_type_name(setup_type)
-    approval_ready = bool(
-        current_snapshot.get("approval_ready_now")
-        or current_snapshot.get("approval_ready_on_completed_candle")
-    )
-    invalidation_hit = bool(current_snapshot.get("invalidation_hit"))
-    raw_signal_detected = bool(
-        current_snapshot.get("intrabar_raw_signal_detected")
-        or current_snapshot.get("completed_raw_signal_detected")
-        or current_snapshot.get("raw_signal_present_if_open")
-    )
-    market_open = bool(current_snapshot.get("market_open"))
-    fresh_entry_allowed = bool(current_snapshot.get("fresh_entry_allowed"))
-    would_be_trade_if_open = bool(current_snapshot.get("would_be_trade_if_open"))
-    replay_test_enabled = bool(current_snapshot.get("replay_test_enabled"))
-    replay_trade_allowed = bool(current_snapshot.get("replay_trade_allowed"))
-    forming_type: Optional[str] = None
-    forming_summary: Optional[str] = None
-    severity = "medium"
-
-    if not invalidation_hit and not approval_ready:
-        if replay_test_enabled and replay_trade_allowed:
-            forming_type = "REPLAY_TRADE_ALLOWED"
-            forming_summary = (
-                "Replay lane says this setup would be tradable at the supplied replay timestamp."
-            )
-        elif not market_open and would_be_trade_if_open:
-            forming_type = "AFTER_HOURS_WOULD_BE_TRADE"
-            forming_summary = (
-                "After-hours tester says structure would qualify if the market were open."
-            )
-        elif allowed_setup and raw_signal_detected:
-            forming_type = "RAW_SIGNAL_WAITING_FOR_APPROVAL"
-            forming_summary = (
-                "A raw signal is visible, but SAFE-FAST approval is still waiting on the remaining gates."
-            )
-        elif allowed_setup and current_snapshot.get("primary_blocker") == "time_day_gate":
-            forming_type = "ALLOWED_SETUP_WAITING_FOR_WINDOW"
-            forming_summary = (
-                "An allowed setup is in place, but the entry window is currently closed."
-            )
-
-    eligible = bool(forming_type)
-    return {
-        "ok": True,
-        "eligible": eligible,
-        "forming_type": forming_type,
-        "severity": severity if eligible else "info",
-        "summary": forming_summary if eligible else "No forming setup alert right now.",
-        "ticker": summary.get("ticker"),
-        "state": current_snapshot.get("current_state"),
-        "setup_type": setup_type,
-        "allowed_setup": allowed_setup,
-        "approval_ready_now": current_snapshot.get("approval_ready_now"),
-        "approval_ready_on_completed_candle": current_snapshot.get(
-            "approval_ready_on_completed_candle"
-        ),
-        "raw_signal_detected": raw_signal_detected,
-        "market_open": market_open,
-        "fresh_entry_allowed": fresh_entry_allowed,
-        "would_be_trade_if_open": would_be_trade_if_open,
-        "replay_test_enabled": replay_test_enabled,
-        "replay_trade_allowed": replay_trade_allowed,
-        "replay_timestamp_et": current_snapshot.get("replay_timestamp_et"),
-        "primary_blocker": current_snapshot.get("primary_blocker"),
-        "next_flip_needed": current_snapshot.get("next_flip_needed"),
-        "why_now": readable_summary.get("why_now"),
-        "effective_user_facing_why": current_snapshot.get("effective_user_facing_why"),
-    }
-
-
-def _continuous_forming_alert_fingerprint(
-    forming_context: Dict[str, Any],
-) -> Optional[str]:
-    if not forming_context.get("eligible"):
-        return None
-    payload = {
-        "ticker": forming_context.get("ticker"),
-        "forming_type": forming_context.get("forming_type"),
-        "state": forming_context.get("state"),
-        "primary_blocker": forming_context.get("primary_blocker"),
-        "next_flip_needed": forming_context.get("next_flip_needed"),
-        "market_open": forming_context.get("market_open"),
-        "fresh_entry_allowed": forming_context.get("fresh_entry_allowed"),
-        "raw_signal_detected": forming_context.get("raw_signal_detected"),
-        "would_be_trade_if_open": forming_context.get("would_be_trade_if_open"),
-        "replay_trade_allowed": forming_context.get("replay_trade_allowed"),
-        "replay_timestamp_et": forming_context.get("replay_timestamp_et"),
-    }
-    raw = json.dumps(_json_safe_for_response(payload), sort_keys=True, default=str)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def _build_continuous_forming_alert_payload(
-    *,
-    forming_context: Dict[str, Any],
-    should_alert: bool,
-    deduped: bool,
-    transition_fingerprint: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    if not forming_context.get("eligible"):
-        return None
-    return {
-        "ok": True,
-        "alert_type": "forming_setup",
-        "should_alert": should_alert,
-        "deduped": deduped,
-        "transition_fingerprint": transition_fingerprint,
-        "forming_type": forming_context.get("forming_type"),
-        "severity": forming_context.get("severity"),
-        "message": forming_context.get("summary"),
-        "ticker": forming_context.get("ticker"),
-        "state": forming_context.get("state"),
-        "setup_type": forming_context.get("setup_type"),
-        "primary_blocker": forming_context.get("primary_blocker"),
-        "next_flip_needed": forming_context.get("next_flip_needed"),
-        "market_open": forming_context.get("market_open"),
-        "fresh_entry_allowed": forming_context.get("fresh_entry_allowed"),
-        "raw_signal_detected": forming_context.get("raw_signal_detected"),
-        "would_be_trade_if_open": forming_context.get("would_be_trade_if_open"),
-        "replay_test_enabled": forming_context.get("replay_test_enabled"),
-        "replay_trade_allowed": forming_context.get("replay_trade_allowed"),
-        "replay_timestamp_et": forming_context.get("replay_timestamp_et"),
-        "why_now": forming_context.get("why_now"),
-        "effective_user_facing_why": forming_context.get("effective_user_facing_why"),
-    }
-
-
-
-def _build_continuous_live_alerts(
-    shadow_payload: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    alerts: List[Dict[str, Any]] = []
-
-    primary_alert = shadow_payload.get("alert_payload")
-    if isinstance(primary_alert, dict) and primary_alert.get("should_alert"):
-        alerts.append(
-            {
-                "ok": True,
-                "alert_lane": "current_profile",
-                "alert_kind": "state_transition",
-                **primary_alert,
-            }
-        )
-
-    paired_alert = shadow_payload.get("paired_profile_alert_payload")
-    if isinstance(paired_alert, dict) and paired_alert.get("should_alert"):
-        alerts.append(
-            {
-                "ok": True,
-                "alert_lane": "paired_profile",
-                "alert_kind": "profile_divergence",
-                **paired_alert,
-            }
-        )
-
-    forming_alert = shadow_payload.get("forming_alert_payload")
-    if isinstance(forming_alert, dict) and forming_alert.get("should_alert"):
-        alerts.append(
-            {
-                "ok": True,
-                "alert_lane": "current_profile",
-                "alert_kind": "forming_setup",
-                **forming_alert,
-            }
-        )
-
-    return alerts
-
-
-def _build_continuous_live_summary(
-    shadow_payload: Dict[str, Any],
-    alerts: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    readable_summary = shadow_payload.get("readable_summary") or {}
-    true_transition_context = shadow_payload.get("true_transition_context") or {}
-    paired_profile_transition_context = shadow_payload.get("paired_profile_transition_context") or {}
-
-    return {
-        "alert_status": "ALERT" if alerts else "NO_ALERT",
-        "alert_count": len(alerts),
-        "good_idea_now": readable_summary.get("good_idea_now"),
-        "ticker": readable_summary.get("ticker"),
-        "action": readable_summary.get("action"),
-        "setup_state": readable_summary.get("setup_state"),
-        "now_state": readable_summary.get("now_state"),
-        "primary_blocker": readable_summary.get("primary_blocker"),
-        "next_flip_needed": readable_summary.get("next_flip_needed"),
-        "trigger_present": readable_summary.get("trigger_present"),
-        "trigger_reason": readable_summary.get("trigger_reason"),
-        "raw_signal_present_if_open": readable_summary.get("raw_signal_present_if_open"),
-        "would_be_trade_if_open": readable_summary.get("would_be_trade_if_open"),
-        "underlying_structural_verdict": readable_summary.get("underlying_structural_verdict"),
-        "market_open": readable_summary.get("market_open"),
-        "replay_test_enabled": readable_summary.get("replay_test_enabled"),
-        "replay_trade_allowed": readable_summary.get("replay_trade_allowed"),
-        "replay_timestamp_et": readable_summary.get("replay_timestamp_et"),
-        "why_now": readable_summary.get("why_now"),
-        "invalidation": readable_summary.get("invalidation"),
-        "current_profile_alert_ready": bool(
-            (shadow_payload.get("alert_payload") or {}).get("should_alert")
-        ),
-        "paired_profile_alert_ready": bool(
-            (shadow_payload.get("paired_profile_alert_payload") or {}).get("should_alert")
-        ),
-        "forming_alert_ready": bool(
-            (shadow_payload.get("forming_alert_payload") or {}).get("should_alert")
-        ),
-        "forming_status": (
-            "FORMING"
-            if (shadow_payload.get("forming_context") or {}).get("eligible")
-            else "NONE"
-        ),
-        "forming_type": (shadow_payload.get("forming_context") or {}).get("forming_type"),
-        "forming_summary": (shadow_payload.get("forming_context") or {}).get("summary"),
-        "profile_view": readable_summary.get("profile_view"),
-        "effective_user_facing_why": shadow_payload.get("effective_user_facing_why"),
-        "effective_market_open": shadow_payload.get("current_snapshot", {}).get("effective_market_open"),
-        "effective_fresh_entry_allowed": shadow_payload.get("current_snapshot", {}).get("effective_fresh_entry_allowed"),
-        "effective_time_gate_reason": shadow_payload.get("current_snapshot", {}).get("effective_time_gate_reason"),
-        "true_transition_type": true_transition_context.get("transition_type"),
-        "paired_profile_transition_type": paired_profile_transition_context.get("transition_type"),
-    }
-
-
-def _build_continuous_live_payload(shadow_payload: Dict[str, Any]) -> Dict[str, Any]:
-    alerts = _build_continuous_live_alerts(shadow_payload)
-    live_summary = _build_continuous_live_summary(shadow_payload, alerts)
-    persistence = shadow_payload.get("persistence") or {}
-    true_transition_context = shadow_payload.get("true_transition_context") or {}
-    paired_profile_transition_context = shadow_payload.get("paired_profile_transition_context") or {}
-
-    return _json_safe_for_response(
-        {
-            "ok": shadow_payload.get("ok"),
-            "mode": "continuous_live",
-            "live_mode": "alert_or_status",
-            "build_tag": shadow_payload.get("build_tag"),
-            "source_of_truth": shadow_payload.get("source_of_truth"),
-            "profile_name": shadow_payload.get("profile_name"),
-            "profile_key": shadow_payload.get("profile_key"),
-            "base_profile_key": shadow_payload.get("base_profile_key"),
-            "replay_profile_active": shadow_payload.get("replay_profile_active"),
-            "live_status": live_summary.get("alert_status"),
-            "should_alert": bool(alerts),
-            "alert_count": len(alerts),
-            "alerts": alerts,
-            "read_this_first": "live_summary",
-            "live_summary": live_summary,
-            "readable_summary": shadow_payload.get("readable_summary"),
-            "effective_user_facing_why": shadow_payload.get("effective_user_facing_why"),
-            "transition_summary": shadow_payload.get("transition_summary"),
-            "true_transition_context": {
-                **true_transition_context,
-                "should_alert": bool((shadow_payload.get("alert_payload") or {}).get("should_alert")),
-            },
-            "paired_profile_transition_context": {
-                **paired_profile_transition_context,
-                "should_alert": bool((shadow_payload.get("paired_profile_alert_payload") or {}).get("should_alert")),
-            },
-            "persistence": {
-                "enabled": persistence.get("enabled"),
-                "persisted": persistence.get("persisted"),
-                "state_file": persistence.get("state_file"),
-                "previous_snapshot_found": persistence.get("previous_snapshot_found"),
-            },
-            "compact_ticker_summaries": shadow_payload.get("compact_ticker_summaries") or [],
-            "market_closed_tester": shadow_payload.get("market_closed_tester"),
-            "replay_test_context": shadow_payload.get("replay_test_context"),
-            "replay_compare_context": shadow_payload.get("replay_compare_context"),
-            "paired_profile_context": shadow_payload.get("paired_profile_context"),
-            "forming_context": shadow_payload.get("forming_context"),
-            "forming_alert_payload": shadow_payload.get("forming_alert_payload"),
-            "monitor_hint": {
-                "use_endpoint": "/safe-fast/continuous/monitor",
-                "use_default_endpoint": "/safe-fast/continuous/monitor/default",
-                "use_default_simple_endpoint": "/safe-fast/continuous/monitor/default/simple",
-            },
-            "on_demand_excerpt": shadow_payload.get("on_demand_excerpt"),
-        }
-    )
-
-
-
-
-def _continuous_shadow_request_from_payload(payload: Dict[str, Any]) -> ContinuousShadowRequest:
-    cleaned = dict(payload)
-    return ContinuousShadowRequest(**cleaned)
-
-
-def _build_continuous_monitor_summary(
-    default_live_payload: Dict[str, Any],
-    replay_live_payload: Optional[Dict[str, Any]],
-    alerts: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    default_summary = default_live_payload.get("live_summary") or {}
-    replay_summary = (replay_live_payload or {}).get("live_summary") or {}
-    replay_transition = (replay_live_payload or {}).get("paired_profile_transition_context") or {}
-    replay_context = (replay_live_payload or {}).get("replay_test_context") or {}
-
-    return {
-        "monitor_status": "ALERT" if alerts else "NO_ALERT",
-        "alert_count": len(alerts),
-        "default_live_status": default_live_payload.get("live_status"),
-        "replay_live_status": (replay_live_payload or {}).get("live_status"),
-        "replay_profile_enabled": bool(replay_live_payload),
-        "ticker": default_summary.get("ticker"),
-        "good_idea_now": default_summary.get("good_idea_now"),
-        "action": default_summary.get("action"),
-        "setup_state": default_summary.get("setup_state"),
-        "default_now_state": default_summary.get("now_state"),
-        "default_primary_blocker": default_summary.get("primary_blocker"),
-        "default_next_flip_needed": default_summary.get("next_flip_needed"),
-        "default_trigger_present": default_summary.get("trigger_present"),
-        "default_trigger_reason": default_summary.get("trigger_reason"),
-        "default_raw_signal_present_if_open": default_summary.get("raw_signal_present_if_open"),
-        "default_would_be_trade_if_open": default_summary.get("would_be_trade_if_open"),
-        "default_underlying_structural_verdict": default_summary.get("underlying_structural_verdict"),
-        "default_market_open": default_summary.get("market_open"),
-        "default_forming_status": default_summary.get("forming_status"),
-        "default_forming_type": default_summary.get("forming_type"),
-        "default_forming_summary": default_summary.get("forming_summary"),
-        "replay_trade_allowed": replay_summary.get("replay_trade_allowed"),
-        "replay_timestamp_et": replay_summary.get("replay_timestamp_et"),
-        "replay_forming_status": replay_summary.get("forming_status"),
-        "replay_forming_type": replay_summary.get("forming_type"),
-        "paired_profile_transition_type": replay_transition.get("transition_type"),
-        "paired_profile_should_alert": bool(replay_transition.get("should_alert")),
-        "paired_profile_summary": replay_transition.get("summary"),
-        "replay_effective_why": replay_summary.get("why_now"),
-        "replay_compare_takeaway": replay_context.get("replay_takeaway"),
-    }
-
-
-async def _build_continuous_monitor_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
-    base_payload = _model_dump(request)
-    base_payload["replay_timestamp_et"] = None
-    base_payload["replay_label"] = None
-    base_request = _continuous_shadow_request_from_payload(base_payload)
-
-    default_shadow_payload = await _build_continuous_shadow_payload(base_request)
-    default_live_payload = _build_continuous_live_payload(default_shadow_payload)
-
-    replay_live_payload: Optional[Dict[str, Any]] = None
-    replay_shadow_payload: Optional[Dict[str, Any]] = None
-    replay_enabled = bool(request.replay_timestamp_et or request.replay_label)
-
-    if replay_enabled:
-        replay_shadow_payload = await _build_continuous_shadow_payload(request)
-        replay_live_payload = _build_continuous_live_payload(replay_shadow_payload)
-
-    alerts: List[Dict[str, Any]] = []
-    alerts.extend(default_live_payload.get("alerts") or [])
-    if replay_live_payload:
-        alerts.extend(replay_live_payload.get("alerts") or [])
-
-    monitor_summary = _build_continuous_monitor_summary(
-        default_live_payload=default_live_payload,
-        replay_live_payload=replay_live_payload,
-        alerts=alerts,
-    )
-
-    pair_transition_context = {}
-    pair_context = {}
-    replay_test_context = None
-    if replay_live_payload:
-        pair_transition_context = replay_live_payload.get("paired_profile_transition_context") or {}
-        pair_context = replay_live_payload.get("paired_profile_context") or {}
-        replay_test_context = replay_live_payload.get("replay_test_context")
-
-    return _json_safe_for_response(
-        {
-            "ok": bool(default_live_payload.get("ok"))
-            and (True if replay_live_payload is None else bool(replay_live_payload.get("ok"))),
-            "mode": "continuous_monitor",
-            "monitor_mode": "bundled_live_profiles",
-            "build_tag": default_live_payload.get("build_tag"),
-            "source_of_truth": default_live_payload.get("source_of_truth"),
-            "profile_name": default_live_payload.get("profile_name"),
-            "base_profile_key": default_live_payload.get("base_profile_key"),
-            "default_profile_key": default_live_payload.get("profile_key"),
-            "replay_profile_key": (replay_live_payload or {}).get("profile_key"),
-            "replay_profile_active": replay_enabled,
-            "should_alert": bool(alerts),
-            "alert_count": len(alerts),
-            "alerts": alerts,
-            "read_this_first": "monitor_summary",
-            "monitor_summary": monitor_summary,
-            "paired_profile_transition_context": pair_transition_context,
-            "paired_profile_context": pair_context,
-            "replay_test_context": replay_test_context,
-            "default_lane": default_live_payload,
-            "replay_lane": replay_live_payload,
-        }
-    )
 
 def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Dict[str, Any]:
     decision_context = on_demand_payload.get("decision_context") or {}
@@ -8378,17 +7483,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     primary_blocker = snapshot.get("primary_blocker")
     next_flip_needed = snapshot.get("next_flip_needed")
     summary = snapshot.get("summary") or {}
-    time_gate_reason = snapshot.get("effective_time_gate_reason") or snapshot.get("time_gate_reason")
-    market_open = (
-        snapshot.get("effective_market_open")
-        if snapshot.get("effective_market_open") is not None
-        else snapshot.get("market_open")
-    )
+    time_gate_reason = snapshot.get("time_gate_reason")
+    market_open = snapshot.get("market_open")
     decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
     failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
     market_closed_tester = snapshot.get("market_closed_tester") or {}
     replay_test_context = snapshot.get("replay_test_context") or {}
-    replay_compare_context = snapshot.get("replay_compare_context") or {}
 
     underlying_state = current_state
     if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and latent_structure_state:
@@ -8412,9 +7512,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             break
 
     summary_note = summary.get("why")
-    if replay_compare_context.get("enabled") is True and replay_compare_context.get("effective_why_now"):
-        summary_note = replay_compare_context.get("effective_why_now")
-    elif current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
         summary_note = f"{summary.get('why')} Underneath that, structure is still {underlying_state}."
     elif market_open is False and underlying_state != current_state and underlying_state is not None:
         summary_note = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
@@ -8429,16 +7527,10 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "primary_blocker": primary_blocker,
         "next_flip_needed": next_flip_needed,
         "top_blockers": top_blockers,
-        "trigger_present": (
-            snapshot.get("effective_trigger_present")
-            if snapshot.get("effective_trigger_present") is not None
-            else snapshot.get("trigger_present")
-        ),
-        "trigger_reason": snapshot.get("effective_trigger_reason") or snapshot.get("trigger_reason"),
+        "trigger_present": snapshot.get("trigger_present"),
+        "trigger_reason": snapshot.get("trigger_reason"),
         "structure_ready": snapshot.get("structure_ready"),
-        "raw_signal_present_if_open": snapshot.get("raw_signal_present_if_open"),
         "market_open": market_open,
-        "profile_view": snapshot.get("effective_profile_view") or ("replay" if snapshot.get("replay_profile_active") else "live"),
         "time_gate_reason": time_gate_reason,
         "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
         "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
@@ -8446,10 +7538,6 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_test_enabled": replay_test_context.get("enabled"),
         "replay_trade_allowed": replay_test_context.get("replay_trade_allowed"),
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
-        "replay_compare_takeaway": replay_compare_context.get("compare_takeaway"),
-        "effective_user_facing_why": replay_compare_context.get("effective_user_facing_why"),
-        "forming_type": (snapshot.get("forming_context") or {}).get("forming_type"),
-        "forming_summary": (snapshot.get("forming_context") or {}).get("summary"),
         "why_now": summary_note,
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "invalidation": snapshot.get("invalidation"),
@@ -8465,13 +7553,6 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
 
     stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
     previous_snapshot = stored_state.get("latest_snapshot")
-    sibling_profile_key = _continuous_sibling_profile_key(base_profile_key, replay_profile_active)
-    sibling_state = (
-        _load_continuous_state(sibling_profile_key)
-        if request.persist_state and sibling_profile_key != profile_key
-        else {}
-    )
-    sibling_snapshot = sibling_state.get("latest_snapshot")
 
     on_demand_payload = await _build_on_demand_payload(on_demand_request)
     current_snapshot = _build_continuous_snapshot(
@@ -8506,61 +7587,6 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         transition_summary=true_transition_context,
         should_alert=should_alert,
     )
-    forming_context = _build_continuous_forming_context(current_snapshot)
-    forming_transition_fingerprint = _continuous_forming_alert_fingerprint(forming_context)
-    last_forming_alert_fingerprint = stored_state.get("last_forming_alert_fingerprint")
-    forming_deduped = bool(
-        forming_context.get("eligible")
-        and forming_transition_fingerprint
-        and forming_transition_fingerprint == last_forming_alert_fingerprint
-    )
-    forming_should_alert = bool(
-        forming_context.get("eligible")
-        and forming_transition_fingerprint
-        and not forming_deduped
-    )
-    forming_alert_payload = _build_continuous_forming_alert_payload(
-        forming_context=forming_context,
-        should_alert=forming_should_alert,
-        deduped=forming_deduped,
-        transition_fingerprint=forming_transition_fingerprint,
-    )
-    current_snapshot["forming_context"] = forming_context
-    current_snapshot["readable_summary"] = _build_continuous_readable_summary(current_snapshot)
-    paired_profile_context = _build_paired_profile_context(
-        current_snapshot=current_snapshot,
-        sibling_snapshot=sibling_snapshot,
-        current_profile_key=profile_key,
-        sibling_profile_key=sibling_profile_key,
-        replay_profile_active=replay_profile_active,
-    )
-    paired_profile_transition_context = _build_paired_profile_transition_context(
-        current_snapshot=current_snapshot,
-        sibling_snapshot=sibling_snapshot,
-        current_profile_key=profile_key,
-        sibling_profile_key=sibling_profile_key,
-        replay_profile_active=replay_profile_active,
-    )
-    pair_transition_fingerprint = _paired_profile_transition_fingerprint(
-        paired_profile_transition_context
-    )
-    last_pair_alert_fingerprint = stored_state.get("last_pair_alert_fingerprint")
-    pair_deduped = bool(
-        paired_profile_transition_context.get("should_alert_candidate")
-        and pair_transition_fingerprint
-        and pair_transition_fingerprint == last_pair_alert_fingerprint
-    )
-    pair_should_alert = bool(
-        paired_profile_transition_context.get("should_alert_candidate")
-        and pair_transition_fingerprint
-        and not pair_deduped
-    )
-    paired_profile_alert_payload = _build_paired_profile_alert_payload(
-        paired_profile_transition_context,
-        should_alert=pair_should_alert,
-        deduped=pair_deduped,
-        transition_fingerprint=pair_transition_fingerprint,
-    )
 
     persisted = False
     state_file = None
@@ -8580,21 +7606,6 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
                 "last_transition_fingerprint": transition_fingerprint,
                 "last_alert_fingerprint": transition_fingerprint if should_alert else last_alert_fingerprint,
                 "last_alert_timestamp": current_snapshot.get("timestamp_et") if should_alert else stored_state.get("last_alert_timestamp"),
-                "last_pair_transition_fingerprint": pair_transition_fingerprint,
-                "last_pair_alert_fingerprint": pair_transition_fingerprint if pair_should_alert else last_pair_alert_fingerprint,
-                "last_pair_alert_timestamp": current_snapshot.get("timestamp_et") if pair_should_alert else stored_state.get("last_pair_alert_timestamp"),
-                "last_forming_alert_fingerprint": (
-                    forming_transition_fingerprint if forming_context.get("eligible") else None
-                ),
-                "last_forming_alert_timestamp": (
-                    current_snapshot.get("timestamp_et")
-                    if forming_should_alert
-                    else (
-                        stored_state.get("last_forming_alert_timestamp")
-                        if forming_context.get("eligible")
-                        else None
-                    )
-                ),
             },
         )
 
@@ -8631,35 +7642,12 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         },
         "read_this_first": "readable_summary",
         "readable_summary": current_snapshot.get("readable_summary"),
-        "effective_profile_context": current_snapshot.get("effective_profile_context"),
-        "effective_user_facing_why": current_snapshot.get("effective_user_facing_why"),
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
         "replay_test_context": current_snapshot.get("replay_test_context"),
-        "replay_compare_context": current_snapshot.get("replay_compare_context"),
-        "paired_profile_context": paired_profile_context,
-        "paired_profile_transition_context": {
-            **paired_profile_transition_context,
-            "deduped": pair_deduped,
-            "transition_fingerprint": pair_transition_fingerprint,
-            "should_alert": pair_should_alert,
-        },
-        "paired_profile_alert_payload": paired_profile_alert_payload,
-        "forming_context": forming_context,
-        "forming_alert_payload": forming_alert_payload,
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
         "on_demand_excerpt": {
             **_build_continuous_on_demand_excerpt(on_demand_payload),
             "replay_test_context": current_snapshot.get("replay_test_context"),
-            "replay_compare_context": current_snapshot.get("replay_compare_context"),
-            "effective_profile_context": current_snapshot.get("effective_profile_context"),
-            "paired_profile_context": paired_profile_context,
-            "forming_context": forming_context,
-            "paired_profile_transition_context": {
-                **paired_profile_transition_context,
-                "deduped": pair_deduped,
-                "transition_fingerprint": pair_transition_fingerprint,
-                "should_alert": pair_should_alert,
-            },
         },
     }
     return _json_safe_for_response(response_payload)
@@ -8683,165 +7671,29 @@ async def safe_fast_continuous_shadow(request: ContinuousShadowRequest) -> Any:
         )
 
 
-
-@app.post("/safe-fast/continuous/live")
-async def safe_fast_continuous_live(request: ContinuousShadowRequest) -> Any:
+@app.get("/safe-fast/continuous/shadow/default", include_in_schema=False)
+async def safe_fast_continuous_shadow_default() -> Any:
     try:
-        return await _build_continuous_canonical_live_payload(request)
+        return await _build_continuous_shadow_payload(ContinuousShadowRequest())
     except Exception as e:
         return _json_safe_for_response(
             {
                 "ok": False,
-                "mode": "continuous_live",
-                "live_mode": "canonical_alert_first",
-                "error_type": "continuous_live_runtime_error",
+                "mode": "continuous_shadow",
+                "shadow_mode": "snapshot_compare_only",
+                "error_type": "continuous_shadow_runtime_error",
                 "reason": str(e),
-                "profile_name": _sanitize_continuous_profile_name(request.profile_name),
-                "request_profile": _model_dump(request),
+                "profile_name": "default",
+                "request_profile": _model_dump(ContinuousShadowRequest()),
             }
         )
 
-
-
-
-
-
-
-
-async def _build_continuous_watch_payload(
-    request: ContinuousShadowRequest,
-) -> Dict[str, Any]:
-    monitor_payload = await _build_continuous_monitor_payload(request)
-    monitor_summary = monitor_payload.get("monitor_summary") or {}
-    alerts = monitor_payload.get("alerts") or []
-    primary_alert = alerts[0] if alerts else None
-
-    watch_summary = {
-        **monitor_summary,
-        "watch_status": monitor_summary.get("monitor_status") or ("ALERT" if alerts else "NO_ALERT"),
-    }
-
-    return _json_safe_for_response(
-        {
-            **monitor_payload,
-            "mode": "continuous_watch",
-            "watch_mode": "paired_profiles",
-            "watch_summary": watch_summary,
-            "primary_alert": primary_alert,
-        }
+def _default_on_demand_request() -> OnDemandRequest:
+    return OnDemandRequest(
+        option_type="C",
+        open_positions=0,
+        weekly_trade_count=0,
     )
-
-
-async def _build_continuous_canonical_live_payload(
-    request: ContinuousShadowRequest,
-) -> Dict[str, Any]:
-    watch_payload = await _build_continuous_watch_payload(request)
-    watch_summary = watch_payload.get("watch_summary") or {}
-    monitor_summary = watch_payload.get("monitor_summary") or {}
-    default_lane = watch_payload.get("default_lane") or {}
-    replay_lane = watch_payload.get("replay_lane") or {}
-    default_live_summary = default_lane.get("live_summary") or {}
-    replay_live_summary = replay_lane.get("live_summary") or {}
-    primary_alert = watch_payload.get("primary_alert")
-    alerts = watch_payload.get("alerts") or []
-
-    replay_profile_active = bool(watch_payload.get("replay_profile_active"))
-    profile_key = (
-        watch_payload.get("replay_profile_key")
-        if replay_profile_active and watch_payload.get("replay_profile_key")
-        else watch_payload.get("default_profile_key")
-    )
-
-    live_summary = {
-        "alert_status": watch_summary.get("watch_status") or ("ALERT" if alerts else "NO_ALERT"),
-        "alert_count": len(alerts),
-        "good_idea_now": watch_summary.get("good_idea_now"),
-        "ticker": watch_summary.get("ticker"),
-        "action": watch_summary.get("action"),
-        "setup_state": watch_summary.get("setup_state"),
-        "now_state": watch_summary.get("default_now_state") or default_live_summary.get("now_state"),
-        "primary_blocker": watch_summary.get("default_primary_blocker") or default_live_summary.get("primary_blocker"),
-        "next_flip_needed": watch_summary.get("default_next_flip_needed") or default_live_summary.get("next_flip_needed"),
-        "trigger_present": default_live_summary.get("trigger_present"),
-        "trigger_reason": default_live_summary.get("trigger_reason"),
-        "raw_signal_present_if_open": default_live_summary.get("raw_signal_present_if_open"),
-        "would_be_trade_if_open": default_live_summary.get("would_be_trade_if_open"),
-        "underlying_structural_verdict": default_live_summary.get("underlying_structural_verdict"),
-        "market_open": default_live_summary.get("market_open"),
-        "replay_test_enabled": bool(watch_summary.get("replay_profile_enabled")),
-        "replay_trade_allowed": watch_summary.get("replay_trade_allowed"),
-        "replay_timestamp_et": watch_summary.get("replay_timestamp_et"),
-        "why_now": default_live_summary.get("why_now"),
-        "invalidation": default_live_summary.get("invalidation"),
-        "current_profile_alert_ready": bool(alerts),
-        "paired_profile_alert_ready": bool(watch_summary.get("paired_profile_should_alert")),
-        "forming_alert_ready": bool(default_live_summary.get("forming_alert_ready")),
-        "forming_status": watch_summary.get("default_forming_status") or default_live_summary.get("forming_status"),
-        "forming_type": watch_summary.get("default_forming_type") or default_live_summary.get("forming_type"),
-        "forming_summary": watch_summary.get("default_forming_summary") or default_live_summary.get("forming_summary"),
-        "profile_view": default_live_summary.get("profile_view"),
-        "effective_user_facing_why": default_live_summary.get("effective_user_facing_why"),
-        "effective_market_open": default_live_summary.get("effective_market_open"),
-        "effective_fresh_entry_allowed": default_live_summary.get("effective_fresh_entry_allowed"),
-        "effective_time_gate_reason": default_live_summary.get("effective_time_gate_reason"),
-        "true_transition_type": (default_lane.get("true_transition_context") or {}).get("transition_type"),
-        "paired_profile_transition_type": watch_summary.get("paired_profile_transition_type"),
-        "primary_alert_kind": (primary_alert or {}).get("alert_kind") or (primary_alert or {}).get("alert_type"),
-        "primary_alert_message": (primary_alert or {}).get("message") or (primary_alert or {}).get("summary"),
-        "primary_alert_ticker": (primary_alert or {}).get("ticker"),
-        "replay_compare_takeaway": watch_summary.get("replay_compare_takeaway"),
-        "canonical_endpoint": "/safe-fast/continuous/live",
-        "profile_mode": "paired_alert_first",
-    }
-
-    return _json_safe_for_response(
-        {
-            "ok": watch_payload.get("ok"),
-            "mode": "continuous_live",
-            "live_mode": "canonical_alert_first",
-            "build_tag": watch_payload.get("build_tag"),
-            "source_of_truth": watch_payload.get("source_of_truth"),
-            "profile_name": watch_payload.get("profile_name"),
-            "profile_key": profile_key,
-            "base_profile_key": watch_payload.get("base_profile_key"),
-            "default_profile_key": watch_payload.get("default_profile_key"),
-            "replay_profile_key": watch_payload.get("replay_profile_key"),
-            "replay_profile_active": replay_profile_active,
-            "live_status": live_summary.get("alert_status"),
-            "should_alert": bool(alerts),
-            "alert_count": len(alerts),
-            "primary_alert": primary_alert,
-            "alerts": alerts,
-            "read_this_first": "live_summary",
-            "live_summary": live_summary,
-            "watch_summary": watch_summary,
-            "monitor_summary": monitor_summary,
-            "readable_summary": default_lane.get("readable_summary"),
-            "effective_user_facing_why": default_lane.get("effective_user_facing_why"),
-            "transition_summary": default_lane.get("transition_summary"),
-            "true_transition_context": default_lane.get("true_transition_context"),
-            "paired_profile_transition_context": watch_payload.get("paired_profile_transition_context"),
-            "paired_profile_context": watch_payload.get("paired_profile_context"),
-            "persistence": (default_lane.get("persistence") or {}),
-            "compact_ticker_summaries": default_lane.get("compact_ticker_summaries") or [],
-            "market_closed_tester": default_lane.get("market_closed_tester"),
-            "replay_test_context": watch_payload.get("replay_test_context"),
-            "replay_compare_context": default_lane.get("replay_compare_context"),
-            "forming_context": default_lane.get("forming_context"),
-            "forming_alert_payload": default_lane.get("forming_alert_payload"),
-            "on_demand_excerpt": default_lane.get("on_demand_excerpt"),
-            "default_lane": default_lane,
-            "replay_lane": replay_lane,
-            "canonical_hint": {
-                "use_endpoint": "/safe-fast/continuous/live",
-                "shadow_endpoint": "/safe-fast/continuous/shadow",
-                "shadow_is_for_testing_only": True,
-            },
-        }
-    )
-
-
-
 
 
 @app.get("/safe-fast/on-demand/default")
