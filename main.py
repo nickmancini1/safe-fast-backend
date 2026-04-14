@@ -8707,6 +8707,31 @@ async def safe_fast_continuous_live(request: ContinuousShadowRequest) -> Any:
 
 
 
+
+async def _build_continuous_watch_payload(
+    request: ContinuousShadowRequest,
+) -> Dict[str, Any]:
+    monitor_payload = await _build_continuous_monitor_payload(request)
+    monitor_summary = monitor_payload.get("monitor_summary") or {}
+    alerts = monitor_payload.get("alerts") or []
+    primary_alert = alerts[0] if alerts else None
+
+    watch_summary = {
+        **monitor_summary,
+        "watch_status": monitor_summary.get("monitor_status") or ("ALERT" if alerts else "NO_ALERT"),
+    }
+
+    return _json_safe_for_response(
+        {
+            **monitor_payload,
+            "mode": "continuous_watch",
+            "watch_mode": "paired_profiles",
+            "watch_summary": watch_summary,
+            "primary_alert": primary_alert,
+        }
+    )
+
+
 async def _build_continuous_canonical_live_payload(
     request: ContinuousShadowRequest,
 ) -> Dict[str, Any]:
