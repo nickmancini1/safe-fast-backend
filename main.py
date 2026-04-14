@@ -7641,6 +7641,11 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "previous_snapshot_found": bool(previous_snapshot),
         },
         "read_this_first": "readable_summary",
+        "api_surface": {
+            "canonical_continuous_post": "/safe-fast/continuous",
+            "legacy_continuous_post": "/safe-fast/continuous/shadow",
+            "legacy_continuous_hidden_from_schema": True,
+        },
         "readable_summary": current_snapshot.get("readable_summary"),
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
         "replay_test_context": current_snapshot.get("replay_test_context"),
@@ -7653,8 +7658,8 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     return _json_safe_for_response(response_payload)
 
 
-@app.post("/safe-fast/continuous/shadow")
-async def safe_fast_continuous_shadow(request: ContinuousShadowRequest) -> Any:
+@app.post("/safe-fast/continuous")
+async def safe_fast_continuous(request: ContinuousShadowRequest) -> Any:
     try:
         return await _build_continuous_shadow_payload(request)
     except Exception as e:
@@ -7667,12 +7672,22 @@ async def safe_fast_continuous_shadow(request: ContinuousShadowRequest) -> Any:
                 "reason": str(e),
                 "profile_name": _sanitize_continuous_profile_name(request.profile_name),
                 "request_profile": _model_dump(request),
+                "api_surface": {
+                    "canonical_continuous_post": "/safe-fast/continuous",
+                    "legacy_continuous_post": "/safe-fast/continuous/shadow",
+                    "legacy_continuous_hidden_from_schema": True,
+                },
             }
         )
 
 
-@app.get("/safe-fast/continuous/shadow/default", include_in_schema=False)
-async def safe_fast_continuous_shadow_default() -> Any:
+@app.post("/safe-fast/continuous/shadow", include_in_schema=False)
+async def safe_fast_continuous_shadow_legacy(request: ContinuousShadowRequest) -> Any:
+    return await safe_fast_continuous(request)
+
+
+@app.get("/safe-fast/continuous/default", include_in_schema=False)
+async def safe_fast_continuous_default() -> Any:
     try:
         return await _build_continuous_shadow_payload(ContinuousShadowRequest())
     except Exception as e:
@@ -7685,6 +7700,11 @@ async def safe_fast_continuous_shadow_default() -> Any:
                 "reason": str(e),
                 "profile_name": "default",
                 "request_profile": _model_dump(ContinuousShadowRequest()),
+                "api_surface": {
+                    "canonical_continuous_post": "/safe-fast/continuous",
+                    "legacy_continuous_post": "/safe-fast/continuous/shadow",
+                    "legacy_continuous_hidden_from_schema": True,
+                },
             }
         )
 
