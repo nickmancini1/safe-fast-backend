@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# fresh full main.py build with entry_context bridge 2026-04-09T16:05:00Z
+# fresh full main.py build with continuous forming alerts bundle 2026-04-14T04:40:00Z
 
 import asyncio
 
@@ -23,10 +23,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.7")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.6"
+USER_AGENT = "safe-fast-backend/1.8.7"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -6745,7 +6745,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_profile_pair_transition_alerts_2026_04_14",
+        "build_tag": "continuous_forming_alerts_monitor_summary_2026_04_14",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -7324,7 +7324,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_profile_pair_transition_alerts_2026_04_14",
+        "build_tag": "continuous_forming_alerts_monitor_summary_2026_04_14",
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
@@ -7340,6 +7340,12 @@ def _build_continuous_snapshot(
         "structure_ready": trigger_context.get("structure_ready"),
         "approval_ready_now": approval_context.get("approval_ready_now"),
         "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
+        "intrabar_raw_signal_detected": approval_context.get("intrabar_raw_signal_detected"),
+        "completed_raw_signal_detected": approval_context.get("completed_raw_signal_detected"),
+        "raw_signal_present_if_open": market_closed_tester.get("raw_signal_present_if_open"),
+        "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
+        "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
+        "underlying_structural_primary_blocker": market_closed_tester.get("underlying_structural_primary_blocker"),
         "open_positions": request_payload.get("open_positions"),
         "weekly_trade_count": request_payload.get("weekly_trade_count"),
         "invalidation": simple_output.get("invalidation"),
@@ -7410,6 +7416,12 @@ def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]
         "structure_ready",
         "approval_ready_now",
         "approval_ready_on_completed_candle",
+        "intrabar_raw_signal_detected",
+        "completed_raw_signal_detected",
+        "raw_signal_present_if_open",
+        "would_be_trade_if_open",
+        "underlying_structural_verdict",
+        "underlying_structural_primary_blocker",
         "open_positions",
         "weekly_trade_count",
         "replay_test_enabled",
@@ -7478,6 +7490,14 @@ def _compare_continuous_snapshots(
         transition_type = "APPROVAL_STATE_CHANGED"
         severity = "high" if current.get("approval_ready_now") else "medium"
         summary = "Approval state changed."
+    elif previous.get("raw_signal_present_if_open") != current.get("raw_signal_present_if_open"):
+        transition_type = "RAW_SIGNAL_STATE_CHANGED"
+        severity = "medium"
+        summary = "Raw signal state changed."
+    elif previous.get("would_be_trade_if_open") != current.get("would_be_trade_if_open"):
+        transition_type = "WOULD_BE_TRADE_IF_OPEN_CHANGED"
+        severity = "medium"
+        summary = "After-hours structural trade status changed."
     elif previous.get("trigger_present") != current.get("trigger_present"):
         transition_type = "TRIGGER_STATE_CHANGED"
         severity = "medium"
@@ -7563,6 +7583,11 @@ def _build_true_transition_context(
         "trigger_present",
         "approval_ready_now",
         "approval_ready_on_completed_candle",
+        "intrabar_raw_signal_detected",
+        "completed_raw_signal_detected",
+        "raw_signal_present_if_open",
+        "would_be_trade_if_open",
+        "underlying_structural_verdict",
         "current_state",
         "invalidation_hit",
         "replay_test_enabled",
@@ -7682,6 +7707,43 @@ def _build_true_transition_context(
             summary="Trigger disappeared.",
         )
 
+    prev_raw_signal = bool(previous.get("raw_signal_present_if_open") is True)
+    curr_raw_signal = bool(current.get("raw_signal_present_if_open") is True)
+    if not prev_raw_signal and curr_raw_signal:
+        _add_event(
+            "RAW_SIGNAL_APPEARED",
+            previous_value=prev_raw_signal,
+            current_value=curr_raw_signal,
+            severity="medium",
+            summary="Raw signal appeared. SAFE-FAST approval is still pending.",
+        )
+    elif prev_raw_signal and not curr_raw_signal:
+        _add_event(
+            "RAW_SIGNAL_CLEARED",
+            previous_value=prev_raw_signal,
+            current_value=curr_raw_signal,
+            severity="medium",
+            summary="Raw signal cleared before approval.",
+        )
+
+    if previous.get("would_be_trade_if_open") != current.get("would_be_trade_if_open"):
+        _add_event(
+            "WOULD_BE_TRADE_IF_OPEN_CHANGED",
+            previous_value=previous.get("would_be_trade_if_open"),
+            current_value=current.get("would_be_trade_if_open"),
+            severity="medium",
+            summary="After-hours structural trade status changed.",
+        )
+
+    if previous.get("underlying_structural_verdict") != current.get("underlying_structural_verdict"):
+        _add_event(
+            "UNDERLYING_STRUCTURAL_VERDICT_CHANGED",
+            previous_value=previous.get("underlying_structural_verdict"),
+            current_value=current.get("underlying_structural_verdict"),
+            severity="medium",
+            summary="Underlying structural verdict changed.",
+        )
+
     if previous.get("replay_test_enabled") != current.get("replay_test_enabled"):
         _add_event(
             "REPLAY_MODE_CHANGED",
@@ -7773,6 +7835,7 @@ def _build_continuous_alert_payload(
         return None
 
     summary = current_snapshot.get("summary") or {}
+    readable_summary = current_snapshot.get("readable_summary") or {}
     return {
         "should_alert": should_alert,
         "transition_type": transition_summary.get("transition_type"),
@@ -7784,6 +7847,15 @@ def _build_continuous_alert_payload(
         "next_flip_needed": current_snapshot.get("next_flip_needed"),
         "good_idea_now": summary.get("good_idea_now"),
         "action": summary.get("action"),
+        "trigger_present": current_snapshot.get("trigger_present"),
+        "raw_signal_present_if_open": current_snapshot.get("raw_signal_present_if_open"),
+        "would_be_trade_if_open": current_snapshot.get("would_be_trade_if_open"),
+        "underlying_structural_verdict": current_snapshot.get("underlying_structural_verdict"),
+        "effective_user_facing_why": current_snapshot.get("effective_user_facing_why"),
+        "replay_test_enabled": current_snapshot.get("replay_test_enabled"),
+        "replay_trade_allowed": current_snapshot.get("replay_trade_allowed"),
+        "replay_timestamp_et": current_snapshot.get("replay_timestamp_et"),
+        "why_now": readable_summary.get("why_now"),
     }
 
 
@@ -7838,6 +7910,9 @@ def _build_continuous_live_summary(
         "next_flip_needed": readable_summary.get("next_flip_needed"),
         "trigger_present": readable_summary.get("trigger_present"),
         "trigger_reason": readable_summary.get("trigger_reason"),
+        "raw_signal_present_if_open": readable_summary.get("raw_signal_present_if_open"),
+        "would_be_trade_if_open": readable_summary.get("would_be_trade_if_open"),
+        "underlying_structural_verdict": readable_summary.get("underlying_structural_verdict"),
         "market_open": readable_summary.get("market_open"),
         "replay_test_enabled": readable_summary.get("replay_test_enabled"),
         "replay_trade_allowed": readable_summary.get("replay_trade_allowed"),
@@ -7901,6 +7976,11 @@ def _build_continuous_live_payload(shadow_payload: Dict[str, Any]) -> Dict[str, 
             "replay_test_context": shadow_payload.get("replay_test_context"),
             "replay_compare_context": shadow_payload.get("replay_compare_context"),
             "paired_profile_context": shadow_payload.get("paired_profile_context"),
+            "monitor_hint": {
+                "use_endpoint": "/safe-fast/continuous/monitor",
+                "use_default_endpoint": "/safe-fast/continuous/monitor/default",
+                "use_default_simple_endpoint": "/safe-fast/continuous/monitor/default/simple",
+            },
             "on_demand_excerpt": shadow_payload.get("on_demand_excerpt"),
         }
     )
@@ -7938,12 +8018,16 @@ def _build_continuous_monitor_summary(
         "default_next_flip_needed": default_summary.get("next_flip_needed"),
         "default_trigger_present": default_summary.get("trigger_present"),
         "default_trigger_reason": default_summary.get("trigger_reason"),
+        "default_raw_signal_present_if_open": default_summary.get("raw_signal_present_if_open"),
+        "default_would_be_trade_if_open": default_summary.get("would_be_trade_if_open"),
+        "default_underlying_structural_verdict": default_summary.get("underlying_structural_verdict"),
         "default_market_open": default_summary.get("market_open"),
         "replay_trade_allowed": replay_summary.get("replay_trade_allowed"),
         "replay_timestamp_et": replay_summary.get("replay_timestamp_et"),
         "paired_profile_transition_type": replay_transition.get("transition_type"),
         "paired_profile_should_alert": bool(replay_transition.get("should_alert")),
         "paired_profile_summary": replay_transition.get("summary"),
+        "replay_effective_why": replay_summary.get("why_now"),
         "replay_compare_takeaway": replay_context.get("replay_takeaway"),
     }
 
@@ -8102,6 +8186,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "trigger_present": snapshot.get("trigger_present"),
         "trigger_reason": snapshot.get("trigger_reason"),
         "structure_ready": snapshot.get("structure_ready"),
+        "raw_signal_present_if_open": snapshot.get("raw_signal_present_if_open"),
         "market_open": market_open,
         "time_gate_reason": time_gate_reason,
         "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
