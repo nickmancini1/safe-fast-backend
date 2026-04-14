@@ -7658,7 +7658,13 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     return _json_safe_for_response(response_payload)
 
 
-@app.post("/safe-fast/continuous")
+@app.post(
+    "/safe-fast/continuous",
+    tags=["SAFE-FAST"],
+    summary="SAFE-FAST Continuous",
+    description="Canonical production continuous endpoint. Use this route for continuous SAFE-FAST monitoring.",
+    operation_id="safe_fast_continuous",
+)
 async def safe_fast_continuous(request: ContinuousShadowRequest) -> Any:
     try:
         return await _build_continuous_shadow_payload(request)
@@ -7681,12 +7687,12 @@ async def safe_fast_continuous(request: ContinuousShadowRequest) -> Any:
         )
 
 
-@app.post("/safe-fast/continuous/shadow", include_in_schema=False)
+@app.post("/safe-fast/continuous/shadow", include_in_schema=False, deprecated=True)
 async def safe_fast_continuous_shadow_legacy(request: ContinuousShadowRequest) -> Any:
     return await safe_fast_continuous(request)
 
 
-@app.get("/safe-fast/continuous/default", include_in_schema=False)
+@app.get("/safe-fast/continuous/default", include_in_schema=False, deprecated=True)
 async def safe_fast_continuous_default() -> Any:
     try:
         return await _build_continuous_shadow_payload(ContinuousShadowRequest())
@@ -7716,12 +7722,12 @@ def _default_on_demand_request() -> OnDemandRequest:
     )
 
 
-@app.get("/safe-fast/on-demand/default", include_in_schema=False)
+@app.get("/safe-fast/on-demand/default", include_in_schema=False, deprecated=True)
 async def safe_fast_on_demand_default() -> Any:
     return await _build_on_demand_payload(_default_on_demand_request())
 
 
-@app.get("/safe-fast/on-demand/default/simple", include_in_schema=False)
+@app.get("/safe-fast/on-demand/default/simple", include_in_schema=False, deprecated=True)
 async def safe_fast_on_demand_default_simple() -> Any:
     payload = await _build_on_demand_payload(_default_on_demand_request())
     return {
@@ -7734,6 +7740,12 @@ async def safe_fast_on_demand_default_simple() -> Any:
     }
 
 
-@app.post("/safe-fast/on-demand")
+@app.post(
+    "/safe-fast/on-demand",
+    tags=["SAFE-FAST"],
+    summary="SAFE-FAST On Demand",
+    description="Canonical on-demand SAFE-FAST read. Use this route for direct setup decisions.",
+    operation_id="safe_fast_on_demand",
+)
 async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
     return await _build_on_demand_payload(request)
