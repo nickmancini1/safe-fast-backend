@@ -7643,8 +7643,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "read_this_first": "readable_summary",
         "api_surface": {
             "canonical_continuous_post": "/safe-fast/continuous",
-            "legacy_continuous_post": "/safe-fast/continuous/shadow",
-            "legacy_continuous_hidden_from_schema": True,
+            "canonical_on_demand_post": "/safe-fast/on-demand",
         },
         "readable_summary": current_snapshot.get("readable_summary"),
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
@@ -7680,39 +7679,14 @@ async def safe_fast_continuous(request: ContinuousShadowRequest) -> Any:
                 "request_profile": _model_dump(request),
                 "api_surface": {
                     "canonical_continuous_post": "/safe-fast/continuous",
-                    "legacy_continuous_post": "/safe-fast/continuous/shadow",
-                    "legacy_continuous_hidden_from_schema": True,
+                    "canonical_on_demand_post": "/safe-fast/on-demand",
                 },
             }
         )
 
 
-@app.post("/safe-fast/continuous/shadow", include_in_schema=False, deprecated=True)
-async def safe_fast_continuous_shadow_legacy(request: ContinuousShadowRequest) -> Any:
-    return await safe_fast_continuous(request)
 
 
-@app.get("/safe-fast/continuous/default", include_in_schema=False, deprecated=True)
-async def safe_fast_continuous_default() -> Any:
-    try:
-        return await _build_continuous_shadow_payload(ContinuousShadowRequest())
-    except Exception as e:
-        return _json_safe_for_response(
-            {
-                "ok": False,
-                "mode": "continuous_shadow",
-                "shadow_mode": "snapshot_compare_only",
-                "error_type": "continuous_shadow_runtime_error",
-                "reason": str(e),
-                "profile_name": "default",
-                "request_profile": _model_dump(ContinuousShadowRequest()),
-                "api_surface": {
-                    "canonical_continuous_post": "/safe-fast/continuous",
-                    "legacy_continuous_post": "/safe-fast/continuous/shadow",
-                    "legacy_continuous_hidden_from_schema": True,
-                },
-            }
-        )
 
 def _default_on_demand_request() -> OnDemandRequest:
     return OnDemandRequest(
