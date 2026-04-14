@@ -7530,20 +7530,101 @@ def _build_true_transition_context(
     }
 
 
+def _build_continuous_alert_decision_context(
+    *,
+    previous_snapshot: Optional[Dict[str, Any]],
+    current_snapshot: Dict[str, Any],
+    transition_summary: Dict[str, Any],
+    deduped: bool,
+    replay_profile_active: bool,
+) -> Dict[str, Any]:
+    alert_candidate_context = current_snapshot.get("alert_candidate_context") or {}
+    current_alert_candidate = bool(alert_candidate_context.get("should_alert_candidate"))
+    meaningful_transition = bool(transition_summary.get("meaningful_transition"))
+    initial_snapshot = previous_snapshot is None
+    eligible_profile = not replay_profile_active
+
+    suppressed_reasons: List[str] = []
+    if replay_profile_active:
+        suppressed_reasons.append("replay_profile")
+    if initial_snapshot:
+        suppressed_reasons.append("initial_snapshot")
+    if deduped:
+        suppressed_reasons.append("duplicate_transition")
+    if current_alert_candidate and not meaningful_transition and not initial_snapshot:
+        suppressed_reasons.append("no_meaningful_transition")
+    if not current_alert_candidate:
+        suppressed_reasons.append("no_alert_candidate")
+
+    would_alert_now = bool(
+        eligible_profile
+        and current_alert_candidate
+        and not deduped
+        and (meaningful_transition or initial_snapshot)
+    )
+    should_alert = bool(
+        eligible_profile
+        and current_alert_candidate
+        and meaningful_transition
+        and not initial_snapshot
+        and not deduped
+    )
+
+    if should_alert:
+        dispatch_state = "ALERT_READY"
+    elif replay_profile_active and current_alert_candidate:
+        dispatch_state = "SUPPRESSED_REPLAY_PROFILE"
+    elif initial_snapshot and current_alert_candidate:
+        dispatch_state = "SUPPRESSED_INITIAL_SNAPSHOT"
+    elif deduped and current_alert_candidate:
+        dispatch_state = "SUPPRESSED_DUPLICATE"
+    elif current_alert_candidate and not meaningful_transition:
+        dispatch_state = "WAITING_FOR_MEANINGFUL_TRANSITION"
+    else:
+        dispatch_state = "TRACK_ONLY"
+
+    return {
+        "ok": True,
+        "dispatch_state": dispatch_state,
+        "should_alert": should_alert,
+        "would_alert_now": would_alert_now,
+        "current_alert_candidate": current_alert_candidate,
+        "meaningful_transition": meaningful_transition,
+        "initial_snapshot": initial_snapshot,
+        "eligible_profile": eligible_profile,
+        "replay_profile_active": replay_profile_active,
+        "deduped": deduped,
+        "suppressed_reasons": suppressed_reasons,
+        "alert_stage": current_snapshot.get("alert_stage"),
+        "alert_reason": current_snapshot.get("alert_reason"),
+        "alert_severity": current_snapshot.get("alert_severity"),
+    }
+
+
 def _build_continuous_alert_payload(
     *,
     previous_snapshot: Optional[Dict[str, Any]],
     current_snapshot: Dict[str, Any],
     transition_summary: Dict[str, Any],
-    should_alert: bool,
+    alert_decision_context: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    if not previous_snapshot or not transition_summary.get("meaningful_transition"):
+    meaningful_transition = bool(transition_summary.get("meaningful_transition"))
+    current_alert_candidate = bool(alert_decision_context.get("current_alert_candidate"))
+    should_alert = bool(alert_decision_context.get("should_alert"))
+
+    if not current_alert_candidate and not meaningful_transition and not should_alert:
         return None
 
     summary = current_snapshot.get("summary") or {}
-    alert_candidate_context = current_snapshot.get("alert_candidate_context") or {}
     return {
         "should_alert": should_alert,
+        "would_alert_now": alert_decision_context.get("would_alert_now"),
+        "dispatch_state": alert_decision_context.get("dispatch_state"),
+        "initial_snapshot": alert_decision_context.get("initial_snapshot"),
+        "eligible_profile": alert_decision_context.get("eligible_profile"),
+        "replay_profile_active": alert_decision_context.get("replay_profile_active"),
+        "deduped": alert_decision_context.get("deduped"),
+        "suppressed_reasons": alert_decision_context.get("suppressed_reasons"),
         "transition_type": transition_summary.get("transition_type"),
         "severity": transition_summary.get("severity"),
         "message": transition_summary.get("summary"),
@@ -7551,6 +7632,7 @@ def _build_continuous_alert_payload(
         "state": current_snapshot.get("current_state"),
         "alert_stage": current_snapshot.get("alert_stage"),
         "alert_reason": current_snapshot.get("alert_reason"),
+        "alert_severity": current_snapshot.get("alert_severity"),
         "primary_blocker": current_snapshot.get("primary_blocker"),
         "next_flip_needed": current_snapshot.get("next_flip_needed"),
         "good_idea_now": summary.get("good_idea_now"),
@@ -7560,7 +7642,7 @@ def _build_continuous_alert_payload(
         "trigger_present": current_snapshot.get("trigger_present"),
         "approval_ready_now": current_snapshot.get("approval_ready_now"),
         "approval_ready_on_completed_candle": current_snapshot.get("approval_ready_on_completed_candle"),
-        "should_alert_candidate": alert_candidate_context.get("should_alert_candidate"),
+        "should_alert_candidate": current_alert_candidate,
     }
 
 
@@ -7663,6 +7745,10 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
         "alert_stage": snapshot.get("alert_stage"),
         "alert_reason": snapshot.get("alert_reason"),
+        "alert_dispatch_state": snapshot.get("alert_dispatch_state"),
+        "would_alert_now": snapshot.get("would_alert_now"),
+        "should_alert_now": snapshot.get("should_alert_now"),
+        "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
         "why_now": summary_note,
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "invalidation": snapshot.get("invalidation"),
@@ -7700,17 +7786,26 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         and true_transition_context.get("should_alert_candidate")
         and transition_fingerprint == last_alert_fingerprint
     )
-    should_alert = bool(
-        previous_snapshot
-        and true_transition_context.get("should_alert_candidate")
-        and not deduped
+    alert_decision_context = _build_continuous_alert_decision_context(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+        deduped=deduped,
+        replay_profile_active=replay_profile_active,
     )
+    should_alert = bool(alert_decision_context.get("should_alert"))
+
+    current_snapshot["alert_dispatch_state"] = alert_decision_context.get("dispatch_state")
+    current_snapshot["would_alert_now"] = alert_decision_context.get("would_alert_now")
+    current_snapshot["should_alert_now"] = should_alert
+    current_snapshot["alert_suppressed_reasons"] = alert_decision_context.get("suppressed_reasons") or []
+    current_snapshot["readable_summary"] = _build_continuous_readable_summary(current_snapshot)
 
     alert_payload = _build_continuous_alert_payload(
         previous_snapshot=previous_snapshot,
         current_snapshot=current_snapshot,
         transition_summary=true_transition_context,
-        should_alert=should_alert,
+        alert_decision_context=alert_decision_context,
     )
 
     persisted = False
@@ -7758,6 +7853,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "deduped": deduped,
             "transition_fingerprint": transition_fingerprint,
         },
+        "alert_decision_context": alert_decision_context,
         "alert_payload": alert_payload,
         "persistence": {
             "enabled": request.persist_state,
