@@ -6745,7 +6745,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_forming_alerts_monitor_summary_2026_04_14",
+        "build_tag": "continuous_forming_alerts_live_watch_2026_04_14",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -7324,7 +7324,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_forming_alerts_monitor_summary_2026_04_14",
+        "build_tag": "continuous_forming_alerts_live_watch_2026_04_14",
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
@@ -7860,6 +7860,139 @@ def _build_continuous_alert_payload(
 
 
 
+def _build_continuous_forming_context(current_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    summary = current_snapshot.get("summary") or {}
+    readable_summary = current_snapshot.get("readable_summary") or {}
+    setup_type = current_snapshot.get("setup_type")
+    allowed_setup = _is_allowed_setup_type_name(setup_type)
+    approval_ready = bool(
+        current_snapshot.get("approval_ready_now")
+        or current_snapshot.get("approval_ready_on_completed_candle")
+    )
+    invalidation_hit = bool(current_snapshot.get("invalidation_hit"))
+    raw_signal_detected = bool(
+        current_snapshot.get("intrabar_raw_signal_detected")
+        or current_snapshot.get("completed_raw_signal_detected")
+        or current_snapshot.get("raw_signal_present_if_open")
+    )
+    market_open = bool(current_snapshot.get("market_open"))
+    fresh_entry_allowed = bool(current_snapshot.get("fresh_entry_allowed"))
+    would_be_trade_if_open = bool(current_snapshot.get("would_be_trade_if_open"))
+    replay_test_enabled = bool(current_snapshot.get("replay_test_enabled"))
+    replay_trade_allowed = bool(current_snapshot.get("replay_trade_allowed"))
+    forming_type: Optional[str] = None
+    forming_summary: Optional[str] = None
+    severity = "medium"
+
+    if not invalidation_hit and not approval_ready:
+        if replay_test_enabled and replay_trade_allowed:
+            forming_type = "REPLAY_TRADE_ALLOWED"
+            forming_summary = (
+                "Replay lane says this setup would be tradable at the supplied replay timestamp."
+            )
+        elif not market_open and would_be_trade_if_open:
+            forming_type = "AFTER_HOURS_WOULD_BE_TRADE"
+            forming_summary = (
+                "After-hours tester says structure would qualify if the market were open."
+            )
+        elif allowed_setup and raw_signal_detected:
+            forming_type = "RAW_SIGNAL_WAITING_FOR_APPROVAL"
+            forming_summary = (
+                "A raw signal is visible, but SAFE-FAST approval is still waiting on the remaining gates."
+            )
+        elif allowed_setup and current_snapshot.get("primary_blocker") == "time_day_gate":
+            forming_type = "ALLOWED_SETUP_WAITING_FOR_WINDOW"
+            forming_summary = (
+                "An allowed setup is in place, but the entry window is currently closed."
+            )
+
+    eligible = bool(forming_type)
+    return {
+        "ok": True,
+        "eligible": eligible,
+        "forming_type": forming_type,
+        "severity": severity if eligible else "info",
+        "summary": forming_summary if eligible else "No forming setup alert right now.",
+        "ticker": summary.get("ticker"),
+        "state": current_snapshot.get("current_state"),
+        "setup_type": setup_type,
+        "allowed_setup": allowed_setup,
+        "approval_ready_now": current_snapshot.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": current_snapshot.get(
+            "approval_ready_on_completed_candle"
+        ),
+        "raw_signal_detected": raw_signal_detected,
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "would_be_trade_if_open": would_be_trade_if_open,
+        "replay_test_enabled": replay_test_enabled,
+        "replay_trade_allowed": replay_trade_allowed,
+        "replay_timestamp_et": current_snapshot.get("replay_timestamp_et"),
+        "primary_blocker": current_snapshot.get("primary_blocker"),
+        "next_flip_needed": current_snapshot.get("next_flip_needed"),
+        "why_now": readable_summary.get("why_now"),
+        "effective_user_facing_why": current_snapshot.get("effective_user_facing_why"),
+    }
+
+
+def _continuous_forming_alert_fingerprint(
+    forming_context: Dict[str, Any],
+) -> Optional[str]:
+    if not forming_context.get("eligible"):
+        return None
+    payload = {
+        "ticker": forming_context.get("ticker"),
+        "forming_type": forming_context.get("forming_type"),
+        "state": forming_context.get("state"),
+        "primary_blocker": forming_context.get("primary_blocker"),
+        "next_flip_needed": forming_context.get("next_flip_needed"),
+        "market_open": forming_context.get("market_open"),
+        "fresh_entry_allowed": forming_context.get("fresh_entry_allowed"),
+        "raw_signal_detected": forming_context.get("raw_signal_detected"),
+        "would_be_trade_if_open": forming_context.get("would_be_trade_if_open"),
+        "replay_trade_allowed": forming_context.get("replay_trade_allowed"),
+        "replay_timestamp_et": forming_context.get("replay_timestamp_et"),
+    }
+    raw = json.dumps(_json_safe_for_response(payload), sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _build_continuous_forming_alert_payload(
+    *,
+    forming_context: Dict[str, Any],
+    should_alert: bool,
+    deduped: bool,
+    transition_fingerprint: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not forming_context.get("eligible"):
+        return None
+    return {
+        "ok": True,
+        "alert_type": "forming_setup",
+        "should_alert": should_alert,
+        "deduped": deduped,
+        "transition_fingerprint": transition_fingerprint,
+        "forming_type": forming_context.get("forming_type"),
+        "severity": forming_context.get("severity"),
+        "message": forming_context.get("summary"),
+        "ticker": forming_context.get("ticker"),
+        "state": forming_context.get("state"),
+        "setup_type": forming_context.get("setup_type"),
+        "primary_blocker": forming_context.get("primary_blocker"),
+        "next_flip_needed": forming_context.get("next_flip_needed"),
+        "market_open": forming_context.get("market_open"),
+        "fresh_entry_allowed": forming_context.get("fresh_entry_allowed"),
+        "raw_signal_detected": forming_context.get("raw_signal_detected"),
+        "would_be_trade_if_open": forming_context.get("would_be_trade_if_open"),
+        "replay_test_enabled": forming_context.get("replay_test_enabled"),
+        "replay_trade_allowed": forming_context.get("replay_trade_allowed"),
+        "replay_timestamp_et": forming_context.get("replay_timestamp_et"),
+        "why_now": forming_context.get("why_now"),
+        "effective_user_facing_why": forming_context.get("effective_user_facing_why"),
+    }
+
+
+
 def _build_continuous_live_alerts(
     shadow_payload: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -7884,6 +8017,17 @@ def _build_continuous_live_alerts(
                 "alert_lane": "paired_profile",
                 "alert_kind": "profile_divergence",
                 **paired_alert,
+            }
+        )
+
+    forming_alert = shadow_payload.get("forming_alert_payload")
+    if isinstance(forming_alert, dict) and forming_alert.get("should_alert"):
+        alerts.append(
+            {
+                "ok": True,
+                "alert_lane": "current_profile",
+                "alert_kind": "forming_setup",
+                **forming_alert,
             }
         )
 
@@ -7925,6 +8069,16 @@ def _build_continuous_live_summary(
         "paired_profile_alert_ready": bool(
             (shadow_payload.get("paired_profile_alert_payload") or {}).get("should_alert")
         ),
+        "forming_alert_ready": bool(
+            (shadow_payload.get("forming_alert_payload") or {}).get("should_alert")
+        ),
+        "forming_status": (
+            "FORMING"
+            if (shadow_payload.get("forming_context") or {}).get("eligible")
+            else "NONE"
+        ),
+        "forming_type": (shadow_payload.get("forming_context") or {}).get("forming_type"),
+        "forming_summary": (shadow_payload.get("forming_context") or {}).get("summary"),
         "true_transition_type": true_transition_context.get("transition_type"),
         "paired_profile_transition_type": paired_profile_transition_context.get("transition_type"),
     }
@@ -7976,6 +8130,8 @@ def _build_continuous_live_payload(shadow_payload: Dict[str, Any]) -> Dict[str, 
             "replay_test_context": shadow_payload.get("replay_test_context"),
             "replay_compare_context": shadow_payload.get("replay_compare_context"),
             "paired_profile_context": shadow_payload.get("paired_profile_context"),
+            "forming_context": shadow_payload.get("forming_context"),
+            "forming_alert_payload": shadow_payload.get("forming_alert_payload"),
             "monitor_hint": {
                 "use_endpoint": "/safe-fast/continuous/monitor",
                 "use_default_endpoint": "/safe-fast/continuous/monitor/default",
@@ -8022,8 +8178,13 @@ def _build_continuous_monitor_summary(
         "default_would_be_trade_if_open": default_summary.get("would_be_trade_if_open"),
         "default_underlying_structural_verdict": default_summary.get("underlying_structural_verdict"),
         "default_market_open": default_summary.get("market_open"),
+        "default_forming_status": default_summary.get("forming_status"),
+        "default_forming_type": default_summary.get("forming_type"),
+        "default_forming_summary": default_summary.get("forming_summary"),
         "replay_trade_allowed": replay_summary.get("replay_trade_allowed"),
         "replay_timestamp_et": replay_summary.get("replay_timestamp_et"),
+        "replay_forming_status": replay_summary.get("forming_status"),
+        "replay_forming_type": replay_summary.get("forming_type"),
         "paired_profile_transition_type": replay_transition.get("transition_type"),
         "paired_profile_should_alert": bool(replay_transition.get("should_alert")),
         "paired_profile_summary": replay_transition.get("summary"),
@@ -8197,6 +8358,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
         "replay_compare_takeaway": replay_compare_context.get("compare_takeaway"),
         "effective_user_facing_why": replay_compare_context.get("effective_user_facing_why"),
+        "forming_type": (snapshot.get("forming_context") or {}).get("forming_type"),
+        "forming_summary": (snapshot.get("forming_context") or {}).get("summary"),
         "why_now": summary_note,
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "invalidation": snapshot.get("invalidation"),
@@ -8253,6 +8416,27 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         transition_summary=true_transition_context,
         should_alert=should_alert,
     )
+    forming_context = _build_continuous_forming_context(current_snapshot)
+    forming_transition_fingerprint = _continuous_forming_alert_fingerprint(forming_context)
+    last_forming_alert_fingerprint = stored_state.get("last_forming_alert_fingerprint")
+    forming_deduped = bool(
+        forming_context.get("eligible")
+        and forming_transition_fingerprint
+        and forming_transition_fingerprint == last_forming_alert_fingerprint
+    )
+    forming_should_alert = bool(
+        forming_context.get("eligible")
+        and forming_transition_fingerprint
+        and not forming_deduped
+    )
+    forming_alert_payload = _build_continuous_forming_alert_payload(
+        forming_context=forming_context,
+        should_alert=forming_should_alert,
+        deduped=forming_deduped,
+        transition_fingerprint=forming_transition_fingerprint,
+    )
+    current_snapshot["forming_context"] = forming_context
+    current_snapshot["readable_summary"] = _build_continuous_readable_summary(current_snapshot)
     paired_profile_context = _build_paired_profile_context(
         current_snapshot=current_snapshot,
         sibling_snapshot=sibling_snapshot,
@@ -8309,6 +8493,18 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
                 "last_pair_transition_fingerprint": pair_transition_fingerprint,
                 "last_pair_alert_fingerprint": pair_transition_fingerprint if pair_should_alert else last_pair_alert_fingerprint,
                 "last_pair_alert_timestamp": current_snapshot.get("timestamp_et") if pair_should_alert else stored_state.get("last_pair_alert_timestamp"),
+                "last_forming_alert_fingerprint": (
+                    forming_transition_fingerprint if forming_context.get("eligible") else None
+                ),
+                "last_forming_alert_timestamp": (
+                    current_snapshot.get("timestamp_et")
+                    if forming_should_alert
+                    else (
+                        stored_state.get("last_forming_alert_timestamp")
+                        if forming_context.get("eligible")
+                        else None
+                    )
+                ),
             },
         )
 
@@ -8357,12 +8553,15 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "should_alert": pair_should_alert,
         },
         "paired_profile_alert_payload": paired_profile_alert_payload,
+        "forming_context": forming_context,
+        "forming_alert_payload": forming_alert_payload,
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
         "on_demand_excerpt": {
             **_build_continuous_on_demand_excerpt(on_demand_payload),
             "replay_test_context": current_snapshot.get("replay_test_context"),
             "replay_compare_context": current_snapshot.get("replay_compare_context"),
             "paired_profile_context": paired_profile_context,
+            "forming_context": forming_context,
             "paired_profile_transition_context": {
                 **paired_profile_transition_context,
                 "deduped": pair_deduped,
