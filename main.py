@@ -1263,6 +1263,125 @@ def _time_day_gate(market_context: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _market_context_at(dt_et: datetime) -> Dict[str, Any]:
+    is_weekday = dt_et.weekday() < 5
+    in_regular_session = time(9, 30) <= dt_et.time() < time(16, 0)
+    is_open = is_weekday and in_regular_session
+
+    return {
+        "is_open": is_open,
+        "as_of_et": dt_et.isoformat(timespec="seconds"),
+        "session": "regular" if is_open else "closed",
+    }
+
+
+def _parse_replay_timestamp_et(value: Optional[str]) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=NY_TZ)
+
+    try:
+        return parsed.astimezone(NY_TZ)
+    except Exception:
+        return None
+
+
+def _build_replay_test_context(
+    current_snapshot: Dict[str, Any],
+    request: Optional[ContinuousShadowRequest],
+) -> Dict[str, Any]:
+    replay_timestamp_raw = None if request is None else request.replay_timestamp_et
+    replay_label = None if request is None else request.replay_label
+
+    if not replay_timestamp_raw:
+        return {
+            "ok": True,
+            "enabled": False,
+            "status": "disabled",
+            "scope": "time_gate_only_static_structure_baseline",
+            "why": "no_replay_timestamp_et_supplied",
+        }
+
+    replay_dt = _parse_replay_timestamp_et(replay_timestamp_raw)
+    if replay_dt is None:
+        return {
+            "ok": False,
+            "enabled": True,
+            "status": "invalid_replay_timestamp",
+            "scope": "time_gate_only_static_structure_baseline",
+            "requested_replay_timestamp_et": replay_timestamp_raw,
+            "why": "could_not_parse_replay_timestamp_et",
+        }
+
+    replay_market_context = _market_context_at(replay_dt)
+    replay_time_day_gate = _time_day_gate(replay_market_context)
+    market_closed_tester = current_snapshot.get("market_closed_tester") or {}
+    structural_verdict = str(
+        market_closed_tester.get("underlying_structural_verdict")
+        or current_snapshot.get("final_verdict")
+        or "unconfirmed"
+    ).upper()
+    structural_primary_blocker = (
+        market_closed_tester.get("underlying_structural_primary_blocker")
+        or current_snapshot.get("primary_blocker")
+    )
+    structural_blockers = _ordered_unique_strings(
+        market_closed_tester.get("underlying_structural_blockers")
+        or current_snapshot.get("decision_blockers")
+        or []
+    )
+    would_be_trade_if_open = bool(market_closed_tester.get("would_be_trade_if_open") is True)
+    replay_trade_allowed = bool(
+        replay_market_context.get("is_open") is True
+        and replay_time_day_gate.get("fresh_entry_allowed") is True
+        and would_be_trade_if_open
+    )
+
+    if replay_trade_allowed:
+        replay_takeaway = "Replay tester says this baseline would qualify at the requested replay time."
+    elif replay_market_context.get("is_open") is False:
+        replay_takeaway = (
+            "Replay tester says the requested replay time is outside the regular session, "
+            "so live entry would still be blocked there."
+        )
+    elif structural_verdict == "NO_TRADE":
+        replay_takeaway = (
+            "Replay tester says time would allow entry there, but structure from the current baseline still fails."
+        )
+    else:
+        replay_takeaway = (
+            "Replay tester says time would allow entry there, but approval still would not be ready from the current baseline."
+        )
+
+    return {
+        "ok": True,
+        "enabled": True,
+        "status": "ready",
+        "scope": "time_gate_only_static_structure_baseline",
+        "requested_replay_timestamp_et": replay_timestamp_raw,
+        "resolved_replay_timestamp_et": replay_dt.isoformat(timespec="seconds"),
+        "replay_label": replay_label,
+        "replay_market_context": replay_market_context,
+        "replay_time_day_gate": replay_time_day_gate,
+        "replay_market_open": replay_market_context.get("is_open"),
+        "replay_fresh_entry_allowed": replay_time_day_gate.get("fresh_entry_allowed"),
+        "underlying_structural_verdict": structural_verdict,
+        "underlying_structural_primary_blocker": structural_primary_blocker,
+        "underlying_structural_blockers": structural_blockers,
+        "would_be_trade_if_open": would_be_trade_if_open,
+        "replay_trade_allowed": replay_trade_allowed,
+        "replay_takeaway": replay_takeaway,
+    }
+
+
 def _other_ticker_candidates(
     summary_payload: Dict[str, Any],
     best_ticker: Optional[str],
@@ -6287,7 +6406,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_compact_ticker_summary_market_closed_tester_2026_04_13",
+        "build_tag": "continuous_compact_ticker_summary_market_closed_tester_true_transition_replay_test_2026_04_13",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -6474,6 +6593,8 @@ async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
 class ContinuousShadowRequest(OnDemandRequest):
     profile_name: str = "default"
     persist_state: bool = True
+    replay_timestamp_et: Optional[str] = None
+    replay_label: Optional[str] = None
 
 
 def _model_dump(model: BaseModel) -> Dict[str, Any]:
@@ -6498,6 +6619,8 @@ def _continuous_shadow_to_on_demand_request(request: ContinuousShadowRequest) ->
     payload = _model_dump(request)
     payload.pop("profile_name", None)
     payload.pop("persist_state", None)
+    payload.pop("replay_timestamp_et", None)
+    payload.pop("replay_label", None)
     return OnDemandRequest(**payload)
 
 
@@ -6828,6 +6951,7 @@ def _build_continuous_snapshot(
     request: OnDemandRequest,
     profile_name: str,
     profile_key: str,
+    shadow_request: Optional[ContinuousShadowRequest] = None,
 ) -> Dict[str, Any]:
     request_payload = _model_dump(request)
     simple_output = on_demand_payload.get("simple_output") or {}
@@ -6847,7 +6971,7 @@ def _build_continuous_snapshot(
         "profile_name": profile_name,
         "profile_key": profile_key,
         "request_profile": request_payload,
-        "build_tag": on_demand_payload.get("build_tag"),
+        "build_tag": "continuous_compact_ticker_summary_market_closed_tester_true_transition_replay_test_2026_04_13",
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
@@ -6884,6 +7008,7 @@ def _build_continuous_snapshot(
             "why": simple_output.get("why"),
         },
         "market_closed_tester": market_closed_tester,
+        "replay_test_context": {},
         "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
     }
     snapshot["latent_structure_state"] = _derive_continuous_structure_state(snapshot)
@@ -6900,6 +7025,7 @@ def _build_continuous_snapshot(
         snapshot.get("latent_structure_state"),
     )
     snapshot["invalidation_hit"] = snapshot.get("current_state") == "EXIT_NOW"
+    snapshot["replay_test_context"] = _build_replay_test_context(snapshot, shadow_request)
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
 
@@ -7260,6 +7386,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
     failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
     market_closed_tester = snapshot.get("market_closed_tester") or {}
+    replay_test_context = snapshot.get("replay_test_context") or {}
 
     underlying_state = current_state
     if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and latent_structure_state:
@@ -7306,6 +7433,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
         "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
         "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
+        "replay_test_enabled": replay_test_context.get("enabled"),
+        "replay_trade_allowed": replay_test_context.get("replay_trade_allowed"),
+        "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
         "why_now": summary_note,
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "invalidation": snapshot.get("invalidation"),
@@ -7326,6 +7456,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         request=on_demand_request,
         profile_name=profile_name,
         profile_key=profile_key,
+        shadow_request=request,
     )
     transition_summary = _compare_continuous_snapshots(previous_snapshot, current_snapshot)
     true_transition_context = _build_true_transition_context(previous_snapshot, current_snapshot)
@@ -7406,8 +7537,12 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "read_this_first": "readable_summary",
         "readable_summary": current_snapshot.get("readable_summary"),
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
+        "replay_test_context": current_snapshot.get("replay_test_context"),
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
-        "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
+        "on_demand_excerpt": {
+            **_build_continuous_on_demand_excerpt(on_demand_payload),
+            "replay_test_context": current_snapshot.get("replay_test_context"),
+        },
     }
     return _json_safe_for_response(response_payload)
 
