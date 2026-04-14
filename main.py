@@ -6408,7 +6408,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_compact_ticker_summary_market_closed_tester_true_transition_replay_test_2026_04_13",
+        "build_tag": "continuous_replay_transition_profile_sandbox_2026_04_14",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -6968,12 +6968,22 @@ def _build_continuous_snapshot(
     time_day_gate = on_demand_payload.get("time_day_gate") or {}
     market_closed_tester = _build_market_closed_tester_block(on_demand_payload)
 
+    shadow_request_profile = {
+        "profile_name": shadow_request.profile_name if shadow_request else profile_name,
+        "persist_state": shadow_request.persist_state if shadow_request else None,
+        "replay_timestamp_et": shadow_request.replay_timestamp_et if shadow_request else None,
+        "replay_label": shadow_request.replay_label if shadow_request else None,
+    }
+
     snapshot: Dict[str, Any] = {
         "timestamp_et": market_context.get("as_of_et") or datetime.now(NY_TZ).isoformat(),
         "profile_name": profile_name,
         "profile_key": profile_key,
+        "base_profile_key": profile_key.replace("__replay", "") if isinstance(profile_key, str) else profile_key,
+        "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
-        "build_tag": "continuous_compact_ticker_summary_market_closed_tester_true_transition_replay_test_2026_04_13",
+        "shadow_request_profile": shadow_request_profile,
+        "build_tag": "continuous_replay_transition_profile_sandbox_2026_04_14",
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
@@ -7027,7 +7037,14 @@ def _build_continuous_snapshot(
         snapshot.get("latent_structure_state"),
     )
     snapshot["invalidation_hit"] = snapshot.get("current_state") == "EXIT_NOW"
-    snapshot["replay_test_context"] = _build_replay_test_context(snapshot, shadow_request)
+    replay_test_context = _build_replay_test_context(snapshot, shadow_request)
+    snapshot["replay_test_context"] = replay_test_context
+    snapshot["replay_test_enabled"] = replay_test_context.get("enabled")
+    snapshot["replay_status"] = replay_test_context.get("status")
+    snapshot["replay_trade_allowed"] = replay_test_context.get("replay_trade_allowed")
+    snapshot["replay_timestamp_et"] = replay_test_context.get("resolved_replay_timestamp_et")
+    snapshot["replay_market_open"] = replay_test_context.get("replay_market_open")
+    snapshot["replay_fresh_entry_allowed"] = replay_test_context.get("replay_fresh_entry_allowed")
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
 
@@ -7049,6 +7066,11 @@ def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]
         "approval_ready_on_completed_candle",
         "open_positions",
         "weekly_trade_count",
+        "replay_test_enabled",
+        "replay_timestamp_et",
+        "replay_trade_allowed",
+        "replay_market_open",
+        "replay_fresh_entry_allowed",
     ]
     changes: Dict[str, Dict[str, Any]] = {}
     for field in tracked_fields:
@@ -7114,6 +7136,27 @@ def _compare_continuous_snapshots(
         transition_type = "TRIGGER_STATE_CHANGED"
         severity = "medium"
         summary = "Trigger state changed."
+    elif previous.get("replay_test_enabled") != current.get("replay_test_enabled"):
+        transition_type = "REPLAY_MODE_CHANGED"
+        severity = "medium"
+        summary = "Replay mode changed."
+    elif previous.get("replay_timestamp_et") != current.get("replay_timestamp_et"):
+        transition_type = "REPLAY_TIMESTAMP_CHANGED"
+        severity = "medium"
+        summary = (
+            f"Replay timestamp changed from {previous.get('replay_timestamp_et')} to {current.get('replay_timestamp_et')}."
+        )
+    elif previous.get("replay_trade_allowed") != current.get("replay_trade_allowed"):
+        transition_type = "REPLAY_TRADE_PERMISSION_CHANGED"
+        severity = "medium"
+        summary = "Replay trade permission changed."
+    elif (
+        previous.get("replay_market_open") != current.get("replay_market_open")
+        or previous.get("replay_fresh_entry_allowed") != current.get("replay_fresh_entry_allowed")
+    ):
+        transition_type = "REPLAY_TIME_GATE_CHANGED"
+        severity = "medium"
+        summary = "Replay time gate changed."
     elif (
         previous.get("open_positions") != current.get("open_positions")
         or previous.get("weekly_trade_count") != current.get("weekly_trade_count")
@@ -7152,6 +7195,11 @@ def _continuous_transition_fingerprint(
         "approval_ready_on_completed_candle": current_snapshot.get("approval_ready_on_completed_candle"),
         "open_positions": current_snapshot.get("open_positions"),
         "weekly_trade_count": current_snapshot.get("weekly_trade_count"),
+        "replay_test_enabled": current_snapshot.get("replay_test_enabled"),
+        "replay_timestamp_et": current_snapshot.get("replay_timestamp_et"),
+        "replay_trade_allowed": current_snapshot.get("replay_trade_allowed"),
+        "replay_market_open": current_snapshot.get("replay_market_open"),
+        "replay_fresh_entry_allowed": current_snapshot.get("replay_fresh_entry_allowed"),
     }
     return hashlib.sha1(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -7171,6 +7219,11 @@ def _build_true_transition_context(
         "approval_ready_on_completed_candle",
         "current_state",
         "invalidation_hit",
+        "replay_test_enabled",
+        "replay_timestamp_et",
+        "replay_trade_allowed",
+        "replay_market_open",
+        "replay_fresh_entry_allowed",
     ]
 
     if not previous:
@@ -7281,6 +7334,53 @@ def _build_true_transition_context(
             current_value=current.get("trigger_present"),
             severity="medium",
             summary="Trigger disappeared.",
+        )
+
+    if previous.get("replay_test_enabled") != current.get("replay_test_enabled"):
+        _add_event(
+            "REPLAY_MODE_CHANGED",
+            previous_value=previous.get("replay_test_enabled"),
+            current_value=current.get("replay_test_enabled"),
+            severity="medium",
+            summary="Replay mode changed.",
+        )
+
+    if previous.get("replay_timestamp_et") != current.get("replay_timestamp_et"):
+        _add_event(
+            "REPLAY_TIMESTAMP_CHANGED",
+            previous_value=previous.get("replay_timestamp_et"),
+            current_value=current.get("replay_timestamp_et"),
+            severity="medium",
+            summary=(
+                f"Replay timestamp changed from {previous.get('replay_timestamp_et')} to {current.get('replay_timestamp_et')}."
+            ),
+        )
+
+    if previous.get("replay_trade_allowed") != current.get("replay_trade_allowed"):
+        _add_event(
+            "REPLAY_TRADE_PERMISSION_CHANGED",
+            previous_value=previous.get("replay_trade_allowed"),
+            current_value=current.get("replay_trade_allowed"),
+            severity="medium",
+            summary="Replay trade permission changed.",
+        )
+
+    if (
+        previous.get("replay_market_open") != current.get("replay_market_open")
+        or previous.get("replay_fresh_entry_allowed") != current.get("replay_fresh_entry_allowed")
+    ):
+        _add_event(
+            "REPLAY_TIME_GATE_CHANGED",
+            previous_value={
+                "replay_market_open": previous.get("replay_market_open"),
+                "replay_fresh_entry_allowed": previous.get("replay_fresh_entry_allowed"),
+            },
+            current_value={
+                "replay_market_open": current.get("replay_market_open"),
+                "replay_fresh_entry_allowed": current.get("replay_fresh_entry_allowed"),
+            },
+            severity="medium",
+            summary="Replay time gate changed.",
         )
 
     transition_detected = bool(events)
@@ -7447,7 +7547,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
 async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
     profile_name = _sanitize_continuous_profile_name(request.profile_name)
     on_demand_request = _continuous_shadow_to_on_demand_request(request)
-    profile_key = _continuous_profile_key(profile_name, on_demand_request)
+    base_profile_key = _continuous_profile_key(profile_name, on_demand_request)
+    replay_profile_active = bool(request.replay_timestamp_et or request.replay_label)
+    profile_key = f"{base_profile_key}__replay" if replay_profile_active else base_profile_key
 
     stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
     previous_snapshot = stored_state.get("latest_snapshot")
@@ -7515,6 +7617,8 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "source_of_truth": "frozen_on_demand_baseline",
         "profile_name": profile_name,
         "profile_key": profile_key,
+        "base_profile_key": base_profile_key,
+        "replay_profile_active": replay_profile_active,
         "current_snapshot": current_snapshot,
         "previous_snapshot": previous_snapshot,
         "transition_summary": {
