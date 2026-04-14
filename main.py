@@ -1464,6 +1464,100 @@ def _build_replay_compare_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _build_paired_profile_context(
+    current_snapshot: Dict[str, Any],
+    sibling_snapshot: Optional[Dict[str, Any]],
+    current_profile_key: str,
+    sibling_profile_key: str,
+    replay_profile_active: bool,
+) -> Dict[str, Any]:
+    if not sibling_snapshot:
+        return {
+            "ok": True,
+            "available": False,
+            "status": "unavailable",
+            "current_profile_key": current_profile_key,
+            "sibling_profile_key": sibling_profile_key,
+            "current_replay_profile_active": replay_profile_active,
+            "sibling_replay_profile_active": not replay_profile_active,
+            "why": "no_sibling_snapshot_found",
+        }
+
+    watched_fields = [
+        "current_state",
+        "primary_blocker",
+        "setup_type",
+        "trigger_present",
+        "approval_ready_now",
+        "approval_ready_on_completed_candle",
+        "invalidation_hit",
+        "replay_test_enabled",
+        "replay_trade_allowed",
+        "replay_market_open",
+        "replay_fresh_entry_allowed",
+    ]
+    changed_fields: Dict[str, Dict[str, Any]] = {}
+    for field in watched_fields:
+        current_value = current_snapshot.get(field)
+        sibling_value = sibling_snapshot.get(field)
+        if current_value != sibling_value:
+            changed_fields[field] = {
+                "current": current_value,
+                "sibling": sibling_value,
+            }
+
+    current_readable = current_snapshot.get("readable_summary") or {}
+    sibling_readable = sibling_snapshot.get("readable_summary") or {}
+
+    if changed_fields:
+        pair_takeaway = (
+            "Live and replay profile lanes are now isolated. Use this block to compare the two persisted summaries side by side."
+        )
+    else:
+        pair_takeaway = "Live and replay profile lanes currently agree on all watched fields."
+
+    return {
+        "ok": True,
+        "available": True,
+        "status": "ready",
+        "current_profile_key": current_profile_key,
+        "sibling_profile_key": sibling_profile_key,
+        "current_replay_profile_active": replay_profile_active,
+        "sibling_replay_profile_active": not replay_profile_active,
+        "changed_fields": changed_fields,
+        "watched_fields": watched_fields,
+        "pair_takeaway": pair_takeaway,
+        "current": {
+            "profile_key": current_profile_key,
+            "timestamp_et": current_snapshot.get("timestamp_et"),
+            "replay_profile_active": replay_profile_active,
+            "market_open": current_snapshot.get("market_open"),
+            "fresh_entry_allowed": current_snapshot.get("fresh_entry_allowed"),
+            "replay_test_enabled": current_snapshot.get("replay_test_enabled"),
+            "replay_timestamp_et": current_snapshot.get("replay_timestamp_et"),
+            "replay_trade_allowed": current_snapshot.get("replay_trade_allowed"),
+            "current_state": current_snapshot.get("current_state"),
+            "primary_blocker": current_snapshot.get("primary_blocker"),
+            "effective_user_facing_why": current_snapshot.get("effective_user_facing_why"),
+            "readable_summary": current_readable,
+        },
+        "sibling": {
+            "profile_key": sibling_profile_key,
+            "timestamp_et": sibling_snapshot.get("timestamp_et"),
+            "replay_profile_active": bool(sibling_snapshot.get("replay_profile_active")),
+            "market_open": sibling_snapshot.get("market_open"),
+            "fresh_entry_allowed": sibling_snapshot.get("fresh_entry_allowed"),
+            "replay_test_enabled": sibling_snapshot.get("replay_test_enabled"),
+            "replay_timestamp_et": sibling_snapshot.get("replay_timestamp_et"),
+            "replay_trade_allowed": sibling_snapshot.get("replay_trade_allowed"),
+            "current_state": sibling_snapshot.get("current_state"),
+            "primary_blocker": sibling_snapshot.get("primary_blocker"),
+            "effective_user_facing_why": sibling_snapshot.get("effective_user_facing_why"),
+            "readable_summary": sibling_readable,
+        },
+    }
+
+
 def _other_ticker_candidates(
     summary_payload: Dict[str, Any],
     best_ticker: Optional[str],
@@ -6488,7 +6582,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_replay_compare_context_2026_04_14",
+        "build_tag": "continuous_replay_profile_pair_compare_2026_04_14",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -6724,6 +6818,10 @@ def _continuous_profile_key(profile_name: str, request: OnDemandRequest) -> str:
 
 def _continuous_state_path(profile_key: str) -> Path:
     return _continuous_state_dir() / f"{profile_key}.json"
+
+
+def _continuous_sibling_profile_key(base_profile_key: str, replay_profile_active: bool) -> str:
+    return base_profile_key if replay_profile_active else f"{base_profile_key}__replay"
 
 
 def _load_continuous_state(profile_key: str) -> Dict[str, Any]:
@@ -7063,7 +7161,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_replay_compare_context_2026_04_14",
+        "build_tag": "continuous_replay_profile_pair_compare_2026_04_14",
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
@@ -7643,6 +7741,13 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
 
     stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
     previous_snapshot = stored_state.get("latest_snapshot")
+    sibling_profile_key = _continuous_sibling_profile_key(base_profile_key, replay_profile_active)
+    sibling_state = (
+        _load_continuous_state(sibling_profile_key)
+        if request.persist_state and sibling_profile_key != profile_key
+        else {}
+    )
+    sibling_snapshot = sibling_state.get("latest_snapshot")
 
     on_demand_payload = await _build_on_demand_payload(on_demand_request)
     current_snapshot = _build_continuous_snapshot(
@@ -7676,6 +7781,13 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         current_snapshot=current_snapshot,
         transition_summary=true_transition_context,
         should_alert=should_alert,
+    )
+    paired_profile_context = _build_paired_profile_context(
+        current_snapshot=current_snapshot,
+        sibling_snapshot=sibling_snapshot,
+        current_profile_key=profile_key,
+        sibling_profile_key=sibling_profile_key,
+        replay_profile_active=replay_profile_active,
     )
 
     persisted = False
@@ -7736,11 +7848,13 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
         "replay_test_context": current_snapshot.get("replay_test_context"),
         "replay_compare_context": current_snapshot.get("replay_compare_context"),
+        "paired_profile_context": paired_profile_context,
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
         "on_demand_excerpt": {
             **_build_continuous_on_demand_excerpt(on_demand_payload),
             "replay_test_context": current_snapshot.get("replay_test_context"),
             "replay_compare_context": current_snapshot.get("replay_compare_context"),
+            "paired_profile_context": paired_profile_context,
         },
     }
     return _json_safe_for_response(response_payload)
