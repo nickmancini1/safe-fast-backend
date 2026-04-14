@@ -7787,6 +7787,125 @@ def _build_continuous_alert_payload(
     }
 
 
+
+def _build_continuous_live_alerts(
+    shadow_payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    alerts: List[Dict[str, Any]] = []
+
+    primary_alert = shadow_payload.get("alert_payload")
+    if isinstance(primary_alert, dict) and primary_alert.get("should_alert"):
+        alerts.append(
+            {
+                "ok": True,
+                "alert_lane": "current_profile",
+                "alert_kind": "state_transition",
+                **primary_alert,
+            }
+        )
+
+    paired_alert = shadow_payload.get("paired_profile_alert_payload")
+    if isinstance(paired_alert, dict) and paired_alert.get("should_alert"):
+        alerts.append(
+            {
+                "ok": True,
+                "alert_lane": "paired_profile",
+                "alert_kind": "profile_divergence",
+                **paired_alert,
+            }
+        )
+
+    return alerts
+
+
+def _build_continuous_live_summary(
+    shadow_payload: Dict[str, Any],
+    alerts: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    readable_summary = shadow_payload.get("readable_summary") or {}
+    true_transition_context = shadow_payload.get("true_transition_context") or {}
+    paired_profile_transition_context = shadow_payload.get("paired_profile_transition_context") or {}
+
+    return {
+        "alert_status": "ALERT" if alerts else "NO_ALERT",
+        "alert_count": len(alerts),
+        "good_idea_now": readable_summary.get("good_idea_now"),
+        "ticker": readable_summary.get("ticker"),
+        "action": readable_summary.get("action"),
+        "setup_state": readable_summary.get("setup_state"),
+        "now_state": readable_summary.get("now_state"),
+        "primary_blocker": readable_summary.get("primary_blocker"),
+        "next_flip_needed": readable_summary.get("next_flip_needed"),
+        "trigger_present": readable_summary.get("trigger_present"),
+        "trigger_reason": readable_summary.get("trigger_reason"),
+        "market_open": readable_summary.get("market_open"),
+        "replay_test_enabled": readable_summary.get("replay_test_enabled"),
+        "replay_trade_allowed": readable_summary.get("replay_trade_allowed"),
+        "replay_timestamp_et": readable_summary.get("replay_timestamp_et"),
+        "why_now": readable_summary.get("why_now"),
+        "invalidation": readable_summary.get("invalidation"),
+        "current_profile_alert_ready": bool(
+            (shadow_payload.get("alert_payload") or {}).get("should_alert")
+        ),
+        "paired_profile_alert_ready": bool(
+            (shadow_payload.get("paired_profile_alert_payload") or {}).get("should_alert")
+        ),
+        "true_transition_type": true_transition_context.get("transition_type"),
+        "paired_profile_transition_type": paired_profile_transition_context.get("transition_type"),
+    }
+
+
+def _build_continuous_live_payload(shadow_payload: Dict[str, Any]) -> Dict[str, Any]:
+    alerts = _build_continuous_live_alerts(shadow_payload)
+    live_summary = _build_continuous_live_summary(shadow_payload, alerts)
+    persistence = shadow_payload.get("persistence") or {}
+    true_transition_context = shadow_payload.get("true_transition_context") or {}
+    paired_profile_transition_context = shadow_payload.get("paired_profile_transition_context") or {}
+
+    return _json_safe_for_response(
+        {
+            "ok": shadow_payload.get("ok"),
+            "mode": "continuous_live",
+            "live_mode": "alert_or_status",
+            "build_tag": shadow_payload.get("build_tag"),
+            "source_of_truth": shadow_payload.get("source_of_truth"),
+            "profile_name": shadow_payload.get("profile_name"),
+            "profile_key": shadow_payload.get("profile_key"),
+            "base_profile_key": shadow_payload.get("base_profile_key"),
+            "replay_profile_active": shadow_payload.get("replay_profile_active"),
+            "live_status": live_summary.get("alert_status"),
+            "should_alert": bool(alerts),
+            "alert_count": len(alerts),
+            "alerts": alerts,
+            "read_this_first": "live_summary",
+            "live_summary": live_summary,
+            "readable_summary": shadow_payload.get("readable_summary"),
+            "effective_user_facing_why": shadow_payload.get("effective_user_facing_why"),
+            "transition_summary": shadow_payload.get("transition_summary"),
+            "true_transition_context": {
+                **true_transition_context,
+                "should_alert": bool((shadow_payload.get("alert_payload") or {}).get("should_alert")),
+            },
+            "paired_profile_transition_context": {
+                **paired_profile_transition_context,
+                "should_alert": bool((shadow_payload.get("paired_profile_alert_payload") or {}).get("should_alert")),
+            },
+            "persistence": {
+                "enabled": persistence.get("enabled"),
+                "persisted": persistence.get("persisted"),
+                "state_file": persistence.get("state_file"),
+                "previous_snapshot_found": persistence.get("previous_snapshot_found"),
+            },
+            "compact_ticker_summaries": shadow_payload.get("compact_ticker_summaries") or [],
+            "market_closed_tester": shadow_payload.get("market_closed_tester"),
+            "replay_test_context": shadow_payload.get("replay_test_context"),
+            "replay_compare_context": shadow_payload.get("replay_compare_context"),
+            "paired_profile_context": shadow_payload.get("paired_profile_context"),
+            "on_demand_excerpt": shadow_payload.get("on_demand_excerpt"),
+        }
+    )
+
+
 def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Dict[str, Any]:
     decision_context = on_demand_payload.get("decision_context") or {}
     approval_context = on_demand_payload.get("approval_context") or {}
@@ -8100,6 +8219,81 @@ async def safe_fast_continuous_shadow_default() -> Any:
                 "request_profile": _model_dump(ContinuousShadowRequest()),
             }
         )
+
+
+@app.post("/safe-fast/continuous/live")
+async def safe_fast_continuous_live(request: ContinuousShadowRequest) -> Any:
+    try:
+        shadow_payload = await _build_continuous_shadow_payload(request)
+        return _build_continuous_live_payload(shadow_payload)
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_live",
+                "live_mode": "alert_or_status",
+                "error_type": "continuous_live_runtime_error",
+                "reason": str(e),
+                "profile_name": _sanitize_continuous_profile_name(request.profile_name),
+                "request_profile": _model_dump(request),
+            }
+        )
+
+
+@app.get("/safe-fast/continuous/live/default")
+async def safe_fast_continuous_live_default() -> Any:
+    try:
+        shadow_payload = await _build_continuous_shadow_payload(ContinuousShadowRequest())
+        return _build_continuous_live_payload(shadow_payload)
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_live",
+                "live_mode": "alert_or_status",
+                "error_type": "continuous_live_runtime_error",
+                "reason": str(e),
+                "profile_name": "default",
+                "request_profile": _model_dump(ContinuousShadowRequest()),
+            }
+        )
+
+
+@app.get("/safe-fast/continuous/live/default/simple")
+async def safe_fast_continuous_live_default_simple() -> Any:
+    try:
+        shadow_payload = await _build_continuous_shadow_payload(ContinuousShadowRequest())
+        live_payload = _build_continuous_live_payload(shadow_payload)
+        return _json_safe_for_response(
+            {
+                "ok": live_payload.get("ok"),
+                "mode": live_payload.get("mode"),
+                "live_mode": live_payload.get("live_mode"),
+                "build_tag": live_payload.get("build_tag"),
+                "profile_name": live_payload.get("profile_name"),
+                "profile_key": live_payload.get("profile_key"),
+                "live_status": live_payload.get("live_status"),
+                "should_alert": live_payload.get("should_alert"),
+                "alert_count": live_payload.get("alert_count"),
+                "alerts": live_payload.get("alerts") or [],
+                "read_this_first": live_payload.get("read_this_first"),
+                "live_summary": live_payload.get("live_summary"),
+            }
+        )
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_live",
+                "live_mode": "alert_or_status",
+                "error_type": "continuous_live_runtime_error",
+                "reason": str(e),
+                "profile_name": "default",
+                "request_profile": _model_dump(ContinuousShadowRequest()),
+            }
+        )
+
+
 
 def _default_on_demand_request() -> OnDemandRequest:
     return OnDemandRequest(
