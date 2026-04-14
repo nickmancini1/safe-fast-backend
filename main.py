@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# fresh full main.py build with continuous forming alerts bundle 2026-04-14T04:40:00Z
+# fresh full main.py build with continuous forming alerts + replay-clean display bundle 2026-04-14T05:10:00Z
 
 import asyncio
 
@@ -23,10 +23,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.7")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.8")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.7"
+USER_AGENT = "safe-fast-backend/1.8.8"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -1461,6 +1461,73 @@ def _build_replay_compare_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         "effective_user_facing_why": effective_user_facing_why,
         "effective_why_now": effective_user_facing_why,
         "compare_takeaway": compare_takeaway,
+    }
+
+
+
+def _build_effective_profile_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    replay_profile_active = bool(snapshot.get("replay_profile_active"))
+    replay_test_context = snapshot.get("replay_test_context") or {}
+    replay_compare_context = snapshot.get("replay_compare_context") or {}
+
+    live_market_open = snapshot.get("market_open")
+    live_fresh_entry_allowed = snapshot.get("fresh_entry_allowed")
+    live_time_gate_reason = snapshot.get("time_gate_reason")
+    live_trigger_present = snapshot.get("trigger_present")
+    live_trigger_reason = snapshot.get("trigger_reason")
+
+    if not replay_profile_active:
+        return {
+            "ok": True,
+            "profile_view": "live",
+            "market_open": live_market_open,
+            "fresh_entry_allowed": live_fresh_entry_allowed,
+            "time_gate_reason": live_time_gate_reason,
+            "trigger_present": live_trigger_present,
+            "trigger_reason": live_trigger_reason,
+            "user_facing_why": replay_compare_context.get("effective_user_facing_why") or snapshot.get("user_facing_why"),
+        }
+
+    replay_enabled = bool(replay_test_context.get("enabled"))
+    replay_market_open = replay_test_context.get("replay_market_open")
+    replay_fresh_entry_allowed = replay_test_context.get("replay_fresh_entry_allowed")
+    replay_time_day_gate = replay_test_context.get("replay_time_day_gate") or {}
+
+    effective_market_open = replay_market_open if replay_enabled else live_market_open
+    effective_fresh_entry_allowed = (
+        replay_fresh_entry_allowed if replay_enabled else live_fresh_entry_allowed
+    )
+    effective_time_gate_reason = (
+        replay_time_day_gate.get("reason") if replay_enabled else live_time_gate_reason
+    )
+
+    if replay_enabled and replay_market_open is False:
+        effective_trigger_reason = replay_time_day_gate.get("reason") or "replay_market_closed"
+    elif replay_enabled and replay_fresh_entry_allowed is False:
+        effective_trigger_reason = replay_time_day_gate.get("reason") or "replay_time_gate_blocked"
+    elif replay_enabled and replay_test_context.get("replay_trade_allowed") is True:
+        effective_trigger_reason = "replay_trade_allowed"
+    elif replay_enabled:
+        effective_trigger_reason = "replay_structure_blocked"
+    else:
+        effective_trigger_reason = live_trigger_reason
+
+    effective_trigger_present = bool(live_trigger_present)
+    effective_user_facing_why = (
+        replay_compare_context.get("effective_user_facing_why")
+        or snapshot.get("effective_user_facing_why")
+        or snapshot.get("user_facing_why")
+    )
+
+    return {
+        "ok": True,
+        "profile_view": "replay",
+        "market_open": effective_market_open,
+        "fresh_entry_allowed": effective_fresh_entry_allowed,
+        "time_gate_reason": effective_time_gate_reason,
+        "trigger_present": effective_trigger_present,
+        "trigger_reason": effective_trigger_reason,
+        "user_facing_why": effective_user_facing_why,
     }
 
 
@@ -7397,6 +7464,15 @@ def _build_continuous_snapshot(
     replay_compare_context = _build_replay_compare_context(snapshot)
     snapshot["replay_compare_context"] = replay_compare_context
     snapshot["effective_user_facing_why"] = replay_compare_context.get("effective_user_facing_why") or snapshot.get("user_facing_why")
+    effective_profile_context = _build_effective_profile_context(snapshot)
+    snapshot["effective_profile_context"] = effective_profile_context
+    snapshot["effective_profile_view"] = effective_profile_context.get("profile_view")
+    snapshot["effective_market_open"] = effective_profile_context.get("market_open")
+    snapshot["effective_fresh_entry_allowed"] = effective_profile_context.get("fresh_entry_allowed")
+    snapshot["effective_time_gate_reason"] = effective_profile_context.get("time_gate_reason")
+    snapshot["effective_trigger_present"] = effective_profile_context.get("trigger_present")
+    snapshot["effective_trigger_reason"] = effective_profile_context.get("trigger_reason")
+    snapshot["effective_user_facing_why"] = effective_profile_context.get("user_facing_why") or snapshot.get("effective_user_facing_why")
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
 
@@ -8079,6 +8155,11 @@ def _build_continuous_live_summary(
         ),
         "forming_type": (shadow_payload.get("forming_context") or {}).get("forming_type"),
         "forming_summary": (shadow_payload.get("forming_context") or {}).get("summary"),
+        "profile_view": readable_summary.get("profile_view"),
+        "effective_user_facing_why": shadow_payload.get("effective_user_facing_why"),
+        "effective_market_open": shadow_payload.get("current_snapshot", {}).get("effective_market_open"),
+        "effective_fresh_entry_allowed": shadow_payload.get("current_snapshot", {}).get("effective_fresh_entry_allowed"),
+        "effective_time_gate_reason": shadow_payload.get("current_snapshot", {}).get("effective_time_gate_reason"),
         "true_transition_type": true_transition_context.get("transition_type"),
         "paired_profile_transition_type": paired_profile_transition_context.get("transition_type"),
     }
@@ -8297,8 +8378,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     primary_blocker = snapshot.get("primary_blocker")
     next_flip_needed = snapshot.get("next_flip_needed")
     summary = snapshot.get("summary") or {}
-    time_gate_reason = snapshot.get("time_gate_reason")
-    market_open = snapshot.get("market_open")
+    time_gate_reason = snapshot.get("effective_time_gate_reason") or snapshot.get("time_gate_reason")
+    market_open = (
+        snapshot.get("effective_market_open")
+        if snapshot.get("effective_market_open") is not None
+        else snapshot.get("market_open")
+    )
     decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
     failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
     market_closed_tester = snapshot.get("market_closed_tester") or {}
@@ -8344,11 +8429,16 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "primary_blocker": primary_blocker,
         "next_flip_needed": next_flip_needed,
         "top_blockers": top_blockers,
-        "trigger_present": snapshot.get("trigger_present"),
-        "trigger_reason": snapshot.get("trigger_reason"),
+        "trigger_present": (
+            snapshot.get("effective_trigger_present")
+            if snapshot.get("effective_trigger_present") is not None
+            else snapshot.get("trigger_present")
+        ),
+        "trigger_reason": snapshot.get("effective_trigger_reason") or snapshot.get("trigger_reason"),
         "structure_ready": snapshot.get("structure_ready"),
         "raw_signal_present_if_open": snapshot.get("raw_signal_present_if_open"),
         "market_open": market_open,
+        "profile_view": snapshot.get("effective_profile_view") or ("replay" if snapshot.get("replay_profile_active") else "live"),
         "time_gate_reason": time_gate_reason,
         "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
         "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
@@ -8541,6 +8631,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         },
         "read_this_first": "readable_summary",
         "readable_summary": current_snapshot.get("readable_summary"),
+        "effective_profile_context": current_snapshot.get("effective_profile_context"),
         "effective_user_facing_why": current_snapshot.get("effective_user_facing_why"),
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
         "replay_test_context": current_snapshot.get("replay_test_context"),
@@ -8560,6 +8651,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             **_build_continuous_on_demand_excerpt(on_demand_payload),
             "replay_test_context": current_snapshot.get("replay_test_context"),
             "replay_compare_context": current_snapshot.get("replay_compare_context"),
+            "effective_profile_context": current_snapshot.get("effective_profile_context"),
             "paired_profile_context": paired_profile_context,
             "forming_context": forming_context,
             "paired_profile_transition_context": {
@@ -8809,11 +8901,13 @@ def _build_continuous_watch_summary(monitor_payload: Dict[str, Any]) -> Dict[str
         "default_forming_summary": monitor_summary.get("default_forming_summary") or default_live_summary.get("forming_summary"),
         "default_market_open": monitor_summary.get("default_market_open") or default_live_summary.get("market_open"),
         "default_why_now": default_live_summary.get("why_now"),
+        "default_profile_view": default_live_summary.get("profile_view"),
         "replay_profile_enabled": bool(monitor_summary.get("replay_profile_enabled") or replay_lane),
         "replay_trade_allowed": monitor_summary.get("replay_trade_allowed"),
         "replay_timestamp_et": monitor_summary.get("replay_timestamp_et"),
         "replay_forming_status": monitor_summary.get("replay_forming_status") or replay_live_summary.get("forming_status"),
         "replay_forming_type": monitor_summary.get("replay_forming_type") or replay_live_summary.get("forming_type"),
+        "replay_profile_view": replay_live_summary.get("profile_view"),
         "replay_why_now": monitor_summary.get("replay_effective_why") or replay_live_summary.get("why_now"),
         "paired_profile_transition_type": monitor_summary.get("paired_profile_transition_type") or paired_transition.get("transition_type"),
         "paired_profile_should_alert": bool(monitor_summary.get("paired_profile_should_alert") or paired_transition.get("should_alert")),
