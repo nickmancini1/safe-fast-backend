@@ -23,10 +23,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.5")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.5"
+USER_AGENT = "safe-fast-backend/1.8.6"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -7906,6 +7906,110 @@ def _build_continuous_live_payload(shadow_payload: Dict[str, Any]) -> Dict[str, 
     )
 
 
+
+
+def _continuous_shadow_request_from_payload(payload: Dict[str, Any]) -> ContinuousShadowRequest:
+    cleaned = dict(payload)
+    return ContinuousShadowRequest(**cleaned)
+
+
+def _build_continuous_monitor_summary(
+    default_live_payload: Dict[str, Any],
+    replay_live_payload: Optional[Dict[str, Any]],
+    alerts: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    default_summary = default_live_payload.get("live_summary") or {}
+    replay_summary = (replay_live_payload or {}).get("live_summary") or {}
+    replay_transition = (replay_live_payload or {}).get("paired_profile_transition_context") or {}
+    replay_context = (replay_live_payload or {}).get("replay_test_context") or {}
+
+    return {
+        "monitor_status": "ALERT" if alerts else "NO_ALERT",
+        "alert_count": len(alerts),
+        "default_live_status": default_live_payload.get("live_status"),
+        "replay_live_status": (replay_live_payload or {}).get("live_status"),
+        "replay_profile_enabled": bool(replay_live_payload),
+        "ticker": default_summary.get("ticker"),
+        "good_idea_now": default_summary.get("good_idea_now"),
+        "action": default_summary.get("action"),
+        "setup_state": default_summary.get("setup_state"),
+        "default_now_state": default_summary.get("now_state"),
+        "default_primary_blocker": default_summary.get("primary_blocker"),
+        "default_next_flip_needed": default_summary.get("next_flip_needed"),
+        "default_trigger_present": default_summary.get("trigger_present"),
+        "default_trigger_reason": default_summary.get("trigger_reason"),
+        "default_market_open": default_summary.get("market_open"),
+        "replay_trade_allowed": replay_summary.get("replay_trade_allowed"),
+        "replay_timestamp_et": replay_summary.get("replay_timestamp_et"),
+        "paired_profile_transition_type": replay_transition.get("transition_type"),
+        "paired_profile_should_alert": bool(replay_transition.get("should_alert")),
+        "paired_profile_summary": replay_transition.get("summary"),
+        "replay_compare_takeaway": replay_context.get("replay_takeaway"),
+    }
+
+
+async def _build_continuous_monitor_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
+    base_payload = _model_dump(request)
+    base_payload["replay_timestamp_et"] = None
+    base_payload["replay_label"] = None
+    base_request = _continuous_shadow_request_from_payload(base_payload)
+
+    default_shadow_payload = await _build_continuous_shadow_payload(base_request)
+    default_live_payload = _build_continuous_live_payload(default_shadow_payload)
+
+    replay_live_payload: Optional[Dict[str, Any]] = None
+    replay_shadow_payload: Optional[Dict[str, Any]] = None
+    replay_enabled = bool(request.replay_timestamp_et or request.replay_label)
+
+    if replay_enabled:
+        replay_shadow_payload = await _build_continuous_shadow_payload(request)
+        replay_live_payload = _build_continuous_live_payload(replay_shadow_payload)
+
+    alerts: List[Dict[str, Any]] = []
+    alerts.extend(default_live_payload.get("alerts") or [])
+    if replay_live_payload:
+        alerts.extend(replay_live_payload.get("alerts") or [])
+
+    monitor_summary = _build_continuous_monitor_summary(
+        default_live_payload=default_live_payload,
+        replay_live_payload=replay_live_payload,
+        alerts=alerts,
+    )
+
+    pair_transition_context = {}
+    pair_context = {}
+    replay_test_context = None
+    if replay_live_payload:
+        pair_transition_context = replay_live_payload.get("paired_profile_transition_context") or {}
+        pair_context = replay_live_payload.get("paired_profile_context") or {}
+        replay_test_context = replay_live_payload.get("replay_test_context")
+
+    return _json_safe_for_response(
+        {
+            "ok": bool(default_live_payload.get("ok"))
+            and (True if replay_live_payload is None else bool(replay_live_payload.get("ok"))),
+            "mode": "continuous_monitor",
+            "monitor_mode": "bundled_live_profiles",
+            "build_tag": default_live_payload.get("build_tag"),
+            "source_of_truth": default_live_payload.get("source_of_truth"),
+            "profile_name": default_live_payload.get("profile_name"),
+            "base_profile_key": default_live_payload.get("base_profile_key"),
+            "default_profile_key": default_live_payload.get("profile_key"),
+            "replay_profile_key": (replay_live_payload or {}).get("profile_key"),
+            "replay_profile_active": replay_enabled,
+            "should_alert": bool(alerts),
+            "alert_count": len(alerts),
+            "alerts": alerts,
+            "read_this_first": "monitor_summary",
+            "monitor_summary": monitor_summary,
+            "paired_profile_transition_context": pair_transition_context,
+            "paired_profile_context": pair_context,
+            "replay_test_context": replay_test_context,
+            "default_lane": default_live_payload,
+            "replay_lane": replay_live_payload,
+        }
+    )
+
 def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Dict[str, Any]:
     decision_context = on_demand_payload.get("decision_context") or {}
     approval_context = on_demand_payload.get("approval_context") or {}
@@ -8287,6 +8391,78 @@ async def safe_fast_continuous_live_default_simple() -> Any:
                 "mode": "continuous_live",
                 "live_mode": "alert_or_status",
                 "error_type": "continuous_live_runtime_error",
+                "reason": str(e),
+                "profile_name": "default",
+                "request_profile": _model_dump(ContinuousShadowRequest()),
+            }
+        )
+
+
+
+@app.post("/safe-fast/continuous/monitor")
+async def safe_fast_continuous_monitor(request: ContinuousShadowRequest) -> Any:
+    try:
+        return await _build_continuous_monitor_payload(request)
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_monitor",
+                "monitor_mode": "bundled_live_profiles",
+                "error_type": "continuous_monitor_runtime_error",
+                "reason": str(e),
+                "profile_name": _sanitize_continuous_profile_name(request.profile_name),
+                "request_profile": _model_dump(request),
+            }
+        )
+
+
+@app.get("/safe-fast/continuous/monitor/default")
+async def safe_fast_continuous_monitor_default() -> Any:
+    try:
+        return await _build_continuous_monitor_payload(ContinuousShadowRequest())
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_monitor",
+                "monitor_mode": "bundled_live_profiles",
+                "error_type": "continuous_monitor_runtime_error",
+                "reason": str(e),
+                "profile_name": "default",
+                "request_profile": _model_dump(ContinuousShadowRequest()),
+            }
+        )
+
+
+@app.get("/safe-fast/continuous/monitor/default/simple")
+async def safe_fast_continuous_monitor_default_simple() -> Any:
+    try:
+        payload = await _build_continuous_monitor_payload(ContinuousShadowRequest())
+        return _json_safe_for_response(
+            {
+                "ok": payload.get("ok"),
+                "mode": payload.get("mode"),
+                "monitor_mode": payload.get("monitor_mode"),
+                "build_tag": payload.get("build_tag"),
+                "profile_name": payload.get("profile_name"),
+                "base_profile_key": payload.get("base_profile_key"),
+                "default_profile_key": payload.get("default_profile_key"),
+                "replay_profile_key": payload.get("replay_profile_key"),
+                "should_alert": payload.get("should_alert"),
+                "alert_count": payload.get("alert_count"),
+                "alerts": payload.get("alerts") or [],
+                "read_this_first": payload.get("read_this_first"),
+                "monitor_summary": payload.get("monitor_summary"),
+            }
+        )
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_monitor",
+                "monitor_mode": "bundled_live_profiles",
+                "error_type": "continuous_monitor_runtime_error",
                 "reason": str(e),
                 "profile_name": "default",
                 "request_profile": _model_dump(ContinuousShadowRequest()),
