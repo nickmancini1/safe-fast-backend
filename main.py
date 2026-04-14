@@ -1558,6 +1558,169 @@ def _build_paired_profile_context(
     }
 
 
+
+
+def _build_paired_profile_transition_context(
+    current_snapshot: Dict[str, Any],
+    sibling_snapshot: Optional[Dict[str, Any]],
+    current_profile_key: str,
+    sibling_profile_key: str,
+    replay_profile_active: bool,
+) -> Dict[str, Any]:
+    pair_context = _build_paired_profile_context(
+        current_snapshot=current_snapshot,
+        sibling_snapshot=sibling_snapshot,
+        current_profile_key=current_profile_key,
+        sibling_profile_key=sibling_profile_key,
+        replay_profile_active=replay_profile_active,
+    )
+    if not pair_context.get("available"):
+        return {
+            "ok": True,
+            "available": False,
+            "status": "unavailable",
+            "transition_detected": False,
+            "meaningful_transition": False,
+            "should_alert_candidate": False,
+            "summary": "No sibling profile snapshot is available yet.",
+            "primary_event": None,
+            "events": [],
+            "changed_fields": {},
+            "current_profile_key": current_profile_key,
+            "sibling_profile_key": sibling_profile_key,
+        }
+
+    changed_fields = pair_context.get("changed_fields") or {}
+    events: List[str] = []
+    if "replay_trade_allowed" in changed_fields:
+        events.append("PAIR_REPLAY_TRADE_ALLOWED_DIFF")
+    if "approval_ready_now" in changed_fields or "approval_ready_on_completed_candle" in changed_fields:
+        events.append("PAIR_APPROVAL_DIFF")
+    if "trigger_present" in changed_fields:
+        events.append("PAIR_TRIGGER_DIFF")
+    if "current_state" in changed_fields:
+        events.append("PAIR_STATE_DIFF")
+    if "primary_blocker" in changed_fields or "setup_type" in changed_fields:
+        events.append("PAIR_STRUCTURE_DIFF")
+    if "replay_market_open" in changed_fields or "replay_fresh_entry_allowed" in changed_fields or "replay_test_enabled" in changed_fields:
+        events.append("PAIR_REPLAY_GATE_DIFF")
+
+    primary_event = events[0] if events else None
+    transition_detected = bool(changed_fields)
+    alert_watched_fields = {
+        "current_state",
+        "primary_blocker",
+        "setup_type",
+        "trigger_present",
+        "approval_ready_now",
+        "approval_ready_on_completed_candle",
+        "replay_test_enabled",
+        "replay_trade_allowed",
+        "replay_market_open",
+        "replay_fresh_entry_allowed",
+    }
+    should_alert_candidate = any(field in alert_watched_fields for field in changed_fields)
+
+    current_readable = (pair_context.get("current") or {}).get("readable_summary") or {}
+    sibling_readable = (pair_context.get("sibling") or {}).get("readable_summary") or {}
+    if not transition_detected:
+        summary = "Live and replay lanes still match on all watched fields."
+    elif primary_event == "PAIR_REPLAY_TRADE_ALLOWED_DIFF":
+        summary = "Replay trade-allowed status differs from the sibling lane."
+    elif primary_event == "PAIR_APPROVAL_DIFF":
+        summary = "Approval readiness differs between live and replay lanes."
+    elif primary_event == "PAIR_TRIGGER_DIFF":
+        summary = "Trigger presence differs between live and replay lanes."
+    elif primary_event == "PAIR_STATE_DIFF":
+        summary = "Current state differs between live and replay lanes."
+    else:
+        summary = "Live and replay lanes diverge on one or more watched fields."
+
+    return {
+        "ok": True,
+        "available": True,
+        "status": "ready",
+        "transition_detected": transition_detected,
+        "meaningful_transition": transition_detected,
+        "should_alert_candidate": should_alert_candidate,
+        "primary_event": primary_event,
+        "events": events,
+        "summary": summary,
+        "changed_fields": changed_fields,
+        "current_profile_key": current_profile_key,
+        "sibling_profile_key": sibling_profile_key,
+        "current_replay_profile_active": replay_profile_active,
+        "sibling_replay_profile_active": not replay_profile_active,
+        "current_lane": {
+            "profile_key": current_profile_key,
+            "replay_profile_active": replay_profile_active,
+            "current_state": current_snapshot.get("current_state"),
+            "primary_blocker": current_snapshot.get("primary_blocker"),
+            "trigger_present": current_snapshot.get("trigger_present"),
+            "approval_ready_now": current_snapshot.get("approval_ready_now"),
+            "approval_ready_on_completed_candle": current_snapshot.get("approval_ready_on_completed_candle"),
+            "replay_test_enabled": current_snapshot.get("replay_test_enabled"),
+            "replay_trade_allowed": current_snapshot.get("replay_trade_allowed"),
+            "replay_market_open": current_snapshot.get("replay_market_open"),
+            "replay_fresh_entry_allowed": current_snapshot.get("replay_fresh_entry_allowed"),
+            "why_now": current_readable.get("why_now"),
+        },
+        "sibling_lane": {
+            "profile_key": sibling_profile_key,
+            "replay_profile_active": bool(sibling_snapshot.get("replay_profile_active")),
+            "current_state": sibling_snapshot.get("current_state"),
+            "primary_blocker": sibling_snapshot.get("primary_blocker"),
+            "trigger_present": sibling_snapshot.get("trigger_present"),
+            "approval_ready_now": sibling_snapshot.get("approval_ready_now"),
+            "approval_ready_on_completed_candle": sibling_snapshot.get("approval_ready_on_completed_candle"),
+            "replay_test_enabled": sibling_snapshot.get("replay_test_enabled"),
+            "replay_trade_allowed": sibling_snapshot.get("replay_trade_allowed"),
+            "replay_market_open": sibling_snapshot.get("replay_market_open"),
+            "replay_fresh_entry_allowed": sibling_snapshot.get("replay_fresh_entry_allowed"),
+            "why_now": sibling_readable.get("why_now"),
+        },
+    }
+
+
+def _paired_profile_transition_fingerprint(pair_transition_context: Dict[str, Any]) -> Optional[str]:
+    if not pair_transition_context.get("available"):
+        return None
+    payload = {
+        "current_profile_key": pair_transition_context.get("current_profile_key"),
+        "sibling_profile_key": pair_transition_context.get("sibling_profile_key"),
+        "primary_event": pair_transition_context.get("primary_event"),
+        "changed_fields": pair_transition_context.get("changed_fields") or {},
+    }
+    raw = json.dumps(_json_safe_for_response(payload), sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _build_paired_profile_alert_payload(
+    pair_transition_context: Dict[str, Any],
+    *,
+    should_alert: bool,
+    deduped: bool,
+    transition_fingerprint: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not should_alert or not pair_transition_context.get("available"):
+        return None
+    current_lane = pair_transition_context.get("current_lane") or {}
+    sibling_lane = pair_transition_context.get("sibling_lane") or {}
+    return {
+        "ok": True,
+        "alert_type": "paired_profile_divergence",
+        "should_alert": True,
+        "deduped": deduped,
+        "transition_fingerprint": transition_fingerprint,
+        "primary_event": pair_transition_context.get("primary_event"),
+        "events": pair_transition_context.get("events") or [],
+        "summary": pair_transition_context.get("summary"),
+        "current_lane": current_lane,
+        "sibling_lane": sibling_lane,
+        "changed_fields": pair_transition_context.get("changed_fields") or {},
+    }
+
+
 def _other_ticker_candidates(
     summary_payload: Dict[str, Any],
     best_ticker: Optional[str],
@@ -6582,7 +6745,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_replay_profile_pair_compare_2026_04_14",
+        "build_tag": "continuous_profile_pair_transition_alerts_2026_04_14",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -7161,7 +7324,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_replay_profile_pair_compare_2026_04_14",
+        "build_tag": "continuous_profile_pair_transition_alerts_2026_04_14",
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
@@ -7789,6 +7952,33 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         sibling_profile_key=sibling_profile_key,
         replay_profile_active=replay_profile_active,
     )
+    paired_profile_transition_context = _build_paired_profile_transition_context(
+        current_snapshot=current_snapshot,
+        sibling_snapshot=sibling_snapshot,
+        current_profile_key=profile_key,
+        sibling_profile_key=sibling_profile_key,
+        replay_profile_active=replay_profile_active,
+    )
+    pair_transition_fingerprint = _paired_profile_transition_fingerprint(
+        paired_profile_transition_context
+    )
+    last_pair_alert_fingerprint = stored_state.get("last_pair_alert_fingerprint")
+    pair_deduped = bool(
+        paired_profile_transition_context.get("should_alert_candidate")
+        and pair_transition_fingerprint
+        and pair_transition_fingerprint == last_pair_alert_fingerprint
+    )
+    pair_should_alert = bool(
+        paired_profile_transition_context.get("should_alert_candidate")
+        and pair_transition_fingerprint
+        and not pair_deduped
+    )
+    paired_profile_alert_payload = _build_paired_profile_alert_payload(
+        paired_profile_transition_context,
+        should_alert=pair_should_alert,
+        deduped=pair_deduped,
+        transition_fingerprint=pair_transition_fingerprint,
+    )
 
     persisted = False
     state_file = None
@@ -7808,6 +7998,9 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
                 "last_transition_fingerprint": transition_fingerprint,
                 "last_alert_fingerprint": transition_fingerprint if should_alert else last_alert_fingerprint,
                 "last_alert_timestamp": current_snapshot.get("timestamp_et") if should_alert else stored_state.get("last_alert_timestamp"),
+                "last_pair_transition_fingerprint": pair_transition_fingerprint,
+                "last_pair_alert_fingerprint": pair_transition_fingerprint if pair_should_alert else last_pair_alert_fingerprint,
+                "last_pair_alert_timestamp": current_snapshot.get("timestamp_et") if pair_should_alert else stored_state.get("last_pair_alert_timestamp"),
             },
         )
 
@@ -7849,12 +8042,25 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "replay_test_context": current_snapshot.get("replay_test_context"),
         "replay_compare_context": current_snapshot.get("replay_compare_context"),
         "paired_profile_context": paired_profile_context,
+        "paired_profile_transition_context": {
+            **paired_profile_transition_context,
+            "deduped": pair_deduped,
+            "transition_fingerprint": pair_transition_fingerprint,
+            "should_alert": pair_should_alert,
+        },
+        "paired_profile_alert_payload": paired_profile_alert_payload,
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
         "on_demand_excerpt": {
             **_build_continuous_on_demand_excerpt(on_demand_payload),
             "replay_test_context": current_snapshot.get("replay_test_context"),
             "replay_compare_context": current_snapshot.get("replay_compare_context"),
             "paired_profile_context": paired_profile_context,
+            "paired_profile_transition_context": {
+                **paired_profile_transition_context,
+                "deduped": pair_deduped,
+                "transition_fingerprint": pair_transition_fingerprint,
+                "should_alert": pair_should_alert,
+            },
         },
     }
     return _json_safe_for_response(response_payload)
