@@ -112,9 +112,14 @@ def _round_or_none(value: Optional[float], places: int = 4) -> Optional[float]:
 
 
 def _decorate_why(why_text: Optional[str], market_closed_context: bool = False) -> str:
-    text_value = str(why_text or "unconfirmed")
+    text_value = str(why_text or "unconfirmed").strip()
     if market_closed_context:
-        return f"{text_value} Market is closed right now, so no live entry can be taken."
+        if text_value == "market_closed":
+            return "Market is closed right now, so no live entry can be taken."
+        closed_suffix = "Market is closed right now, so no live entry can be taken."
+        if text_value.endswith(closed_suffix):
+            return text_value
+        return f"{text_value} {closed_suffix}"
     return text_value
 
 
@@ -6282,7 +6287,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "time_gate_removed_continuous_readable_summary_2026_04_13",
+        "build_tag": "continuous_compact_ticker_summary_market_closed_tester_2026_04_13",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -6751,6 +6756,72 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     return "STALE_OR_UNCONFIRMED"
 
 
+
+def _build_market_closed_tester_block(on_demand_payload: Dict[str, Any]) -> Dict[str, Any]:
+    market_context = on_demand_payload.get("market_context") or {}
+    time_day_gate = on_demand_payload.get("time_day_gate") or {}
+    approval_context = on_demand_payload.get("approval_context") or {}
+    approval_requirements_context = on_demand_payload.get("approval_requirements_context") or {}
+    decision_context = on_demand_payload.get("decision_context") or {}
+    trigger_context = on_demand_payload.get("trigger_context") or {}
+    structure_context = on_demand_payload.get("structure_context") or {}
+    final_verdict = str(on_demand_payload.get("final_verdict") or "unconfirmed").upper()
+
+    market_closed_context_only = bool(
+        market_context.get("is_open") is False
+        or time_day_gate.get("reason") == "market_closed"
+    )
+
+    structural_blockers = _ordered_unique_strings(
+        approval_requirements_context.get("raw_checklist_failed_items")
+        or decision_context.get("blockers")
+        or []
+    )
+    structural_blockers = [item for item in structural_blockers if item != "time_day_gate"]
+    structural_primary_blocker = structural_blockers[0] if structural_blockers else None
+
+    intrabar_raw_signal_detected = bool(approval_context.get("intrabar_raw_signal_detected") is True)
+    completed_raw_signal_detected = bool(approval_context.get("completed_raw_signal_detected") is True)
+    raw_signal_present_if_open = intrabar_raw_signal_detected or completed_raw_signal_detected
+
+    if structural_blockers:
+        underlying_structural_verdict = "NO_TRADE"
+        would_be_trade_if_open = False
+        testing_takeaway = (
+            "After-hours tester says structure still fails even if the market were open."
+        )
+    elif raw_signal_present_if_open or final_verdict == "TRADE":
+        underlying_structural_verdict = "TRADE"
+        would_be_trade_if_open = True
+        testing_takeaway = (
+            "After-hours tester says this would qualify as a live SAFE-FAST trade if the market were open."
+        )
+    else:
+        underlying_structural_verdict = "PENDING"
+        would_be_trade_if_open = False
+        testing_takeaway = (
+            "After-hours tester says structure is not failing on non-time gates, but no approved live trigger is present yet."
+        )
+
+    return {
+        "ok": True,
+        "market_closed_context_only": market_closed_context_only,
+        "underlying_structural_verdict": underlying_structural_verdict,
+        "underlying_structural_primary_blocker": structural_primary_blocker,
+        "underlying_structural_blockers": structural_blockers,
+        "would_be_trade_if_open": would_be_trade_if_open,
+        "raw_signal_present_if_open": raw_signal_present_if_open,
+        "intrabar_raw_signal_detected": intrabar_raw_signal_detected,
+        "completed_raw_signal_detected": completed_raw_signal_detected,
+        "setup_type": structure_context.get("setup_type"),
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "trigger_present_live": trigger_context.get("trigger_present"),
+        "trigger_reason_live": trigger_context.get("trigger_reason"),
+        "testing_takeaway": testing_takeaway,
+    }
+
+
 def _build_continuous_snapshot(
     *,
     on_demand_payload: Dict[str, Any],
@@ -6769,6 +6840,7 @@ def _build_continuous_snapshot(
     winner_shift_context = on_demand_payload.get("winner_shift_context") or {}
     iv_context = on_demand_payload.get("iv_context") or {}
     time_day_gate = on_demand_payload.get("time_day_gate") or {}
+    market_closed_tester = _build_market_closed_tester_block(on_demand_payload)
 
     snapshot: Dict[str, Any] = {
         "timestamp_et": market_context.get("as_of_et") or datetime.now(NY_TZ).isoformat(),
@@ -6810,6 +6882,7 @@ def _build_continuous_snapshot(
             "good_idea_now": simple_output.get("good_idea_now"),
             "why": simple_output.get("why"),
         },
+        "market_closed_tester": market_closed_tester,
         "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
     }
     snapshot["latent_structure_state"] = _derive_continuous_structure_state(snapshot)
@@ -7011,6 +7084,7 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
         "iv_context": on_demand_payload.get("iv_context"),
         "market_context": on_demand_payload.get("market_context"),
         "time_day_gate": on_demand_payload.get("time_day_gate"),
+        "market_closed_tester": _build_market_closed_tester_block(on_demand_payload),
         "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
     }
 
@@ -7025,6 +7099,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     market_open = snapshot.get("market_open")
     decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
     failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
+    market_closed_tester = snapshot.get("market_closed_tester") or {}
 
     underlying_state = current_state
     if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and latent_structure_state:
@@ -7068,6 +7143,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "structure_ready": snapshot.get("structure_ready"),
         "market_open": market_open,
         "time_gate_reason": time_gate_reason,
+        "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
+        "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
+        "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
         "why_now": summary_note,
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "invalidation": snapshot.get("invalidation"),
@@ -7159,6 +7237,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         },
         "read_this_first": "readable_summary",
         "readable_summary": current_snapshot.get("readable_summary"),
+        "market_closed_tester": current_snapshot.get("market_closed_tester"),
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
         "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
     }
