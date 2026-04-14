@@ -1384,6 +1384,86 @@ def _build_replay_test_context(
     }
 
 
+def _build_replay_compare_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    replay_test_context = snapshot.get("replay_test_context") or {}
+    live_market_open = snapshot.get("market_open")
+    live_fresh_entry_allowed = snapshot.get("fresh_entry_allowed")
+    replay_enabled = bool(replay_test_context.get("enabled"))
+
+    if not replay_enabled:
+        return {
+            "ok": True,
+            "enabled": False,
+            "status": "disabled",
+            "effective_user_facing_why": snapshot.get("user_facing_why"),
+            "effective_why_now": (snapshot.get("readable_summary") or {}).get("why_now"),
+        }
+
+    replay_market_open = replay_test_context.get("replay_market_open")
+    replay_fresh_entry_allowed = replay_test_context.get("replay_fresh_entry_allowed")
+    replay_trade_allowed = replay_test_context.get("replay_trade_allowed")
+    structural_verdict = replay_test_context.get("underlying_structural_verdict")
+    primary_blocker = replay_test_context.get("underlying_structural_primary_blocker") or snapshot.get("primary_blocker")
+    structural_blockers = _ordered_unique_strings(
+        replay_test_context.get("underlying_structural_blockers")
+        or snapshot.get("decision_blockers")
+        or []
+    )
+
+    changed_fields: List[str] = []
+    if live_market_open != replay_market_open:
+        changed_fields.append("market_open")
+    if live_fresh_entry_allowed != replay_fresh_entry_allowed:
+        changed_fields.append("fresh_entry_allowed")
+
+    if replay_trade_allowed is True:
+        effective_user_facing_why = (
+            "Replay time is inside the regular session and inside the entry window. "
+            "This frozen baseline would qualify there."
+        )
+    elif replay_market_open is False:
+        effective_user_facing_why = (
+            "Replay time is outside the regular session, so entry would still be blocked there."
+        )
+    elif structural_verdict == "NO_TRADE":
+        blocker_text = f" Primary blocker: {primary_blocker}." if primary_blocker else ""
+        effective_user_facing_why = (
+            "Replay time is inside the entry window, but the frozen structural baseline still fails SAFE-FAST."
+            f"{blocker_text}"
+        )
+    else:
+        effective_user_facing_why = (
+            "Replay time is inside the entry window, but approval would still not be ready from the frozen baseline."
+        )
+
+    if replay_market_open is True and live_market_open is False:
+        compare_takeaway = (
+            "Replay flips the time/day gate open, but the structural baseline still does not approve a trade."
+        )
+    elif replay_trade_allowed is True:
+        compare_takeaway = "Replay would allow the trade while live right now would not."
+    else:
+        compare_takeaway = replay_test_context.get("replay_takeaway")
+
+    return {
+        "ok": True,
+        "enabled": True,
+        "status": "ready",
+        "changed_fields": changed_fields,
+        "live_market_open": live_market_open,
+        "live_fresh_entry_allowed": live_fresh_entry_allowed,
+        "replay_market_open": replay_market_open,
+        "replay_fresh_entry_allowed": replay_fresh_entry_allowed,
+        "replay_trade_allowed": replay_trade_allowed,
+        "underlying_structural_verdict": structural_verdict,
+        "underlying_structural_primary_blocker": primary_blocker,
+        "underlying_structural_blockers": structural_blockers,
+        "effective_user_facing_why": effective_user_facing_why,
+        "effective_why_now": effective_user_facing_why,
+        "compare_takeaway": compare_takeaway,
+    }
+
+
 def _other_ticker_candidates(
     summary_payload: Dict[str, Any],
     best_ticker: Optional[str],
@@ -6408,7 +6488,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_replay_transition_profile_sandbox_2026_04_14",
+        "build_tag": "continuous_replay_compare_context_2026_04_14",
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -6983,11 +7063,12 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_replay_transition_profile_sandbox_2026_04_14",
+        "build_tag": "continuous_replay_compare_context_2026_04_14",
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
         "user_facing_why": user_facing.get("why"),
+        "effective_user_facing_why": user_facing.get("why"),
         "primary_blocker": decision_context.get("primary_blocker"),
         "decision_blockers": decision_context.get("blockers") or [],
         "failed_reasons": decision_context.get("failed_reasons") or [],
@@ -7021,6 +7102,7 @@ def _build_continuous_snapshot(
         },
         "market_closed_tester": market_closed_tester,
         "replay_test_context": {},
+        "replay_compare_context": {},
         "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
     }
     snapshot["latent_structure_state"] = _derive_continuous_structure_state(snapshot)
@@ -7045,6 +7127,9 @@ def _build_continuous_snapshot(
     snapshot["replay_timestamp_et"] = replay_test_context.get("resolved_replay_timestamp_et")
     snapshot["replay_market_open"] = replay_test_context.get("replay_market_open")
     snapshot["replay_fresh_entry_allowed"] = replay_test_context.get("replay_fresh_entry_allowed")
+    replay_compare_context = _build_replay_compare_context(snapshot)
+    snapshot["replay_compare_context"] = replay_compare_context
+    snapshot["effective_user_facing_why"] = replay_compare_context.get("effective_user_facing_why") or snapshot.get("user_facing_why")
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
 
@@ -7489,6 +7574,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
     market_closed_tester = snapshot.get("market_closed_tester") or {}
     replay_test_context = snapshot.get("replay_test_context") or {}
+    replay_compare_context = snapshot.get("replay_compare_context") or {}
 
     underlying_state = current_state
     if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and latent_structure_state:
@@ -7512,7 +7598,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             break
 
     summary_note = summary.get("why")
-    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
+    if replay_compare_context.get("enabled") is True and replay_compare_context.get("effective_why_now"):
+        summary_note = replay_compare_context.get("effective_why_now")
+    elif current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
         summary_note = f"{summary.get('why')} Underneath that, structure is still {underlying_state}."
     elif market_open is False and underlying_state != current_state and underlying_state is not None:
         summary_note = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
@@ -7538,6 +7626,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_test_enabled": replay_test_context.get("enabled"),
         "replay_trade_allowed": replay_test_context.get("replay_trade_allowed"),
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
+        "replay_compare_takeaway": replay_compare_context.get("compare_takeaway"),
+        "effective_user_facing_why": replay_compare_context.get("effective_user_facing_why"),
         "why_now": summary_note,
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "invalidation": snapshot.get("invalidation"),
@@ -7642,12 +7732,15 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         },
         "read_this_first": "readable_summary",
         "readable_summary": current_snapshot.get("readable_summary"),
+        "effective_user_facing_why": current_snapshot.get("effective_user_facing_why"),
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
         "replay_test_context": current_snapshot.get("replay_test_context"),
+        "replay_compare_context": current_snapshot.get("replay_compare_context"),
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
         "on_demand_excerpt": {
             **_build_continuous_on_demand_excerpt(on_demand_payload),
             "replay_test_context": current_snapshot.get("replay_test_context"),
+            "replay_compare_context": current_snapshot.get("replay_compare_context"),
         },
     }
     return _json_safe_for_response(response_payload)
