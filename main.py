@@ -8683,7 +8683,7 @@ async def safe_fast_continuous_shadow(request: ContinuousShadowRequest) -> Any:
         )
 
 
-@app.get("/safe-fast/continuous/shadow/default")
+@app.get("/safe-fast/continuous/shadow/default", include_in_schema=False)
 async def safe_fast_continuous_shadow_default() -> Any:
     try:
         return await _build_continuous_shadow_payload(ContinuousShadowRequest())
@@ -8720,7 +8720,7 @@ async def safe_fast_continuous_live(request: ContinuousShadowRequest) -> Any:
         )
 
 
-@app.get("/safe-fast/continuous/live/default")
+@app.get("/safe-fast/continuous/live/default", include_in_schema=False)
 async def safe_fast_continuous_live_default() -> Any:
     try:
         shadow_payload = await _build_continuous_shadow_payload(ContinuousShadowRequest())
@@ -8739,7 +8739,7 @@ async def safe_fast_continuous_live_default() -> Any:
         )
 
 
-@app.get("/safe-fast/continuous/live/default/simple")
+@app.get("/safe-fast/continuous/live/default/simple", include_in_schema=False)
 async def safe_fast_continuous_live_default_simple() -> Any:
     try:
         shadow_payload = await _build_continuous_shadow_payload(ContinuousShadowRequest())
@@ -8775,7 +8775,7 @@ async def safe_fast_continuous_live_default_simple() -> Any:
 
 
 
-@app.post("/safe-fast/continuous/monitor")
+@app.post("/safe-fast/continuous/monitor", include_in_schema=False)
 async def safe_fast_continuous_monitor(request: ContinuousShadowRequest) -> Any:
     try:
         return await _build_continuous_monitor_payload(request)
@@ -8793,7 +8793,7 @@ async def safe_fast_continuous_monitor(request: ContinuousShadowRequest) -> Any:
         )
 
 
-@app.get("/safe-fast/continuous/monitor/default")
+@app.get("/safe-fast/continuous/monitor/default", include_in_schema=False)
 async def safe_fast_continuous_monitor_default() -> Any:
     try:
         return await _build_continuous_monitor_payload(ContinuousShadowRequest())
@@ -8811,7 +8811,7 @@ async def safe_fast_continuous_monitor_default() -> Any:
         )
 
 
-@app.get("/safe-fast/continuous/monitor/default/simple")
+@app.get("/safe-fast/continuous/monitor/default/simple", include_in_schema=False)
 async def safe_fast_continuous_monitor_default_simple() -> Any:
     try:
         payload = await _build_continuous_monitor_payload(ContinuousShadowRequest())
@@ -8950,7 +8950,7 @@ async def _build_continuous_watch_payload(request: ContinuousShadowRequest) -> D
     )
 
 
-@app.post("/safe-fast/continuous/watch")
+@app.post("/safe-fast/continuous/watch", include_in_schema=False)
 async def safe_fast_continuous_watch(request: ContinuousShadowRequest) -> Any:
     try:
         return await _build_continuous_watch_payload(request)
@@ -8968,7 +8968,7 @@ async def safe_fast_continuous_watch(request: ContinuousShadowRequest) -> Any:
         )
 
 
-@app.get("/safe-fast/continuous/watch/default")
+@app.get("/safe-fast/continuous/watch/default", include_in_schema=False)
 async def safe_fast_continuous_watch_default() -> Any:
     try:
         return await _build_continuous_watch_payload(ContinuousShadowRequest())
@@ -8986,7 +8986,7 @@ async def safe_fast_continuous_watch_default() -> Any:
         )
 
 
-@app.get("/safe-fast/continuous/watch/default/simple")
+@app.get("/safe-fast/continuous/watch/default/simple", include_in_schema=False)
 async def safe_fast_continuous_watch_default_simple() -> Any:
     try:
         payload = await _build_continuous_watch_payload(ContinuousShadowRequest())
