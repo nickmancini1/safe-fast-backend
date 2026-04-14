@@ -3899,6 +3899,77 @@ def _screened_other_candidates(
     return out
 
 
+_COMPACT_TICKER_UNIVERSE_ORDER: Dict[str, int] = {
+    "SPY": 0,
+    "QQQ": 1,
+    "IWM": 2,
+    "GLD": 3,
+}
+
+
+def _compact_ticker_summary_entry(
+    item: Dict[str, Any],
+    *,
+    time_day_gate: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    structure_context = item.get("structure_context") or {}
+    chart_check = item.get("chart_check") or {}
+    trigger_state = item.get("trigger_state") or {}
+    checklist = item.get("checklist") or {}
+    screened_reason = item.get("reason")
+
+    effective_blockers = _effective_blockers(
+        checklist,
+        screened_reason=screened_reason,
+    )
+    effective_primary_blocker = _effective_primary_blocker(
+        checklist,
+        screened_reason=screened_reason,
+    )
+
+    return {
+        "ticker": item.get("symbol"),
+        "engine_verdict": item.get("engine_verdict"),
+        "final_verdict": item.get("final_verdict"),
+        "primary_blocker": effective_primary_blocker,
+        "blockers": effective_blockers[:4],
+        "reason": _decorate_why(
+            screened_reason,
+            market_closed_context=((time_day_gate or {}).get("reason") == "market_closed"),
+        ),
+        "setup_type": structure_context.get("setup_type"),
+        "trend_label": structure_context.get("trend_label"),
+        "room_to_first_wall": structure_context.get("room_to_first_wall"),
+        "first_wall": structure_context.get("first_wall"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_state": structure_context.get("extension_state"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "ema50_1h": chart_check.get("ema50_1h"),
+        "latest_close": chart_check.get("latest_close"),
+        "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h"),
+    }
+
+
+def _build_compact_ticker_summaries(
+    screened_candidates: List[Dict[str, Any]],
+    *,
+    time_day_gate: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    ordered_candidates = sorted(
+        screened_candidates,
+        key=lambda item: (
+            _COMPACT_TICKER_UNIVERSE_ORDER.get(str(item.get("symbol")), 99),
+            str(item.get("symbol") or ""),
+        ),
+    )
+    return [
+        _compact_ticker_summary_entry(item, time_day_gate=time_day_gate)
+        for item in ordered_candidates
+    ]
+
+
 def _should_freeze_winner_to_raw_engine(
     *,
     summary_payload: Dict[str, Any],
@@ -5345,7 +5416,7 @@ def _build_on_demand_unavailable_payload(
     status_code: int = 503,
 ) -> Dict[str, Any]:
     reason_text = _coerce_error_reason(reason)
-    build_tag = "time_gate_removed_continuous_readable_summary_2026_04_13"
+    build_tag = "continuous_compact_ticker_summary_2026_04_13"
     failed_reasons = [reason_text]
     primary_blocker = "data_unavailable"
 
@@ -6293,6 +6364,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
         "checklist": effective_payload_checklist_block,
         "failed_reasons": failed_reasons_block,
+        "compact_ticker_summaries": _build_compact_ticker_summaries(
+            screened_candidates,
+            time_day_gate=time_day_gate,
+        ),
         "other_ticker_candidates": _screened_other_candidates(
             screened_candidates,
             best_ticker,
@@ -6735,6 +6810,7 @@ def _build_continuous_snapshot(
             "good_idea_now": simple_output.get("good_idea_now"),
             "why": simple_output.get("why"),
         },
+        "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
     }
     snapshot["latent_structure_state"] = _derive_continuous_structure_state(snapshot)
     snapshot["current_state"] = _derive_continuous_state_from_snapshot(snapshot)
@@ -6935,6 +7011,7 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
         "iv_context": on_demand_payload.get("iv_context"),
         "market_context": on_demand_payload.get("market_context"),
         "time_day_gate": on_demand_payload.get("time_day_gate"),
+        "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
     }
 
 
@@ -7082,6 +7159,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         },
         "read_this_first": "readable_summary",
         "readable_summary": current_snapshot.get("readable_summary"),
+        "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
         "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
     }
     return _json_safe_for_response(response_payload)
