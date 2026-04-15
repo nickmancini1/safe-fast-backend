@@ -8130,7 +8130,7 @@ def _default_on_demand_request() -> OnDemandRequest:
         open_positions=0,
         weekly_trade_count=0,
     )
-
+    
 
 @app.get("/safe-fast/on-demand/default", include_in_schema=False, deprecated=True)
 async def safe_fast_on_demand_default() -> Any:
