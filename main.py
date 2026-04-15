@@ -3362,7 +3362,7 @@ def _build_structure_context(
     extension_confirmer_count = len(extension_confirmer_flags)
     strong_confirmer_flags = [
         flag for flag in extension_confirmer_flags
-        if flag in {"cramped_room", "parabolic_exhaustion", "volume_climax_exhaustion", "degraded_entry_quality"}
+        if flag in {"cramped_room", "parabolic_exhaustion", "volume_climax_exhaustion"}
     ]
     strong_confirmer_count = len(strong_confirmer_flags)
 
@@ -3372,22 +3372,77 @@ def _build_structure_context(
         or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.75)
     )
 
+    no_exhaustion_confirmed = bool(not parabolic_exhaustion and not volume_climax_exhaustion)
+    soft_extension_context = bool(
+        room_pass is True
+        and room_hard_fail is not True
+        and hidden_left_cluster_confirms_room_trap is not True
+        and no_exhaustion_confirmed
+    )
+
+    extreme_pct_threshold_by_symbol = {
+        "SPY": 3.0,
+        "QQQ": 3.75,
+        "IWM": 3.0,
+        "GLD": 2.5,
+    }
+    extreme_atr_threshold_by_symbol = {
+        "SPY": 3.0,
+        "QQQ": 3.0,
+        "IWM": 2.35,
+        "GLD": 2.35,
+    }
+    pct_from_ema = base_extension_ctx.get("pct_from_ema")
+    extreme_extension_only = bool(
+        soft_extension_context
+        and pct_from_ema is not None
+        and atr_multiple_from_ema is not None
+        and pct_from_ema >= extreme_pct_threshold_by_symbol.get(symbol, 3.0)
+        and atr_multiple_from_ema >= extreme_atr_threshold_by_symbol.get(symbol, 2.5)
+        and degraded_entry_quality
+        and early_trigger_window_passed
+    )
+
     emergency_extension_block = bool(
         extension_material
         and (
-            (atr_multiple_from_ema is not None and atr_multiple_from_ema >= 2.6 and degraded_entry_quality and early_trigger_window_passed)
-            or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.88 and degraded_entry_quality)
+            extreme_extension_only
+            or (
+                not soft_extension_context
+                and degraded_entry_quality
+                and early_trigger_window_passed
+                and (
+                    (atr_multiple_from_ema is not None and atr_multiple_from_ema >= 2.6)
+                    or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.88)
+                )
+            )
         )
     )
 
     extension_blocks_now = bool(
         extension_material and (
-            strong_confirmer_count >= 2
-            or (room_hard_fail and early_trigger_window_passed)
-            or (parabolic_exhaustion and degraded_entry_quality)
-            or (volume_climax_exhaustion and degraded_entry_quality)
+            room_hard_fail
+            or hidden_left_cluster_confirms_room_trap
+            or parabolic_exhaustion
+            or volume_climax_exhaustion
+            or (strong_confirmer_count >= 2 and not soft_extension_context)
             or emergency_extension_block
         )
+    )
+
+    early_enough_status = "fail" if extension_blocks_now else (
+        "caution" if (
+            extension_material
+            or degraded_entry_quality
+            or early_trigger_window_passed
+            or base_extension_ctx.get("extension_caution_0_40_pct")
+            or base_extension_ctx.get("move_ratio_caution")
+        ) else "pass"
+    )
+    early_enough_soft_caution = bool(
+        early_enough_status == "caution"
+        and soft_extension_context
+        and extension_material
     )
 
     extension_state = "extended" if extension_blocks_now else (
@@ -3414,7 +3469,12 @@ def _build_structure_context(
         "strong_confirmer_flags": strong_confirmer_flags,
         "strong_confirmer_count": strong_confirmer_count,
         "extension_material": extension_material,
+        "no_exhaustion_confirmed": no_exhaustion_confirmed,
+        "soft_extension_context": soft_extension_context,
+        "extreme_extension_only": extreme_extension_only,
         "emergency_extension_block": emergency_extension_block,
+        "early_enough_status": early_enough_status,
+        "early_enough_soft_caution": early_enough_soft_caution,
         "extension_soft_flag": bool(
             not extension_blocks_now and (
                 base_extension_ctx.get("extension_caution_0_40_pct")
@@ -3484,6 +3544,11 @@ def _build_structure_context(
         "strong_confirmer_flags": extension_ctx.get("strong_confirmer_flags"),
         "strong_confirmer_count": extension_ctx.get("strong_confirmer_count"),
         "extension_material": extension_ctx.get("extension_material"),
+        "no_exhaustion_confirmed": extension_ctx.get("no_exhaustion_confirmed"),
+        "soft_extension_context": extension_ctx.get("soft_extension_context"),
+        "extreme_extension_only": extension_ctx.get("extreme_extension_only"),
+        "early_enough_status": extension_ctx.get("early_enough_status"),
+        "early_enough_soft_caution": extension_ctx.get("early_enough_soft_caution"),
         "extension_soft_flag": extension_ctx.get("extension_soft_flag"),
         "extension_blocks_now": extension_ctx.get("extension_blocks_now"),
         "iv_state": "unconfirmed",
@@ -6648,7 +6713,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "extension_recalibration_v15_2026_04_15",
+        "build_tag": "early_enough_softening_v16_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7239,7 +7304,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "extension_recalibration_v15_2026_04_15",
+        "build_tag": "early_enough_softening_v16_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
