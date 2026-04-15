@@ -3226,7 +3226,11 @@ def _build_structure_context(
     noisy_chop_detail = _compute_noisy_chop_detail(candles, ema50_1h)
     candle_overlap_chop_risk = bool(noisy_chop_detail.get("overlap_rule_triggered") is True)
     adx_chop_risk = adx_ctx.get("chop_risk_from_adx")
-    effective_chop_risk = bool(candle_overlap_chop_risk) if adx_chop_risk is None else bool(candle_overlap_chop_risk and adx_chop_risk)
+    effective_chop_risk = bool(
+        noisy_chop_detail.get("noisy_chop") is True
+        or candle_overlap_chop_risk is True
+        or adx_chop_risk is True
+    )
     atr_multiple_from_ema = None
     if atr14 not in (None, 0) and invalidation_distance is not None:
         atr_multiple_from_ema = round(invalidation_distance / atr14, 3)
@@ -3805,6 +3809,7 @@ def _build_trigger_state(
         and structure_context.get("wall_pass") is True
         and structure_context.get("extension_state") != "extended"
         and structure_context.get("chop_risk") is False
+        and structure_context.get("noisy_chop_explicit") is not True
     )
 
     structural_trigger_present = bool(crossed and side_ok and structure_ok)
@@ -3890,7 +3895,7 @@ def _build_checklist_block(
     items = [
         {"item": "allowed_setup_type", "yes": _is_allowed_setup_type_name(structure_context.get("setup_type"))},
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
-        {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False)},
+        {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False and structure_context.get("noisy_chop_explicit") is not True)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
         {"item": "early_enough", "yes": bool(structure_context.get("extension_blocks_now") is not True)},
         {"item": "clear_trigger", "yes": bool(trigger_state.get("trigger_present") is True)},
@@ -6438,7 +6443,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "rth_route_label_cleanup_2026_04_14",
+        "build_tag": "rth_chop_consistency_cleanup_2026_04_14",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
