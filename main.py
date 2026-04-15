@@ -4171,7 +4171,12 @@ def _select_screened_best_candidate(
     if with_primary:
         return with_primary[0]
 
-    return screened_candidates[0]
+    if raw_engine_best_ticker:
+        for item in screened_candidates:
+            if item.get("symbol") == raw_engine_best_ticker:
+                return item
+
+    return None
 
 
 def _build_simple_output_block(
@@ -6457,7 +6462,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "rth_chop_consistency_cleanup_2026_04_14",
+        "build_tag": "engine_null_winner_cleanup_v7_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
