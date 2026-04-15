@@ -4397,14 +4397,10 @@ def _build_trigger_context_block(
 
 
 def _derive_global_gate_primary_blocker(trigger_reason: Any) -> Optional[str]:
-    if trigger_reason == "market_closed":
-        return "market_closed"
     return None
 
 
 def _derive_global_gate_next_flip(trigger_reason: Any) -> Optional[str]:
-    if trigger_reason == "market_closed":
-        return "market_open"
     return None
 
 
@@ -4445,6 +4441,9 @@ def _build_entry_context_block(
 
     return {
         "ok": True,
+        "live_entry_available_now": bool(trigger_state.get("why") != "market_closed" and current_bar_gated_trigger_pass),
+        "live_entry_requires_market_open": bool(trigger_state.get("why") == "market_closed"),
+        "live_entry_waiting_on": "market_open" if trigger_state.get("why") == "market_closed" else None,
         "mid_candle_trade_available_now": current_bar_gated_trigger_pass,
         "mid_candle_entry_state": mid_candle_entry_state,
         "mid_candle_raw_trigger_detected_now": current_bar_raw_trigger_pass,
@@ -4586,6 +4585,8 @@ def _build_approval_context_block(
     return {
         "ok": True,
         "ticker": intrabar_signal_context.get("ticker"),
+        "live_entry_requires_market_open": bool(trigger_state.get("why") == "market_closed"),
+        "live_entry_waiting_on": "market_open" if trigger_state.get("why") == "market_closed" else None,
         "approval_status": approval_status,
         "approval_ready_now": intrabar_trade_available_now,
         "approval_ready_on_completed_candle": completed_trade_available,
@@ -4692,7 +4693,9 @@ def _build_approval_requirements_context_block(
     ]
 
     missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
-    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("why")) or (blockers[0] if blockers else (missing_gates[0] if missing_gates else None))
+    next_flip_needed = blockers[0] if blockers else (missing_gates[0] if missing_gates else None)
+    if next_flip_needed is None and trigger_state.get("why") == "market_closed":
+        next_flip_needed = "market_open"
 
     if approval_context.get("approval_ready_now") is True:
         approval_path_status = "APPROVED_NOW"
@@ -4841,19 +4844,29 @@ async def _screen_ticker_candidate(
     failed_items = checklist.get("failed_items", [])
     if "liquidity_ok" in failed_items:
         reason = liquidity_context.get("why") or "Options liquidity is too wide for a clean debit spread entry."
-    elif "clear_trigger" in failed_items:
-        reason = trigger_state.get("why") or "No valid live trigger is present."
     elif structure_context.get("ok"):
-        if structure_context.get("room_pass") is False:
+        if structure_context.get("setup_type_allowed") is False:
+            reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
+        elif structure_context.get("room_pass") is False:
             reason = "Room to first wall is too tight for SAFE-FAST."
         elif structure_context.get("wall_pass") is False:
             reason = "Wall thesis and strike placement do not match."
         elif structure_context.get("extension_state") == "extended":
             reason = "Move is too extended from the 1H 50 EMA."
-        elif structure_context.get("setup_type_allowed") is False:
-            reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
         elif chart_alignment is False:
             reason = "Price is on the wrong side of the 1H 50 EMA."
+        elif "clear_trigger" in failed_items:
+            trigger_reason = str(trigger_state.get("why") or "").strip().lower()
+            if trigger_reason == "market_closed":
+                reason = "After-hours review only. No live trigger can be approved until the next regular session."
+            else:
+                reason = trigger_state.get("why") or "No valid live trigger is present."
+    elif "clear_trigger" in failed_items:
+        trigger_reason = str(trigger_state.get("why") or "").strip().lower()
+        if trigger_reason == "market_closed":
+            reason = "After-hours review only. No live trigger can be approved until the next regular session."
+        else:
+            reason = trigger_state.get("why") or "No valid live trigger is present."
 
     return {
         "symbol": symbol,
