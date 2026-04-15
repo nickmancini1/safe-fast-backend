@@ -6905,7 +6905,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "breakout_hold_confirmation_v20_2026_04_15",
+        "build_tag": "continuous_breakout_hold_alignment_v21_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7366,6 +7366,7 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     fresh_entry_allowed = snapshot.get("fresh_entry_allowed")
     time_gate_reason = snapshot.get("time_gate_reason")
     final_verdict = str(snapshot.get("final_verdict") or "").upper()
+    breakout_hold_pending = bool(snapshot.get("breakout_hold_pending"))
 
     if primary_blocker == "open_trade_already" or next_flip_needed == "open_trade_already":
         return "BLOCKED_OPEN_POSITION"
@@ -7374,6 +7375,9 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
 
     if summary.get("setup_state") == "INVALIDATED" or str(summary.get("action", "")).lower() == "exit now":
         return "EXIT_NOW"
+
+    if breakout_hold_pending:
+        return "PENDING_BREAKOUT_HOLD"
 
     if final_verdict == "TRADE":
         return "TRADE_READY"
@@ -7488,11 +7492,19 @@ def _build_continuous_snapshot(
     approval_context = on_demand_payload.get("approval_context") or {}
     approval_requirements_context = on_demand_payload.get("approval_requirements_context") or {}
     trigger_context = on_demand_payload.get("trigger_context") or {}
+    entry_context = on_demand_payload.get("entry_context") or {}
+    trigger_state = on_demand_payload.get("trigger_state") or {}
     market_context = on_demand_payload.get("market_context") or {}
     winner_shift_context = on_demand_payload.get("winner_shift_context") or {}
     iv_context = on_demand_payload.get("iv_context") or {}
     time_day_gate = on_demand_payload.get("time_day_gate") or {}
     market_closed_tester = _build_market_closed_tester_block(on_demand_payload)
+
+    breakout_hold_pending = bool(
+        str(trigger_state.get("why") or "").strip().lower() == "breakout_hold_not_confirmed"
+        or str(entry_context.get("completed_candle_block_reason") or "").strip().lower() == "breakout_hold_not_confirmed"
+        or str(entry_context.get("mid_candle_block_reason") or "").strip().lower() == "breakout_hold_not_confirmed"
+    )
 
     shadow_request_profile = {
         "profile_name": shadow_request.profile_name if shadow_request else profile_name,
@@ -7509,7 +7521,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "breakout_hold_confirmation_v20_2026_04_15",
+        "build_tag": "continuous_breakout_hold_alignment_v21_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
@@ -7526,6 +7538,18 @@ def _build_continuous_snapshot(
         "approval_ready_now": approval_context.get("approval_ready_now"),
         "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
         "approval_status": approval_context.get("approval_status"),
+        "breakout_hold_pending": breakout_hold_pending,
+        "breakout_hold_current_confirmed": trigger_state.get("breakout_hold_current_confirmed"),
+        "breakout_hold_completed_confirmed": trigger_state.get("breakout_hold_completed_confirmed"),
+        "breakout_hold_reference_current": trigger_state.get("breakout_hold_reference_current"),
+        "breakout_hold_reference_completed": trigger_state.get("breakout_hold_reference_completed"),
+        "breakout_hold_block_reason": entry_context.get("completed_candle_block_reason")
+        if str(entry_context.get("completed_candle_block_reason") or "").strip().lower() == "breakout_hold_not_confirmed"
+        else (
+            entry_context.get("mid_candle_block_reason")
+            if str(entry_context.get("mid_candle_block_reason") or "").strip().lower() == "breakout_hold_not_confirmed"
+            else None
+        ),
         "final_verdict": on_demand_payload.get("final_verdict"),
         "global_gate_failures": _ordered_unique_strings((on_demand_payload.get("checklist") or {}).get("global_gate_failures") or (approval_requirements_context.get("global_gate_failures") or [])),
         "wall_thesis_fit_status": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("wall_thesis_fit_status"),
@@ -7599,6 +7623,7 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
     fresh_entry_allowed = bool(snapshot.get("fresh_entry_allowed"))
     next_flip_needed = snapshot.get("next_flip_needed")
     final_verdict = str(snapshot.get("final_verdict") or "").upper()
+    breakout_hold_pending = bool(snapshot.get("breakout_hold_pending"))
 
     hard_blockers = {"allowed_setup_type", "clear_room", "early_enough", "one_hour_clean_around_ema"}
     hard_blockers_active = [item for item in decision_blockers if item in hard_blockers]
@@ -7610,6 +7635,11 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
         alert_reason = "Invalidation hit."
         should_alert_candidate = True
         alert_severity = "high"
+    elif breakout_hold_pending:
+        alert_stage = "PENDING_BREAKOUT_HOLD"
+        alert_reason = "Breakout crossed, but hold above resistance is not confirmed yet."
+        should_alert_candidate = False
+        alert_severity = "info"
     elif final_verdict == "TRADE":
         if approval_ready_on_completed_candle:
             alert_stage = "TRADE_READY_COMPLETED_CANDLE"
@@ -7665,6 +7695,7 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
         "approval_ready_on_completed_candle": approval_ready_on_completed_candle,
         "next_flip_needed": next_flip_needed,
         "final_verdict": final_verdict,
+        "breakout_hold_pending": breakout_hold_pending,
     }
 
 def _continuous_meaningful_changed_fields(
@@ -7700,6 +7731,9 @@ def _continuous_meaningful_changed_fields(
             previous.get("approval_ready_on_completed_candle"),
             current.get("approval_ready_on_completed_candle"),
         )
+
+    if previous.get("breakout_hold_pending") != current.get("breakout_hold_pending"):
+        _add("breakout_hold_pending", previous.get("breakout_hold_pending"), current.get("breakout_hold_pending"))
 
     if previous.get("invalidation_hit") != current.get("invalidation_hit"):
         _add("invalidation_hit", previous.get("invalidation_hit"), current.get("invalidation_hit"))
@@ -7777,6 +7811,14 @@ def _compare_continuous_snapshots(
         transition_type = "INTRABAR_APPROVAL_CHANGED"
         severity = "high" if current.get("approval_ready_now") else "medium"
         summary = "Intrabar approval state changed."
+    elif "breakout_hold_pending" in changed_fields:
+        transition_type = "BREAKOUT_HOLD_CHANGED"
+        severity = "medium"
+        summary = (
+            "Breakout hold confirmation is still pending."
+            if current.get("breakout_hold_pending")
+            else "Breakout hold confirmation cleared."
+        )
     elif "global_gate_failures" in changed_fields:
         transition_type = "FINAL_GATE_CHANGED"
         severity = "medium"
@@ -7842,6 +7884,7 @@ def _build_true_transition_context(
         "next_flip_needed",
         "approval_ready_now",
         "approval_ready_on_completed_candle",
+        "breakout_hold_pending",
         "current_state",
         "global_gate_failures",
         "invalidation_hit",
@@ -7923,6 +7966,15 @@ def _build_true_transition_context(
             current.get("approval_ready_now"),
             "high" if current.get("approval_ready_now") else "medium",
             "Intrabar approval state changed.",
+        )
+
+    if "breakout_hold_pending" in changed_fields:
+        _add_event(
+            "BREAKOUT_HOLD_CHANGED",
+            previous.get("breakout_hold_pending"),
+            current.get("breakout_hold_pending"),
+            "medium",
+            "Breakout hold confirmation state changed.",
         )
 
     if "global_gate_failures" in changed_fields:
@@ -8219,6 +8271,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
         "why_now": summary_note,
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
+        "breakout_hold_pending": snapshot.get("breakout_hold_pending"),
         "invalidation": snapshot.get("invalidation"),
     }
 
