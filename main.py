@@ -6815,7 +6815,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "wall_thesis_gate_v18_2026_04_15",
+        "build_tag": "continuous_alignment_v19_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7099,6 +7099,7 @@ _CONTINUOUS_STRUCTURE_FAILED_REASON_STATE_MAP: Dict[str, str] = {
 _CONTINUOUS_STATE_FAMILY_MAP: Dict[str, str] = {
     "STALE_OR_UNCONFIRMED": "SYSTEM",
     "EXIT_NOW": "EXIT",
+    "TRADE_READY": "SIGNAL",
     "APPROVAL_READY": "SIGNAL",
     "PENDING_COMPLETED_CANDLE_APPROVAL": "SIGNAL",
     "PENDING_TRIGGER_CONFIRMATION": "SIGNAL",
@@ -7201,6 +7202,8 @@ def _derive_continuous_state_source(
         return "time_gate"
     if current_state == "BLOCKED_IV_HIGH":
         return "iv_gate"
+    if current_state == "TRADE_READY":
+        return "final_verdict"
     if current_state in {"APPROVAL_READY", "PENDING_COMPLETED_CANDLE_APPROVAL", "PENDING_TRIGGER_CONFIRMATION"}:
         return "signal_state"
     if current_state == "EXIT_NOW":
@@ -7234,6 +7237,11 @@ def _derive_continuous_state_reason(
         return snapshot.get("iv_status")
     if current_state == "EXIT_NOW":
         return "exit_now"
+    if current_state == "TRADE_READY":
+        approval_status = snapshot.get("approval_status")
+        if approval_status:
+            return str(approval_status).lower()
+        return str(snapshot.get("final_verdict") or "trade").lower()
     if current_state in {"APPROVAL_READY", "PENDING_COMPLETED_CANDLE_APPROVAL", "PENDING_TRIGGER_CONFIRMATION"}:
         return current_state.lower()
     if current_state == "NO_CANDIDATE":
@@ -7253,6 +7261,7 @@ def _derive_continuous_state_reason(
     return None
 
 
+
 def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     if not snapshot.get("on_demand_ok", False):
         return "STALE_OR_UNCONFIRMED"
@@ -7266,6 +7275,7 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     market_open = snapshot.get("market_open")
     fresh_entry_allowed = snapshot.get("fresh_entry_allowed")
     time_gate_reason = snapshot.get("time_gate_reason")
+    final_verdict = str(snapshot.get("final_verdict") or "").upper()
 
     if primary_blocker == "open_trade_already" or next_flip_needed == "open_trade_already":
         return "BLOCKED_OPEN_POSITION"
@@ -7274,12 +7284,9 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
 
     if summary.get("setup_state") == "INVALIDATED" or str(summary.get("action", "")).lower() == "exit now":
         return "EXIT_NOW"
-    if snapshot.get("approval_ready_now"):
-        return "APPROVAL_READY"
-    if snapshot.get("approval_ready_on_completed_candle"):
-        return "PENDING_COMPLETED_CANDLE_APPROVAL"
-    if snapshot.get("trigger_present"):
-        return "PENDING_TRIGGER_CONFIRMATION"
+
+    if final_verdict == "TRADE":
+        return "TRADE_READY"
 
     if iv_status == "high":
         return "BLOCKED_IV_HIGH"
@@ -7292,6 +7299,13 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
             return "WAIT_MARKET_OPEN"
         return "BLOCKED_TIME_GATE"
 
+    if final_verdict == "PENDING":
+        if snapshot.get("approval_ready_on_completed_candle"):
+            return "PENDING_COMPLETED_CANDLE_APPROVAL"
+        if snapshot.get("approval_ready_now") or snapshot.get("trigger_present"):
+            return "PENDING_TRIGGER_CONFIRMATION"
+        return "PENDING_TRIGGER_CONFIRMATION"
+
     if structure_state:
         return structure_state
 
@@ -7303,8 +7317,6 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     if primary_blocker:
         return "BLOCKED_STRUCTURAL"
     return "STALE_OR_UNCONFIRMED"
-
-
 
 def _build_market_closed_tester_block(on_demand_payload: Dict[str, Any]) -> Dict[str, Any]:
     market_context = on_demand_payload.get("market_context") or {}
@@ -7407,7 +7419,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "wall_thesis_gate_v18_2026_04_15",
+        "build_tag": "continuous_alignment_v19_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
@@ -7423,6 +7435,11 @@ def _build_continuous_snapshot(
         "structure_ready": trigger_context.get("structure_ready"),
         "approval_ready_now": approval_context.get("approval_ready_now"),
         "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
+        "approval_status": approval_context.get("approval_status"),
+        "final_verdict": on_demand_payload.get("final_verdict"),
+        "global_gate_failures": _ordered_unique_strings((on_demand_payload.get("checklist") or {}).get("global_gate_failures") or (approval_requirements_context.get("global_gate_failures") or [])),
+        "wall_thesis_fit_status": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("wall_thesis_fit_status"),
+        "wall_thesis_fit_reason": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("why_wall_thesis_fit_passes_or_fails"),
         "open_positions": request_payload.get("open_positions"),
         "weekly_trade_count": request_payload.get("weekly_trade_count"),
         "invalidation": simple_output.get("invalidation"),
@@ -7478,8 +7495,10 @@ def _build_continuous_snapshot(
     return snapshot
 
 
+
 def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     decision_blockers = [str(item) for item in (snapshot.get("decision_blockers") or [])]
+    global_gate_failures = _ordered_unique_strings(snapshot.get("global_gate_failures") or [])
     setup_type = snapshot.get("setup_type")
     setup_allowed = _is_allowed_setup_type_name(setup_type)
     trigger_present = bool(snapshot.get("trigger_present"))
@@ -7489,41 +7508,36 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
     market_open = bool(snapshot.get("market_open"))
     fresh_entry_allowed = bool(snapshot.get("fresh_entry_allowed"))
     next_flip_needed = snapshot.get("next_flip_needed")
+    final_verdict = str(snapshot.get("final_verdict") or "").upper()
 
-    hard_blockers = {"allowed_setup_type", "clear_room", "early_enough"}
+    hard_blockers = {"allowed_setup_type", "clear_room", "early_enough", "one_hour_clean_around_ema"}
     hard_blockers_active = [item for item in decision_blockers if item in hard_blockers]
-    trigger_path_open = (
-        setup_allowed
-        and market_open
-        and fresh_entry_allowed
-        and not hard_blockers_active
-    )
-    pre_alert_gates = {"clear_trigger", "trigger_present", "structure_ready"}
-    waiting_on_last_gates = bool(trigger_path_open and next_flip_needed in pre_alert_gates)
+    wall_thesis_blocking = "wall_thesis_fit" in global_gate_failures
+    final_gate_blocking = bool(global_gate_failures)
 
     if invalidation_hit:
         alert_stage = "EXIT_NOW"
         alert_reason = "Invalidation hit."
         should_alert_candidate = True
         alert_severity = "high"
-    elif approval_ready_now:
-        alert_stage = "APPROVAL_READY_NOW"
-        alert_reason = "SAFE-FAST approval is ready intrabar."
+    elif final_verdict == "TRADE":
+        if approval_ready_on_completed_candle:
+            alert_stage = "TRADE_READY_COMPLETED_CANDLE"
+            alert_reason = "SAFE-FAST trade is ready from completed-candle approval."
+        elif approval_ready_now:
+            alert_stage = "TRADE_READY_INTRABAR"
+            alert_reason = "SAFE-FAST trade is ready intrabar."
+        else:
+            alert_stage = "TRADE_READY"
+            alert_reason = "SAFE-FAST trade is ready."
         should_alert_candidate = True
         alert_severity = "high"
-    elif approval_ready_on_completed_candle:
-        alert_stage = "APPROVAL_READY_ON_COMPLETED_CANDLE"
-        alert_reason = "SAFE-FAST approval is ready on the completed candle."
-        should_alert_candidate = True
-        alert_severity = "high"
-    elif trigger_present and trigger_path_open:
-        alert_stage = "TRIGGER_PRESENT_WAITING_APPROVAL"
-        alert_reason = "Trigger is present and only final approval gates remain."
-        should_alert_candidate = True
-        alert_severity = "medium"
-    elif waiting_on_last_gates:
-        alert_stage = "SETUP_POTENTIALLY_FORMING"
-        alert_reason = "Setup is allowed and nearing trigger readiness."
+    elif final_verdict == "PENDING":
+        alert_stage = "PENDING_TRIGGER_CONFIRMATION"
+        if next_flip_needed:
+            alert_reason = f"Setup is pending. Next flip needed: {next_flip_needed}."
+        else:
+            alert_reason = "Setup is pending trigger confirmation."
         should_alert_candidate = True
         alert_severity = "medium"
     else:
@@ -7532,6 +7546,10 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
             alert_reason = "Entry window is closed."
         elif not setup_allowed:
             alert_reason = "Setup type is not one of the 3 allowed SAFE-FAST routes."
+        elif wall_thesis_blocking:
+            alert_reason = "Wall-thesis fit is blocking the setup."
+        elif final_gate_blocking:
+            alert_reason = f"Final gate blocker active: {', '.join(global_gate_failures)}."
         elif hard_blockers_active:
             alert_reason = f"Hard blockers still active: {', '.join(hard_blockers_active)}."
         else:
@@ -7547,49 +7565,85 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
         "should_alert_candidate": should_alert_candidate,
         "setup_allowed": setup_allowed,
         "hard_blockers_active": hard_blockers_active,
-        "trigger_path_open": trigger_path_open,
-        "waiting_on_last_gates": waiting_on_last_gates,
+        "wall_thesis_blocking": wall_thesis_blocking,
+        "final_gate_blocking": final_gate_blocking,
+        "global_gate_failures": global_gate_failures,
         "market_open": market_open,
         "fresh_entry_allowed": fresh_entry_allowed,
         "trigger_present": trigger_present,
         "approval_ready_now": approval_ready_now,
         "approval_ready_on_completed_candle": approval_ready_on_completed_candle,
         "next_flip_needed": next_flip_needed,
+        "final_verdict": final_verdict,
     }
+
+def _continuous_meaningful_changed_fields(
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    changes: Dict[str, Dict[str, Any]] = {}
+
+    def _add(field: str, previous_value: Any, current_value: Any) -> None:
+        changes[field] = {"previous": previous_value, "current": current_value}
+
+    prev_verdict = str(previous.get("final_verdict") or "").upper()
+    curr_verdict = str(current.get("final_verdict") or "").upper()
+
+    if prev_verdict != curr_verdict:
+        _add("final_verdict", prev_verdict, curr_verdict)
+
+    if previous.get("current_state") != current.get("current_state"):
+        _add("current_state", previous.get("current_state"), current.get("current_state"))
+
+    if previous.get("primary_blocker") != current.get("primary_blocker"):
+        _add("primary_blocker", previous.get("primary_blocker"), current.get("primary_blocker"))
+
+    if previous.get("next_flip_needed") != current.get("next_flip_needed") and curr_verdict == "PENDING":
+        _add("next_flip_needed", previous.get("next_flip_needed"), current.get("next_flip_needed"))
+
+    if previous.get("approval_ready_now") != current.get("approval_ready_now"):
+        _add("approval_ready_now", previous.get("approval_ready_now"), current.get("approval_ready_now"))
+
+    if previous.get("approval_ready_on_completed_candle") != current.get("approval_ready_on_completed_candle"):
+        _add(
+            "approval_ready_on_completed_candle",
+            previous.get("approval_ready_on_completed_candle"),
+            current.get("approval_ready_on_completed_candle"),
+        )
+
+    if previous.get("invalidation_hit") != current.get("invalidation_hit"):
+        _add("invalidation_hit", previous.get("invalidation_hit"), current.get("invalidation_hit"))
+
+    prev_global = _ordered_unique_strings(previous.get("global_gate_failures") or [])
+    curr_global = _ordered_unique_strings(current.get("global_gate_failures") or [])
+    if prev_global != curr_global:
+        _add("global_gate_failures", prev_global, curr_global)
+
+    if previous.get("best_ticker") != current.get("best_ticker") and prev_verdict != curr_verdict:
+        _add("best_ticker", previous.get("best_ticker"), current.get("best_ticker"))
+
+    if (
+        previous.get("open_positions") != current.get("open_positions")
+        or previous.get("weekly_trade_count") != current.get("weekly_trade_count")
+    ):
+        _add(
+            "account_state",
+            {
+                "open_positions": previous.get("open_positions"),
+                "weekly_trade_count": previous.get("weekly_trade_count"),
+            },
+            {
+                "open_positions": current.get("open_positions"),
+                "weekly_trade_count": current.get("weekly_trade_count"),
+            },
+        )
+
+    return changes
 
 
 def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    tracked_fields = [
-        "current_state",
-        "latent_structure_state",
-        "state_family",
-        "state_source",
-        "state_reason",
-        "best_ticker",
-        "final_verdict",
-        "primary_blocker",
-        "next_flip_needed",
-        "trigger_present",
-        "structure_ready",
-        "approval_ready_now",
-        "approval_ready_on_completed_candle",
-        "open_positions",
-        "weekly_trade_count",
-        "replay_test_enabled",
-        "replay_timestamp_et",
-        "replay_trade_allowed",
-        "replay_market_open",
-        "replay_fresh_entry_allowed",
-        "alert_stage",
-        "alert_reason",
-    ]
-    changes: Dict[str, Dict[str, Any]] = {}
-    for field in tracked_fields:
-        previous_value = previous.get(field)
-        current_value = current.get(field)
-        if previous_value != current_value:
-            changes[field] = {"previous": previous_value, "current": current_value}
-    return changes
+    return _continuous_meaningful_changed_fields(previous, current)
+
 
 
 def _compare_continuous_snapshots(
@@ -7613,68 +7667,42 @@ def _compare_continuous_snapshots(
         transition_type = "NO_MEANINGFUL_CHANGE"
         severity = "info"
         summary = "No meaningful state change."
-    elif previous.get("current_state") != current.get("current_state"):
-        transition_type = "STATE_CHANGED"
-        severity = "high" if current.get("current_state") in {"APPROVAL_READY", "EXIT_NOW"} else "medium"
-        summary = (
-            f"State changed from {previous.get('current_state')} to {current.get('current_state')}."
-        )
-    elif previous.get("best_ticker") != current.get("best_ticker"):
-        transition_type = "WINNER_CHANGED"
-        severity = "medium"
-        summary = f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')}."
-    elif previous.get("primary_blocker") != current.get("primary_blocker"):
+    elif "invalidation_hit" in changed_fields and current.get("invalidation_hit"):
+        transition_type = "INVALIDATION_HIT"
+        severity = "high"
+        summary = "Invalidation hit. Exit now."
+    elif "final_verdict" in changed_fields:
+        transition_type = "FINAL_VERDICT_CHANGED"
+        severity = "high" if str(current.get("final_verdict") or "").upper() == "TRADE" else "medium"
+        summary = f"Final verdict changed from {previous.get('final_verdict')} to {current.get('final_verdict')}."
+    elif "primary_blocker" in changed_fields:
         transition_type = "PRIMARY_BLOCKER_CHANGED"
         severity = "medium"
-        summary = (
-            f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}."
-        )
-    elif previous.get("next_flip_needed") != current.get("next_flip_needed"):
-        transition_type = "NEXT_FLIP_CHANGED"
-        severity = "medium"
-        summary = (
-            f"Next flip needed changed from {previous.get('next_flip_needed')} to {current.get('next_flip_needed')}."
-        )
-    elif (
-        previous.get("approval_ready_now") != current.get("approval_ready_now")
-        or previous.get("approval_ready_on_completed_candle")
-        != current.get("approval_ready_on_completed_candle")
-    ):
-        transition_type = "APPROVAL_STATE_CHANGED"
+        summary = f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}."
+    elif "approval_ready_on_completed_candle" in changed_fields:
+        transition_type = "COMPLETED_CANDLE_APPROVAL_CHANGED"
+        severity = "high" if current.get("approval_ready_on_completed_candle") else "medium"
+        summary = "Completed-candle approval state changed."
+    elif "approval_ready_now" in changed_fields:
+        transition_type = "INTRABAR_APPROVAL_CHANGED"
         severity = "high" if current.get("approval_ready_now") else "medium"
-        summary = "Approval state changed."
-    elif previous.get("trigger_present") != current.get("trigger_present"):
-        transition_type = "TRIGGER_STATE_CHANGED"
+        summary = "Intrabar approval state changed."
+    elif "global_gate_failures" in changed_fields:
+        transition_type = "FINAL_GATE_CHANGED"
         severity = "medium"
-        summary = "Trigger state changed."
-    elif previous.get("replay_test_enabled") != current.get("replay_test_enabled"):
-        transition_type = "REPLAY_MODE_CHANGED"
+        summary = "Final gate blocker state changed."
+    elif "best_ticker" in changed_fields:
+        transition_type = "WINNER_CHANGED_WITH_STATE_CHANGE"
         severity = "medium"
-        summary = "Replay mode changed."
-    elif previous.get("replay_timestamp_et") != current.get("replay_timestamp_et"):
-        transition_type = "REPLAY_TIMESTAMP_CHANGED"
-        severity = "medium"
-        summary = (
-            f"Replay timestamp changed from {previous.get('replay_timestamp_et')} to {current.get('replay_timestamp_et')}."
-        )
-    elif previous.get("replay_trade_allowed") != current.get("replay_trade_allowed"):
-        transition_type = "REPLAY_TRADE_PERMISSION_CHANGED"
-        severity = "medium"
-        summary = "Replay trade permission changed."
-    elif (
-        previous.get("replay_market_open") != current.get("replay_market_open")
-        or previous.get("replay_fresh_entry_allowed") != current.get("replay_fresh_entry_allowed")
-    ):
-        transition_type = "REPLAY_TIME_GATE_CHANGED"
-        severity = "medium"
-        summary = "Replay time gate changed."
-    elif (
-        previous.get("open_positions") != current.get("open_positions")
-        or previous.get("weekly_trade_count") != current.get("weekly_trade_count")
-    ):
+        summary = f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')} with a state change."
+    elif "account_state" in changed_fields:
         transition_type = "ACCOUNT_STATE_CHANGED"
         severity = "medium"
         summary = "Account state changed."
+    elif "next_flip_needed" in changed_fields:
+        transition_type = "NEXT_FLIP_CHANGED"
+        severity = "medium"
+        summary = f"Next flip needed changed from {previous.get('next_flip_needed')} to {current.get('next_flip_needed')}."
     else:
         transition_type = "DETAIL_CHANGED"
         severity = "info"
@@ -7689,7 +7717,6 @@ def _compare_continuous_snapshots(
         "summary": summary,
     }
 
-
 def _continuous_transition_fingerprint(
     *,
     current_snapshot: Dict[str, Any],
@@ -7697,26 +7724,21 @@ def _continuous_transition_fingerprint(
 ) -> str:
     payload = {
         "transition_type": transition_summary.get("transition_type"),
+        "final_verdict": current_snapshot.get("final_verdict"),
         "current_state": current_snapshot.get("current_state"),
         "best_ticker": current_snapshot.get("best_ticker"),
         "primary_blocker": current_snapshot.get("primary_blocker"),
         "next_flip_needed": current_snapshot.get("next_flip_needed"),
-        "trigger_present": current_snapshot.get("trigger_present"),
         "approval_ready_now": current_snapshot.get("approval_ready_now"),
         "approval_ready_on_completed_candle": current_snapshot.get("approval_ready_on_completed_candle"),
+        "global_gate_failures": current_snapshot.get("global_gate_failures"),
         "open_positions": current_snapshot.get("open_positions"),
         "weekly_trade_count": current_snapshot.get("weekly_trade_count"),
-        "replay_test_enabled": current_snapshot.get("replay_test_enabled"),
-        "replay_timestamp_et": current_snapshot.get("replay_timestamp_et"),
-        "replay_trade_allowed": current_snapshot.get("replay_trade_allowed"),
-        "replay_market_open": current_snapshot.get("replay_market_open"),
-        "replay_fresh_entry_allowed": current_snapshot.get("replay_fresh_entry_allowed"),
-        "alert_stage": current_snapshot.get("alert_stage"),
-        "alert_reason": current_snapshot.get("alert_reason"),
     }
     return hashlib.sha1(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
 
 
 def _build_true_transition_context(
@@ -7724,21 +7746,17 @@ def _build_true_transition_context(
     current: Dict[str, Any],
 ) -> Dict[str, Any]:
     watched_fields = [
+        "final_verdict",
         "best_ticker",
         "primary_blocker",
-        "setup_type",
-        "trigger_present",
+        "next_flip_needed",
         "approval_ready_now",
         "approval_ready_on_completed_candle",
         "current_state",
+        "global_gate_failures",
         "invalidation_hit",
-        "replay_test_enabled",
-        "replay_timestamp_et",
-        "replay_trade_allowed",
-        "replay_market_open",
-        "replay_fresh_entry_allowed",
-        "alert_stage",
-        "alert_reason",
+        "open_positions",
+        "weekly_trade_count",
     ]
 
     if not previous:
@@ -7757,16 +7775,9 @@ def _build_true_transition_context(
         }
 
     events: List[Dict[str, Any]] = []
-    changed_fields: Dict[str, Dict[str, Any]] = {}
+    changed_fields = _continuous_meaningful_changed_fields(previous, current)
 
-    def _add_event(
-        event: str,
-        *,
-        previous_value: Any,
-        current_value: Any,
-        severity: str,
-        summary: str,
-    ) -> None:
+    def _add_event(event: str, previous_value: Any, current_value: Any, severity: str, summary: str) -> None:
         events.append(
             {
                 "event": event,
@@ -7776,147 +7787,88 @@ def _build_true_transition_context(
                 "summary": summary,
             }
         )
-        changed_fields[event] = {"previous": previous_value, "current": current_value}
 
-    prev_invalidated = bool(previous.get("invalidation_hit") or previous.get("current_state") == "EXIT_NOW")
-    curr_invalidated = bool(current.get("invalidation_hit") or current.get("current_state") == "EXIT_NOW")
-    if not prev_invalidated and curr_invalidated:
+    if "invalidation_hit" in changed_fields and current.get("invalidation_hit"):
         _add_event(
             "INVALIDATION_HIT",
-            previous_value=previous.get("current_state"),
-            current_value=current.get("current_state"),
-            severity="high",
-            summary="Invalidation hit. Exit now.",
+            previous.get("invalidation_hit"),
+            current.get("invalidation_hit"),
+            "high",
+            "Invalidation hit. Exit now.",
         )
 
-    prev_approval_ready = bool(
-        previous.get("approval_ready_now") or previous.get("approval_ready_on_completed_candle")
-    )
-    curr_approval_ready = bool(
-        current.get("approval_ready_now") or current.get("approval_ready_on_completed_candle")
-    )
-    if not prev_approval_ready and curr_approval_ready:
-        approval_mode = "intrabar" if current.get("approval_ready_now") else "completed_candle"
+    if "final_verdict" in changed_fields:
+        curr_verdict = str(current.get("final_verdict") or "").upper()
+        severity = "high" if curr_verdict == "TRADE" else "medium"
         _add_event(
-            "APPROVAL_BECAME_READY",
-            previous_value=prev_approval_ready,
-            current_value=approval_mode,
-            severity="high",
-            summary=f"Approval became ready on {approval_mode}.",
+            "FINAL_VERDICT_CHANGED",
+            previous.get("final_verdict"),
+            current.get("final_verdict"),
+            severity,
+            f"Final verdict changed from {previous.get('final_verdict')} to {current.get('final_verdict')}.",
         )
 
-    if previous.get("best_ticker") != current.get("best_ticker"):
-        _add_event(
-            "WINNER_CHANGED",
-            previous_value=previous.get("best_ticker"),
-            current_value=current.get("best_ticker"),
-            severity="medium",
-            summary=f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')}.",
-        )
-
-    if previous.get("primary_blocker") != current.get("primary_blocker"):
+    if "primary_blocker" in changed_fields:
         _add_event(
             "PRIMARY_BLOCKER_CHANGED",
-            previous_value=previous.get("primary_blocker"),
-            current_value=current.get("primary_blocker"),
-            severity="medium",
-            summary=(
-                f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}."
-            ),
+            previous.get("primary_blocker"),
+            current.get("primary_blocker"),
+            "medium",
+            f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}.",
         )
 
-    if previous.get("setup_type") != current.get("setup_type"):
+    if "approval_ready_on_completed_candle" in changed_fields:
         _add_event(
-            "SETUP_TYPE_CHANGED",
-            previous_value=previous.get("setup_type"),
-            current_value=current.get("setup_type"),
-            severity="medium",
-            summary=f"Setup type changed from {previous.get('setup_type')} to {current.get('setup_type')}.",
+            "COMPLETED_CANDLE_APPROVAL_CHANGED",
+            previous.get("approval_ready_on_completed_candle"),
+            current.get("approval_ready_on_completed_candle"),
+            "high" if current.get("approval_ready_on_completed_candle") else "medium",
+            "Completed-candle approval state changed.",
         )
 
-    if previous.get("trigger_present") is not True and current.get("trigger_present") is True:
+    if "approval_ready_now" in changed_fields:
         _add_event(
-            "TRIGGER_APPEARED",
-            previous_value=previous.get("trigger_present"),
-            current_value=current.get("trigger_present"),
-            severity="medium",
-            summary="Trigger appeared.",
-        )
-    elif previous.get("trigger_present") is True and current.get("trigger_present") is not True:
-        _add_event(
-            "TRIGGER_DISAPPEARED",
-            previous_value=previous.get("trigger_present"),
-            current_value=current.get("trigger_present"),
-            severity="medium",
-            summary="Trigger disappeared.",
+            "INTRABAR_APPROVAL_CHANGED",
+            previous.get("approval_ready_now"),
+            current.get("approval_ready_now"),
+            "high" if current.get("approval_ready_now") else "medium",
+            "Intrabar approval state changed.",
         )
 
-    if previous.get("replay_test_enabled") != current.get("replay_test_enabled"):
+    if "global_gate_failures" in changed_fields:
         _add_event(
-            "REPLAY_MODE_CHANGED",
-            previous_value=previous.get("replay_test_enabled"),
-            current_value=current.get("replay_test_enabled"),
-            severity="medium",
-            summary="Replay mode changed.",
+            "FINAL_GATE_CHANGED",
+            changed_fields["global_gate_failures"]["previous"],
+            changed_fields["global_gate_failures"]["current"],
+            "medium",
+            "Final gate blocker state changed.",
         )
 
-    if previous.get("replay_timestamp_et") != current.get("replay_timestamp_et"):
+    if "best_ticker" in changed_fields:
         _add_event(
-            "REPLAY_TIMESTAMP_CHANGED",
-            previous_value=previous.get("replay_timestamp_et"),
-            current_value=current.get("replay_timestamp_et"),
-            severity="medium",
-            summary=(
-                f"Replay timestamp changed from {previous.get('replay_timestamp_et')} to {current.get('replay_timestamp_et')}."
-            ),
+            "WINNER_CHANGED_WITH_STATE_CHANGE",
+            previous.get("best_ticker"),
+            current.get("best_ticker"),
+            "medium",
+            f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')} with a state change.",
         )
 
-    if previous.get("replay_trade_allowed") != current.get("replay_trade_allowed"):
+    if "account_state" in changed_fields:
         _add_event(
-            "REPLAY_TRADE_PERMISSION_CHANGED",
-            previous_value=previous.get("replay_trade_allowed"),
-            current_value=current.get("replay_trade_allowed"),
-            severity="medium",
-            summary="Replay trade permission changed.",
+            "ACCOUNT_STATE_CHANGED",
+            changed_fields["account_state"]["previous"],
+            changed_fields["account_state"]["current"],
+            "medium",
+            "Account state changed.",
         )
 
-    if (
-        previous.get("replay_market_open") != current.get("replay_market_open")
-        or previous.get("replay_fresh_entry_allowed") != current.get("replay_fresh_entry_allowed")
-    ):
+    if "next_flip_needed" in changed_fields:
         _add_event(
-            "REPLAY_TIME_GATE_CHANGED",
-            previous_value={
-                "replay_market_open": previous.get("replay_market_open"),
-                "replay_fresh_entry_allowed": previous.get("replay_fresh_entry_allowed"),
-            },
-            current_value={
-                "replay_market_open": current.get("replay_market_open"),
-                "replay_fresh_entry_allowed": current.get("replay_fresh_entry_allowed"),
-            },
-            severity="medium",
-            summary="Replay time gate changed.",
-        )
-
-    if (
-        previous.get("alert_stage") != current.get("alert_stage")
-        or previous.get("alert_reason") != current.get("alert_reason")
-    ):
-        current_alert_context = current.get("alert_candidate_context") or {}
-        _add_event(
-            "ALERT_STAGE_CHANGED",
-            previous_value={
-                "alert_stage": previous.get("alert_stage"),
-                "alert_reason": previous.get("alert_reason"),
-            },
-            current_value={
-                "alert_stage": current.get("alert_stage"),
-                "alert_reason": current.get("alert_reason"),
-            },
-            severity=current_alert_context.get("alert_severity") or "medium",
-            summary=(
-                f"Alert stage changed from {previous.get('alert_stage')} to {current.get('alert_stage')}."
-            ),
+            "NEXT_FLIP_CHANGED",
+            previous.get("next_flip_needed"),
+            current.get("next_flip_needed"),
+            "medium",
+            f"Next flip needed changed from {previous.get('next_flip_needed')} to {current.get('next_flip_needed')}.",
         )
 
     transition_detected = bool(events)
@@ -7931,8 +7883,8 @@ def _build_true_transition_context(
         summary = events[0]["summary"]
         primary_event = events[0]["event"]
     else:
-        transition_type = "MULTIPLE_TRUE_TRANSITIONS"
         highest = {"info": 0, "medium": 1, "high": 2}
+        transition_type = "MULTIPLE_TRUE_TRANSITIONS"
         severity = max((event["severity"] for event in events), key=lambda x: highest.get(x, 0))
         summary = " | ".join(event["summary"] for event in events)
         primary_event = events[0]["event"]
@@ -7953,7 +7905,6 @@ def _build_true_transition_context(
         "watched_fields": watched_fields,
         "changed_fields": changed_fields,
     }
-
 
 def _build_continuous_alert_decision_context(
     *,
@@ -8093,6 +8044,7 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
             "approval_ready_on_completed_candle": approval_context.get(
                 "approval_ready_on_completed_candle"
             ),
+            "approval_status": approval_context.get("approval_status"),
         },
         "trigger_context": {
             "trigger_present": trigger_context.get("trigger_present"),
