@@ -3391,10 +3391,6 @@ def _final_verdict(
         return "NO_TRADE"
     if request.weekly_trade_count >= 4:
         return "NO_TRADE"
-    if not market_context["is_open"]:
-        return "NO_TRADE"
-    if not time_day_gate.get("fresh_entry_allowed"):
-        return "NO_TRADE"
     if macro_context.get("ok") and (
         macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
     ):
@@ -3414,7 +3410,13 @@ def _final_verdict(
             return "NO_TRADE"
         if structure_context.get("setup_eligible_now") is False:
             return "NO_TRADE"
-    if trigger_state.get("trigger_present") is True and trigger_state.get("structure_ready") is True:
+
+    if not market_context["is_open"]:
+        return "PENDING"
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return "PENDING"
+
+    if trigger_state.get("trigger_present") is True:
         return "TRADE"
     return "PENDING"
 
@@ -3615,19 +3617,6 @@ def _build_user_facing_block(
             ),
         }
 
-    if not time_day_gate.get("fresh_entry_allowed") and str(time_day_gate.get("reason") or "").strip().lower() != "market_closed":
-        return {
-            "good_idea_now": "NO",
-            "ticker": ticker,
-            "action": "stand down",
-            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-            "setup_state": "NO TRADE",
-            "why": _decorate_why(
-                f"Time/day filter fails: {time_day_gate.get('reason')}.",
-                market_closed_context=market_closed_context,
-            ),
-        }
-
     if liquidity_context.get("liquidity_pass") is False:
         return {
             "good_idea_now": "NO",
@@ -3642,64 +3631,89 @@ def _build_user_facing_block(
         }
 
     if engine_status == "NO_TRADE" or not best_ticker:
+        why = engine_reason
+        if chart_check_error:
+            why = "Chart check failed in this run."
+        if market_closed_context and why == "market_closed":
+            why = "After-hours review only. No structurally valid setup is live from the current read."
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
             "action": "stand down",
             "invalidation": "No valid candidate engine setup is available.",
             "setup_state": "NO TRADE",
-            "why": _decorate_why(engine_reason, market_closed_context=market_closed_context),
+            "why": _decorate_why(why, market_closed_context=False),
         }
 
     if structure_context.get("ok"):
         if structure_context.get("setup_type_allowed") is False:
+            reason = f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
-                "why": _decorate_why(
-                    f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types.",
-                    market_closed_context=market_closed_context,
-                ),
+                "why": reason,
             }
         if structure_context.get("room_pass") is False:
+            reason = "Room to first wall is too tight for SAFE-FAST."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
-                "why": _decorate_why(
-                    "Room to first wall is too tight for SAFE-FAST.",
-                    market_closed_context=market_closed_context,
-                ),
+                "why": reason,
             }
         if structure_context.get("wall_pass") is False:
+            reason = "Wall thesis and strike placement do not match."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
-                "why": _decorate_why(
-                    "Wall thesis and strike placement do not match.",
-                    market_closed_context=market_closed_context,
-                ),
+                "why": reason,
             }
         if structure_context.get("extension_state") == "extended":
+            reason = "Move is extended versus the RTH 1H 50 EMA or too late relative to the first wall."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
                 "action": "stand down",
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
-                "why": _decorate_why(
-                    "Move is extended vs the 1H 50 EMA or too late relative to the first wall.",
-                    market_closed_context=market_closed_context,
-                ),
+                "why": reason,
             }
+
+    if market_closed_context:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "review for next regular session",
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "PENDING",
+            "why": "Market is closed. Structural review can continue, but any live entry must wait for the next regular session.",
+        }
+
+    if final_verdict == "TRADE":
+        return {
+            "good_idea_now": "YES",
+            "ticker": ticker,
+            "action": "enter",
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "TRADE",
+            "why": "Trigger is live and the current SAFE-FAST gates pass.",
+        }
 
     if final_verdict == "NO_TRADE":
         why = "Best ticker failed the 1H EMA alignment check."
@@ -3711,35 +3725,17 @@ def _build_user_facing_block(
             "action": "stand down",
             "invalidation": "No valid new entry from the current combined read.",
             "setup_state": "NO TRADE",
-            "why": _decorate_why(why, market_closed_context=market_closed_context),
-        }
-
-    if final_verdict == "TRADE":
-        trigger_note = trigger_state.get("why") or "trigger_present"
-        return {
-            "good_idea_now": "YES",
-            "ticker": ticker,
-            "action": "enter",
-            "invalidation": f"First RTH 1H close beyond the RTH 1H 50 EMA against thesis. Current EMA50_1h anchor: {ema_text}.",
-            "setup_state": "ACTIVE NOW",
-            "why": _decorate_why(
-                f"Candidate engine, structure, and trigger all pass right now ({trigger_note}).",
-                market_closed_context=market_closed_context,
-            ),
+            "why": why,
         }
 
     return {
         "good_idea_now": "NO",
         "ticker": ticker,
-        "action": "wait",
-        "invalidation": f"First RTH 1H close beyond the RTH 1H 50 EMA against thesis. Current EMA50_1h anchor: {ema_text}.",
+        "action": "wait for live trigger",
+        "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
         "setup_state": "PENDING",
-        "why": _decorate_why(
-            "Candidate engine is valid, but trigger/entry-zone timing still needs confirmation.",
-            market_closed_context=market_closed_context,
-        ),
+        "why": "Structure is acceptable, but trigger/entry timing still needs confirmation.",
     }
-
 
 
 def _build_trigger_state(
@@ -3904,17 +3900,8 @@ def _build_checklist_block(
     ]
 
     failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
-    global_gate_failures: List[str] = []
-    if market_context.get("is_open") is False:
-        global_gate_failures.append("time_day_gate")
-
-    effective_failed_items = list(failed_items)
-    for item in global_gate_failures:
-        if item not in effective_failed_items:
-            effective_failed_items.insert(0, item)
 
     priority_order = [
-        "time_day_gate",
         "allowed_setup_type",
         "twentyfour_hour_supportive",
         "one_hour_clean_around_ema",
@@ -3928,9 +3915,10 @@ def _build_checklist_block(
     ]
     priority_rank = {name: idx for idx, name in enumerate(priority_order)}
     decision_blockers_priority = sorted(failed_items, key=lambda item: (priority_rank.get(item, 999), item))
-    effective_decision_blockers_priority = sorted(
-        effective_failed_items,
-        key=lambda item: (priority_rank.get(item, 999), item),
+
+    live_entry_now_available = bool(
+        market_context.get("is_open")
+        and time_day_gate.get("fresh_entry_allowed")
     )
 
     return {
@@ -3938,14 +3926,16 @@ def _build_checklist_block(
         "items": items,
         "failed_items": failed_items,
         "decision_blockers_priority": decision_blockers_priority,
-        "effective_failed_items": effective_failed_items,
-        "effective_decision_blockers_priority": effective_decision_blockers_priority,
-        "global_gate_failures": global_gate_failures,
+        "effective_failed_items": list(failed_items),
+        "effective_decision_blockers_priority": list(decision_blockers_priority),
+        "global_gate_failures": [],
+        "live_entry_now_available": live_entry_now_available,
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
     }
 
 
 def _failed_reason_messages(
-
     checklist: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     market_context: Dict[str, Any],
@@ -3972,9 +3962,6 @@ def _failed_reason_messages(
         msg = mapping.get(item)
         if msg:
             reasons.append(msg)
-
-    if not market_context.get("is_open"):
-        reasons.insert(0, "market is closed")
 
     if structure_context.get("extension_state") == "extended":
         reasons.append("move is extended versus the 1H 50 EMA")
@@ -4252,8 +4239,8 @@ def _resolve_global_gate_primary_blocker(
     time_gate_reason: Optional[str] = None,
 ) -> Optional[str]:
     gate_reason = str(time_gate_reason or screened_reason or "").strip().lower()
-    if gate_reason == "market_closed":
-        return "market_closed"
+    if gate_reason in {"outside_time_window", "outside_day_window"}:
+        return "time_gate_context"
     return None
 
 
@@ -5393,7 +5380,7 @@ def _build_time_gate_check_context_block(
         "ten_second_check_item": "early_enough",
         "ten_second_check_answer": early_enough_answer,
         "early_enough_fails_from_time_gate": bool(
-            early_enough_answer == "NO" and not fresh_entry_allowed
+            early_enough_answer == "NO" and not fresh_entry_allowed and str(reason or "").lower() not in {"market_closed"}
         ),
         "primary_blocker": primary_blocker,
         "blockers": blockers,
