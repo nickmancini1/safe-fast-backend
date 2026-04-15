@@ -6505,7 +6505,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "screened_winner_anchor_cleanup_v8_2026_04_15",
+        "build_tag": "continuous_time_gate_fix_v11_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -6810,6 +6810,28 @@ _CONTINUOUS_STATE_FAMILY_MAP: Dict[str, str] = {
 }
 
 
+def _continuous_time_gate_is_blocking(
+    time_gate_reason: Optional[str],
+    market_open: Any,
+    fresh_entry_allowed: Any,
+) -> bool:
+    reason = str(time_gate_reason or "").strip().lower()
+    if not reason:
+        return False
+
+    nonblocking_reasons = {
+        "market_open_no_hard_time_cutoff",
+        "within_time_window",
+    }
+    if reason in nonblocking_reasons:
+        return False
+
+    if reason == "market_closed":
+        return bool(market_open is False or fresh_entry_allowed is False)
+
+    return bool(fresh_entry_allowed is False or market_open is False)
+
+
 def _ordered_unique_strings(values: List[Any]) -> List[str]:
     ordered: List[str] = []
     seen = set()
@@ -6952,18 +6974,11 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
         return "BLOCKED_IV_HIGH"
 
     structure_state = _derive_continuous_structure_state(snapshot)
-    if market_open is False and fresh_entry_allowed is False:
-        if time_gate_reason == "market_closed":
+    if _continuous_time_gate_is_blocking(time_gate_reason, market_open, fresh_entry_allowed):
+        if str(time_gate_reason or "").strip().lower() == "market_closed":
             if structure_state:
                 return structure_state
             return "WAIT_MARKET_OPEN"
-        if time_gate_reason:
-            return "BLOCKED_TIME_GATE"
-    if time_gate_reason == "market_closed":
-        if structure_state:
-            return structure_state
-        return "WAIT_MARKET_OPEN"
-    if time_gate_reason:
         return "BLOCKED_TIME_GATE"
 
     if structure_state:
@@ -7081,7 +7096,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_replay_transition_profile_sandbox_2026_04_14",
+        "build_tag": "continuous_time_gate_fix_v11_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
