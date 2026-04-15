@@ -684,16 +684,21 @@ def _build_setup_route_context(
 
 def _build_room_wall_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
     room_pass = structure_context.get("room_pass")
+    room_quality = structure_context.get("room_quality")
+    room_hard_fail = structure_context.get("room_hard_fail")
     wall_pass = structure_context.get("wall_pass")
     wall_thesis = structure_context.get("wall_thesis")
     extension_blocks_now = structure_context.get("extension_blocks_now")
 
-    if room_pass is False:
+    if room_hard_fail is True or room_pass is False:
         room_wall_status = "fail"
         why = "Room to the first wall is too tight for SAFE-FAST."
     elif wall_pass is False:
         room_wall_status = "fail"
         why = "Wall thesis does not support the current path."
+    elif room_quality == "caution" and wall_pass is True:
+        room_wall_status = "caution"
+        why = "Room is workable, but not especially spacious."
     elif room_pass is True and wall_pass is True:
         room_wall_status = "pass"
         if wall_thesis == "TO_THE_WALL":
@@ -710,7 +715,9 @@ def _build_room_wall_context(structure_context: Dict[str, Any]) -> Dict[str, Any
         "room_to_first_wall": structure_context.get("room_to_first_wall"),
         "room_ratio": structure_context.get("room_ratio"),
         "next_pocket_room_ratio": structure_context.get("next_pocket_room_ratio"),
+        "room_quality": room_quality,
         "room_pass": room_pass,
+        "room_hard_fail": room_hard_fail,
         "wall_thesis": wall_thesis,
         "wall_pass": wall_pass,
         "extension_blocks_now": extension_blocks_now,
@@ -2563,14 +2570,35 @@ def _find_wall_levels(
 
     window = candles[-35:] if len(candles) >= 35 else candles
     tolerance = max(latest_close * 0.0015, 0.10)
+    meaningful_gap = max(latest_close * 0.0004, 0.10)
 
     if option_type == "C":
-        candidate_levels = [round(c["high"], 2) for c in window if c["high"] > latest_close]
+        candidate_levels = [
+            round(c["high"], 2)
+            for c in window
+            if _to_float(c.get("high")) is not None and c["high"] > (latest_close + meaningful_gap)
+        ]
+        if not candidate_levels:
+            candidate_levels = [
+                round(c["high"], 2)
+                for c in window
+                if _to_float(c.get("high")) is not None and c["high"] > latest_close
+            ]
         levels = _condense_levels(candidate_levels, tolerance, descending=False)
         first_wall = levels[0] if levels else None
         next_pocket = levels[1] if len(levels) > 1 else None
     else:
-        candidate_levels = [round(c["low"], 2) for c in window if c["low"] < latest_close]
+        candidate_levels = [
+            round(c["low"], 2)
+            for c in window
+            if _to_float(c.get("low")) is not None and c["low"] < (latest_close - meaningful_gap)
+        ]
+        if not candidate_levels:
+            candidate_levels = [
+                round(c["low"], 2)
+                for c in window
+                if _to_float(c.get("low")) is not None and c["low"] < latest_close
+            ]
         levels = _condense_levels(candidate_levels, tolerance, descending=True)
         first_wall = levels[0] if levels else None
         next_pocket = levels[1] if len(levels) > 1 else None
@@ -2580,8 +2608,6 @@ def _find_wall_levels(
         "next_pocket": next_pocket,
         "room_distance": round(abs(first_wall - latest_close), 4) if first_wall is not None else None,
     }
-
-
 
 
 def _recent_trading_day_candles(
@@ -3043,23 +3069,33 @@ def _extension_state(
     first_wall: Optional[float],
 ) -> Dict[str, Any]:
     pct_from_ema_ratio = abs(latest_close - ema50_1h) / ema50_1h if ema50_1h else None
-    threshold = 0.008 if symbol == "GLD" else 0.006
+    threshold_pct_by_symbol = {
+        "SPY": 0.75,
+        "QQQ": 0.85,
+        "IWM": 0.95,
+        "GLD": 1.05,
+    }
+    threshold_pct = threshold_pct_by_symbol.get(symbol, 0.85)
     room_distance = abs(first_wall - latest_close) if first_wall is not None else None
     move_ratio = (abs(latest_close - ema50_1h) / room_distance) if room_distance not in (None, 0) else None
     pct_from_ema = round(pct_from_ema_ratio * 100, 3) if pct_from_ema_ratio is not None else None
     universal_caution_pct = 0.40
     extension_caution_0_40_pct = bool(pct_from_ema is not None and pct_from_ema >= universal_caution_pct)
+    move_ratio_caution = bool(move_ratio is not None and move_ratio >= 0.55)
+    hard_extension_threshold_hit = bool(pct_from_ema is not None and pct_from_ema >= threshold_pct)
 
     return {
-        "state": "caution" if extension_caution_0_40_pct else "acceptable",
+        "state": "caution" if (extension_caution_0_40_pct or move_ratio_caution) else "acceptable",
         "pct_from_ema": pct_from_ema,
         "move_to_wall_ratio": round(move_ratio, 3) if move_ratio is not None else None,
-        "threshold_pct": round(threshold * 100, 3),
+        "threshold_pct": threshold_pct,
         "late_move": False,
         "universal_extension_caution_pct": universal_caution_pct,
         "extension_caution_0_40_pct": extension_caution_0_40_pct,
         "extension_caution_note": "0.40% from the 1H EMA is a caution only, not a hard blocker.",
-        "baseline_extension_threshold_pct": round(threshold * 100, 3),
+        "baseline_extension_threshold_pct": threshold_pct,
+        "move_ratio_caution": move_ratio_caution,
+        "hard_extension_threshold_hit": hard_extension_threshold_hit,
     }
 
 
@@ -3125,12 +3161,12 @@ def _setup_classifier(
     if latest_close is None or ema50_1h is None:
         return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None, "setup_type_allowed": None, "setup_eligible_now": None}
 
-    near_ema = abs(latest_close - ema50_1h) / ema50_1h <= 0.0025
+    near_ema = abs(latest_close - ema50_1h) / ema50_1h <= 0.0035
     chop = _is_chop(candles)
     recent_closes = [c["close"] for c in candles[-3:]] if len(candles) >= 3 else []
     tight_break = False
     if recent_closes and latest_close:
-        tight_break = (max(recent_closes) - min(recent_closes)) / latest_close <= 0.003
+        tight_break = (max(recent_closes) - min(recent_closes)) / latest_close <= 0.0035
 
     blocked_now = bool(room_pass is False or wall_pass is False or extension_state.get("state") == "extended")
 
@@ -3154,7 +3190,6 @@ def _setup_classifier(
         return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False, "setup_type_allowed": False, "setup_eligible_now": False}
 
     return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None, "setup_type_allowed": None, "setup_eligible_now": None}
-
 
 
 def _build_structure_context(
@@ -3208,10 +3243,25 @@ def _build_structure_context(
     hidden_left_cluster_confirms_room_trap = bool(
         hidden_left_wick_cluster.get("cluster_found") is True
         and hidden_left_distance_to_invalidation_ratio is not None
-        and hidden_left_distance_to_invalidation_ratio < 2.0
+        and hidden_left_distance_to_invalidation_ratio < 1.35
     )
 
-    room_pass = (room_ratio is not None and room_ratio >= 2.0)
+    room_quality = "unconfirmed"
+    if hidden_left_cluster_confirms_room_trap:
+        room_quality = "fail"
+    elif room_ratio is None:
+        room_quality = "unconfirmed"
+    elif room_ratio >= 2.0:
+        room_quality = "pass"
+    elif room_ratio >= 1.35:
+        room_quality = "caution"
+    else:
+        room_quality = "fail"
+
+    room_pass = room_quality in {"pass", "caution"}
+    room_hard_fail = room_quality == "fail"
+    room_soft_flag = room_quality == "caution"
+
     base_extension_ctx = _extension_state(symbol, latest_close, ema50_1h, wall_levels.get("first_wall"))
     wall_ctx = _wall_thesis(
         option_type=option_type,
@@ -3260,12 +3310,15 @@ def _build_structure_context(
         baseline_vol = sum(volume_values[:-1]) / max(len(volume_values[:-1]), 1)
         volume_climax_exhaustion = bool(baseline_vol > 0 and volume_values[-1] >= baseline_vol * 1.8 and parabolic_exhaustion)
 
-    degraded_entry_quality = bool(base_extension_ctx.get("move_to_wall_ratio") is not None and base_extension_ctx.get("move_to_wall_ratio") > 0.5)
-    early_trigger_window_passed = bool(base_extension_ctx.get("pct_from_ema") is not None and base_extension_ctx.get("pct_from_ema") > base_extension_ctx.get("baseline_extension_threshold_pct", 999))
-    cramped_room = room_pass is False
+    move_to_wall_ratio = base_extension_ctx.get("move_to_wall_ratio")
+    degraded_entry_quality = bool(move_to_wall_ratio is not None and move_to_wall_ratio >= 0.67)
+    early_trigger_window_passed = bool(
+        (base_extension_ctx.get("pct_from_ema") is not None and base_extension_ctx.get("pct_from_ema") >= base_extension_ctx.get("baseline_extension_threshold_pct", 999))
+        or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.75)
+    )
 
     extension_confirmer_flags = []
-    if cramped_room:
+    if room_hard_fail:
         extension_confirmer_flags.append("cramped_room")
     if parabolic_exhaustion:
         extension_confirmer_flags.append("parabolic_exhaustion")
@@ -3277,16 +3330,38 @@ def _build_structure_context(
         extension_confirmer_flags.append("early_trigger_window_passed")
 
     extension_confirmer_count = len(extension_confirmer_flags)
+    strong_confirmer_flags = [
+        flag for flag in extension_confirmer_flags
+        if flag in {"cramped_room", "parabolic_exhaustion", "volume_climax_exhaustion", "degraded_entry_quality"}
+    ]
+    strong_confirmer_count = len(strong_confirmer_flags)
+
     extension_material = bool(
-        (atr_multiple_from_ema is not None and atr_multiple_from_ema >= 1.0)
-        or early_trigger_window_passed
-        or (base_extension_ctx.get("move_to_wall_ratio") is not None and base_extension_ctx.get("move_to_wall_ratio") > 0.5)
+        (atr_multiple_from_ema is not None and atr_multiple_from_ema >= 1.35)
+        or (base_extension_ctx.get("pct_from_ema") is not None and base_extension_ctx.get("pct_from_ema") >= base_extension_ctx.get("baseline_extension_threshold_pct", 999))
+        or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.75)
     )
-    extension_blocks_now = bool(extension_material and extension_confirmer_count >= 1)
+
+    extension_blocks_now = bool(
+        extension_material and (
+            strong_confirmer_count >= 2
+            or (strong_confirmer_count >= 1 and extension_confirmer_count >= 2)
+            or (room_hard_fail and early_trigger_window_passed)
+        )
+    )
+
+    extension_state = "extended" if extension_blocks_now else (
+        "caution" if (
+            base_extension_ctx.get("extension_caution_0_40_pct")
+            or base_extension_ctx.get("move_ratio_caution")
+            or extension_material
+            or extension_confirmer_count >= 1
+        ) else "acceptable"
+    )
 
     extension_ctx = {
         **base_extension_ctx,
-        "state": "extended" if extension_blocks_now else ("caution" if base_extension_ctx.get("extension_caution_0_40_pct") else "acceptable"),
+        "state": extension_state,
         "late_move": extension_blocks_now,
         "atr_14_1h": atr14,
         "atr_multiple_from_ema": atr_multiple_from_ema,
@@ -3296,8 +3371,17 @@ def _build_structure_context(
         "early_trigger_window_passed": early_trigger_window_passed,
         "extension_confirmer_flags": extension_confirmer_flags,
         "extension_confirmer_count": extension_confirmer_count,
+        "strong_confirmer_flags": strong_confirmer_flags,
+        "strong_confirmer_count": strong_confirmer_count,
         "extension_material": extension_material,
-        "extension_soft_flag": bool(base_extension_ctx.get("extension_caution_0_40_pct")),
+        "extension_soft_flag": bool(
+            not extension_blocks_now and (
+                base_extension_ctx.get("extension_caution_0_40_pct")
+                or base_extension_ctx.get("move_ratio_caution")
+                or extension_material
+                or extension_confirmer_count >= 1
+            )
+        ),
         "extension_blocks_now": extension_blocks_now,
     }
 
@@ -3321,7 +3405,10 @@ def _build_structure_context(
         "next_pocket": wall_levels.get("next_pocket"),
         "room_to_first_wall": wall_levels.get("room_distance"),
         "room_ratio": round(room_ratio, 3) if room_ratio is not None else None,
+        "room_quality": room_quality,
         "room_pass": room_pass,
+        "room_hard_fail": room_hard_fail,
+        "room_soft_flag": room_soft_flag,
         "wall_thesis": wall_ctx.get("wall_thesis"),
         "wall_pass": wall_ctx.get("wall_pass"),
         "next_pocket_room_ratio": wall_ctx.get("next_pocket_room_ratio"),
@@ -3349,6 +3436,8 @@ def _build_structure_context(
         "early_trigger_window_passed": extension_ctx.get("early_trigger_window_passed"),
         "extension_confirmer_flags": extension_ctx.get("extension_confirmer_flags"),
         "extension_confirmer_count": extension_ctx.get("extension_confirmer_count"),
+        "strong_confirmer_flags": extension_ctx.get("strong_confirmer_flags"),
+        "strong_confirmer_count": extension_ctx.get("strong_confirmer_count"),
         "extension_material": extension_ctx.get("extension_material"),
         "extension_soft_flag": extension_ctx.get("extension_soft_flag"),
         "extension_blocks_now": extension_ctx.get("extension_blocks_now"),
@@ -3406,13 +3495,15 @@ def _final_verdict(
     if chart_alignment is False:
         return "NO_TRADE"
     if structure_context.get("ok"):
-        if structure_context.get("room_pass") is False:
+        if structure_context.get("setup_type_allowed") is False:
+            return "NO_TRADE"
+        if structure_context.get("room_hard_fail") is True:
             return "NO_TRADE"
         if structure_context.get("wall_pass") is False:
             return "NO_TRADE"
         if structure_context.get("extension_state") == "extended":
             return "NO_TRADE"
-        if structure_context.get("setup_eligible_now") is False:
+        if structure_context.get("chop_risk") is True:
             return "NO_TRADE"
 
     if not market_context["is_open"]:
@@ -3674,7 +3765,7 @@ def _build_user_facing_block(
                 "setup_state": "NO TRADE",
                 "why": reason,
             }
-        if structure_context.get("room_pass") is False:
+        if structure_context.get("room_hard_fail") is True or structure_context.get("room_pass") is False:
             reason = "Room to first wall is too tight for SAFE-FAST."
             if market_closed_context:
                 reason = f"After-hours structural read: {reason}"
@@ -3755,7 +3846,6 @@ def _build_user_facing_block(
 
 
 def _build_trigger_state(
-
     option_type: str,
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
@@ -3816,10 +3906,10 @@ def _build_trigger_state(
         side_ok = price_side == "below"
 
     structure_ok = bool(
-        structure_context.get("setup_eligible_now") is True
-        and structure_context.get("room_pass") is True
+        structure_context.get("allowed_setup") is True
         and structure_context.get("wall_pass") is True
-        and structure_context.get("extension_state") != "extended"
+        and structure_context.get("room_hard_fail") is not True
+        and structure_context.get("extension_blocks_now") is not True
         and structure_context.get("chop_risk") is False
         and structure_context.get("noisy_chop_explicit") is not True
     )
@@ -3908,7 +3998,7 @@ def _build_checklist_block(
         {"item": "allowed_setup_type", "yes": _is_allowed_setup_type_name(structure_context.get("setup_type"))},
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False and structure_context.get("noisy_chop_explicit") is not True)},
-        {"item": "clear_room", "yes": bool(structure_context.get("room_pass") is True)},
+        {"item": "clear_room", "yes": bool(structure_context.get("room_hard_fail") is not True and structure_context.get("room_pass") is not False)},
         {"item": "early_enough", "yes": bool(structure_context.get("extension_blocks_now") is not True)},
         {"item": "clear_trigger", "yes": bool(trigger_state.get("trigger_present") is True)},
         {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
@@ -4007,9 +4097,17 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
 
     verdict_rank = {"TRADE": 0, "PENDING": 1, "NO_TRADE": 2}.get(final_verdict, 3)
     setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
-    room_rank = 0 if structure.get("room_pass") is True else 1
+
+    room_quality = structure.get("room_quality")
+    room_rank_map = {"pass": 0, "caution": 1, "fail": 2}
+    room_rank = room_rank_map.get(room_quality, 3)
+
     wall_rank = 0 if structure.get("wall_pass") is True else 1
-    ext_rank = 0 if structure.get("extension_state") == "acceptable" else 1
+
+    ext_state = structure.get("extension_state")
+    ext_rank_map = {"acceptable": 0, "caution": 1, "extended": 2}
+    ext_rank = ext_rank_map.get(ext_state, 3)
+
     trend_rank = 0 if structure.get("trend_label") == "Trend-aligned" else 1 if structure.get("trend_label") == "Countertrend" else 2
     liquidity_rank = 0 if liquidity.get("liquidity_pass") is True else 1
     trigger_rank = 0 if trigger_state.get("trigger_present") is True else 1
@@ -4915,7 +5013,7 @@ async def _screen_ticker_candidate(
             reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
         elif structure_context.get("chop_risk") is True:
             reason = "1H structure around the 50 EMA is not clean."
-        elif structure_context.get("room_pass") is False:
+        elif structure_context.get("room_hard_fail") is True or structure_context.get("room_pass") is False:
             reason = "Room to first wall is too tight for SAFE-FAST."
         elif structure_context.get("wall_pass") is False:
             reason = "Wall thesis and strike placement do not match."
@@ -6505,7 +6603,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_time_gate_fix_v11_2026_04_15",
+        "build_tag": "selectivity_recalibration_v12_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7096,7 +7194,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_time_gate_fix_v11_2026_04_15",
+        "build_tag": "selectivity_recalibration_v12_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
