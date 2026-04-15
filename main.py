@@ -3937,6 +3937,8 @@ def _build_checklist_block(
     live_entry_now_available = bool(
         market_context.get("is_open")
         and time_day_gate.get("fresh_entry_allowed")
+        and not failed_items
+        and trigger_state.get("trigger_present") is True
     )
 
     return {
@@ -4163,6 +4165,16 @@ def _select_screened_best_candidate(
         return None
 
     if freeze_to_raw_engine and raw_engine_best_ticker:
+        for item in screened_candidates:
+            if item.get("symbol") == raw_engine_best_ticker:
+                return item
+
+    any_screened_live_candidate = any(
+        item.get("final_verdict") in {"TRADE", "PENDING"}
+        for item in screened_candidates
+    )
+
+    if not any_screened_live_candidate and raw_engine_best_ticker:
         for item in screened_candidates:
             if item.get("symbol") == raw_engine_best_ticker:
                 return item
@@ -6462,7 +6474,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "engine_null_winner_cleanup_v7_2026_04_15",
+        "build_tag": "screened_winner_anchor_cleanup_v8_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
