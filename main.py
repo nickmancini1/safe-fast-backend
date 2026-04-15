@@ -783,7 +783,7 @@ def _build_execution_quality_context(
 
     if not market_open or not fresh_entry_allowed:
         execution_quality_status = "fail"
-        why = "Fresh entries are not allowed right now."
+        why = "After-hours / closed-session structural read only. No live entry can be taken right now."
     elif liquidity_pass is False:
         execution_quality_status = "fail"
         why = liquidity_context.get("why") or "Liquidity is too weak for a clean SAFE-FAST entry."
@@ -3747,34 +3747,22 @@ def _build_trigger_state(
     chart_check: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     trigger_style = "close_above_recent_high" if option_type == "C" else "close_below_recent_low"
-
-    if not market_context.get("is_open"):
-        return {
-            "ok": True,
-            "trigger_present": False,
-            "trigger_style": trigger_style,
-            "trigger_level": None,
-            "current_close": chart_check.get("latest_close") if chart_check else None,
-            "why": "market_closed",
-        }
-
-    if not time_day_gate.get("fresh_entry_allowed"):
-        return {
-            "ok": True,
-            "trigger_present": False,
-            "trigger_style": trigger_style,
-            "trigger_level": None,
-            "current_close": chart_check.get("latest_close") if chart_check else None,
-            "why": time_day_gate.get("reason", "time_day_gate_blocked"),
-        }
+    market_open = bool(market_context.get("is_open"))
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
+    time_gate_reason = str(time_day_gate.get("reason") or "").strip() or "time_day_gate_blocked"
 
     if not chart_check or not chart_check.get("ok"):
         return {
             "ok": False,
             "trigger_present": False,
+            "structural_trigger_present": False,
             "trigger_style": trigger_style,
             "trigger_level": None,
             "current_close": None,
+            "price_vs_ema50_1h": None,
+            "structure_ready": None,
+            "live_entry_requires_market_open": not market_open,
+            "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
             "why": "chart_unavailable",
         }
 
@@ -3786,9 +3774,14 @@ def _build_trigger_state(
         return {
             "ok": False,
             "trigger_present": False,
+            "structural_trigger_present": False,
             "trigger_style": trigger_style,
             "trigger_level": None,
             "current_close": current_close,
+            "price_vs_ema50_1h": price_side,
+            "structure_ready": None,
+            "live_entry_requires_market_open": not market_open,
+            "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
             "why": "insufficient_recent_candles",
         }
 
@@ -3814,24 +3807,32 @@ def _build_trigger_state(
         and structure_context.get("chop_risk") is False
     )
 
-    trigger_present = bool(crossed and side_ok and structure_ok)
+    structural_trigger_present = bool(crossed and side_ok and structure_ok)
+    live_trigger_present = bool(structural_trigger_present and market_open and fresh_entry_allowed)
 
-    why = "trigger_present"
+    why = "trigger_present" if structural_trigger_present else "close_trigger_not_hit"
     if not structure_ok:
         why = "structure_not_ready"
     elif not side_ok:
         why = "wrong_side_of_ema"
     elif not crossed:
         why = "close_trigger_not_hit"
+    elif structural_trigger_present and not market_open:
+        why = "structural_trigger_present_market_closed"
+    elif structural_trigger_present and not fresh_entry_allowed:
+        why = time_gate_reason
 
     return {
         "ok": True,
-        "trigger_present": trigger_present,
+        "trigger_present": live_trigger_present,
+        "structural_trigger_present": structural_trigger_present,
         "trigger_style": trigger_style,
         "trigger_level": _round_or_none(trigger_level, 4),
         "current_close": _round_or_none(current_close, 4),
         "price_vs_ema50_1h": price_side,
         "structure_ready": structure_ok,
+        "live_entry_requires_market_open": not market_open,
+        "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
         "why": why,
     }
 
@@ -4082,10 +4083,7 @@ def _compact_ticker_summary_entry(
         "final_verdict": item.get("final_verdict"),
         "primary_blocker": effective_primary_blocker,
         "blockers": effective_blockers[:4],
-        "reason": _decorate_why(
-            screened_reason,
-            market_closed_context=((time_day_gate or {}).get("reason") == "market_closed"),
-        ),
+        "reason": screened_reason,
         "setup_type": structure_context.get("setup_type"),
         "trend_label": structure_context.get("trend_label"),
         "room_to_first_wall": structure_context.get("room_to_first_wall"),
@@ -4378,11 +4376,14 @@ def _build_trigger_context_block(
     return {
         "ok": True,
         "trigger_present": trigger_state.get("trigger_present"),
+        "structural_trigger_present": trigger_state.get("structural_trigger_present"),
         "trigger_reason": trigger_state.get("why"),
         "structure_ready": trigger_state.get("structure_ready"),
         "trigger_style": trigger_state.get("trigger_style"),
         "trigger_level": trigger_state.get("trigger_level"),
         "current_close": trigger_state.get("current_close"),
+        "live_entry_requires_market_open": trigger_state.get("live_entry_requires_market_open"),
+        "live_entry_waiting_on": trigger_state.get("live_entry_waiting_on"),
         "current_bar_raw_trigger_pass": current_bar.get("raw_chart_trigger_pass"),
         "current_bar_gated_trigger_pass": current_bar.get("gated_trigger_pass"),
         "completed_candle_raw_trigger_pass": completed_candle.get("raw_chart_trigger_pass"),
@@ -4441,9 +4442,9 @@ def _build_entry_context_block(
 
     return {
         "ok": True,
-        "live_entry_available_now": bool(trigger_state.get("why") != "market_closed" and current_bar_gated_trigger_pass),
-        "live_entry_requires_market_open": bool(trigger_state.get("why") == "market_closed"),
-        "live_entry_waiting_on": "market_open" if trigger_state.get("why") == "market_closed" else None,
+        "live_entry_available_now": bool(current_bar_gated_trigger_pass and not trigger_state.get("live_entry_requires_market_open") and not trigger_state.get("live_entry_waiting_on")),
+        "live_entry_requires_market_open": bool(trigger_state.get("live_entry_requires_market_open")),
+        "live_entry_waiting_on": trigger_state.get("live_entry_waiting_on"),
         "mid_candle_trade_available_now": current_bar_gated_trigger_pass,
         "mid_candle_entry_state": mid_candle_entry_state,
         "mid_candle_raw_trigger_detected_now": current_bar_raw_trigger_pass,
@@ -4585,8 +4586,8 @@ def _build_approval_context_block(
     return {
         "ok": True,
         "ticker": intrabar_signal_context.get("ticker"),
-        "live_entry_requires_market_open": bool(trigger_state.get("why") == "market_closed"),
-        "live_entry_waiting_on": "market_open" if trigger_state.get("why") == "market_closed" else None,
+        "live_entry_requires_market_open": bool(trigger_state.get("live_entry_requires_market_open")),
+        "live_entry_waiting_on": trigger_state.get("live_entry_waiting_on"),
         "approval_status": approval_status,
         "approval_ready_now": intrabar_trade_available_now,
         "approval_ready_on_completed_candle": completed_trade_available,
@@ -4694,7 +4695,7 @@ def _build_approval_requirements_context_block(
 
     missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
     next_flip_needed = blockers[0] if blockers else (missing_gates[0] if missing_gates else None)
-    if next_flip_needed is None and trigger_state.get("why") == "market_closed":
+    if next_flip_needed is None and trigger_state.get("live_entry_requires_market_open"):
         next_flip_needed = "market_open"
 
     if approval_context.get("approval_ready_now") is True:
