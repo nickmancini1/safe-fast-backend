@@ -3132,25 +3132,25 @@ def _setup_classifier(
     if recent_closes and latest_close:
         tight_break = (max(recent_closes) - min(recent_closes)) / latest_close <= 0.003
 
-    if room_pass is False or wall_pass is False or extension_state.get("state") == "extended":
-        if trend_supportive is True and near_ema:
-            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
-        if trend_supportive is True and tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
-        return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False, "setup_type_allowed": False, "setup_eligible_now": False}
+    blocked_now = bool(room_pass is False or wall_pass is False or extension_state.get("state") == "extended")
 
     if trend_supportive is True:
-        if near_ema and (room_ratio or 0) >= 2.5 and not chop:
-            return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+        if not blocked_now:
+            if near_ema and (room_ratio or 0) >= 2.5 and not chop:
+                return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+            if tight_break and not chop:
+                return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+            if near_ema:
+                return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
+
         if tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
-        if near_ema:
-            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
         return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
 
     if trend_supportive is False:
         if tight_break and not chop:
-            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": not blocked_now}
         return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False, "setup_type_allowed": False, "setup_eligible_now": False}
 
     return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None, "setup_type_allowed": None, "setup_eligible_now": None}
@@ -6438,7 +6438,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "rth_no_hard_time_gate_cleanup_2026_04_14",
+        "build_tag": "rth_route_label_cleanup_2026_04_14",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
