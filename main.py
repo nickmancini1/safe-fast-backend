@@ -483,6 +483,7 @@ def _build_trigger_scan_context(
     trigger_state: Dict[str, Any],
     market_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
+    structure_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if not chart_check or not chart_check.get("ok"):
         return {
@@ -538,6 +539,33 @@ def _build_trigger_scan_context(
         gate_reason=gate_reason,
     )
 
+    current_hold_context = _build_breakout_hold_context(
+        option_type=option_type,
+        current_close=_to_float(current_bar_eval.get("close")),
+        trigger_level=_to_float(current_bar_eval.get("reference_trigger_level")),
+        structure_context=structure_context,
+    )
+    completed_hold_context = _build_breakout_hold_context(
+        option_type=option_type,
+        current_close=_to_float(current_bar_eval.get("close")),
+        trigger_level=_to_float(completed_eval.get("reference_trigger_level")),
+        structure_context=structure_context,
+    )
+
+    if current_bar_eval.get("raw_chart_trigger_pass") and current_hold_context.get("hold_confirmed") is not True:
+        current_bar_eval["gated_trigger_pass"] = False
+        current_bar_eval["status"] = "fail"
+        current_bar_eval["why"] = "breakout_hold_not_confirmed"
+    if completed_eval.get("raw_chart_trigger_pass") and completed_hold_context.get("hold_confirmed") is not True:
+        completed_eval["gated_trigger_pass"] = False
+        completed_eval["status"] = "fail"
+        completed_eval["why"] = "breakout_hold_not_confirmed"
+
+    current_bar_eval["breakout_hold_confirmed"] = current_hold_context.get("hold_confirmed")
+    current_bar_eval["breakout_hold_reference_level"] = current_hold_context.get("hold_reference_level")
+    completed_eval["breakout_hold_confirmed"] = completed_hold_context.get("hold_confirmed")
+    completed_eval["breakout_hold_reference_level"] = completed_hold_context.get("hold_reference_level")
+
     if current_bar_eval.get("gated_trigger_pass"):
         trigger_scan_status = "pass_current_bar"
         why = "SAFE-FAST trigger conditions pass on the current 1H bar."
@@ -553,6 +581,9 @@ def _build_trigger_scan_context(
     elif structure_ready is False:
         trigger_scan_status = "fail"
         why = "Structure is not ready for a SAFE-FAST trigger."
+    elif current_bar_eval.get("why") == "breakout_hold_not_confirmed" or completed_eval.get("why") == "breakout_hold_not_confirmed":
+        trigger_scan_status = "fail"
+        why = "Breakout printed through resistance/support, but hold-through confirmation is not there yet."
     elif current_bar_eval.get("raw_chart_trigger_pass") or completed_eval.get("raw_chart_trigger_pass"):
         trigger_scan_status = "fail"
         why = "A raw chart trigger appeared, but SAFE-FAST gating still blocks it."
@@ -1147,6 +1178,7 @@ def _build_live_map_block(
         trigger_state=trigger_state,
         market_context=market_context,
         time_day_gate=time_day_gate,
+        structure_context=structure_context,
     )
     return {
         "ticker": ticker,
@@ -3976,6 +4008,39 @@ def _build_user_facing_block(
     }
 
 
+
+def _build_breakout_hold_context(
+    option_type: str,
+    current_close: Optional[float],
+    trigger_level: Optional[float],
+    structure_context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    first_wall = _to_float((structure_context or {}).get("first_wall"))
+    candidates = [level for level in [trigger_level, first_wall] if level is not None]
+    hold_reference_level: Optional[float] = None
+    hold_confirmed = False
+
+    if candidates:
+        if option_type == "C":
+            hold_reference_level = max(candidates)
+            hold_confirmed = bool(current_close is not None and current_close > hold_reference_level)
+        else:
+            hold_reference_level = min(candidates)
+            hold_confirmed = bool(current_close is not None and current_close < hold_reference_level)
+
+    if hold_reference_level is None:
+        reason = "hold_reference_unavailable"
+    elif hold_confirmed:
+        reason = "breakout_hold_confirmed"
+    else:
+        reason = "breakout_hold_not_confirmed"
+
+    return {
+        "hold_reference_level": _round_or_none(hold_reference_level, 4),
+        "hold_confirmed": hold_confirmed,
+        "reason": reason,
+    }
+
 def _build_trigger_state(
     option_type: str,
     market_context: Dict[str, Any],
@@ -4069,6 +4134,19 @@ def _build_trigger_state(
         )
         completed_crossed = bool(completed_trigger_level is not None and completed_close is not None and completed_close < completed_trigger_level)
 
+    current_breakout_hold = _build_breakout_hold_context(
+        option_type=option_type,
+        current_close=current_close,
+        trigger_level=current_trigger_level,
+        structure_context=structure_context,
+    )
+    completed_breakout_hold = _build_breakout_hold_context(
+        option_type=option_type,
+        current_close=current_close,
+        trigger_level=completed_trigger_level,
+        structure_context=structure_context,
+    )
+
     structure_ok = bool(
         structure_context.get("allowed_setup") is True
         and structure_context.get("wall_pass") is True
@@ -4078,14 +4156,22 @@ def _build_trigger_state(
         and structure_context.get("noisy_chop_explicit") is not True
     )
 
-    current_bar_structural_trigger_present = bool(current_crossed and current_side_ok and structure_ok)
-    completed_candle_structural_trigger_present = bool(completed_crossed and completed_side_ok and structure_ok)
+    current_bar_structural_trigger_present = bool(
+        current_crossed and current_side_ok and structure_ok and current_breakout_hold.get("hold_confirmed") is True
+    )
+    completed_candle_structural_trigger_present = bool(
+        completed_crossed and completed_side_ok and structure_ok and completed_breakout_hold.get("hold_confirmed") is True
+    )
     structural_trigger_present = bool(current_bar_structural_trigger_present or completed_candle_structural_trigger_present)
     live_trigger_present = bool(structural_trigger_present and market_open and fresh_entry_allowed)
 
     why = "trigger_present" if current_bar_structural_trigger_present else "close_trigger_not_hit"
     if not structure_ok:
         why = "structure_not_ready"
+    elif current_crossed and current_side_ok and current_breakout_hold.get("hold_confirmed") is not True:
+        why = "breakout_hold_not_confirmed"
+    elif completed_crossed and completed_side_ok and completed_breakout_hold.get("hold_confirmed") is not True:
+        why = "breakout_hold_not_confirmed"
     elif current_bar_structural_trigger_present and not market_open:
         why = "structural_trigger_present_market_closed"
     elif current_bar_structural_trigger_present and not fresh_entry_allowed:
@@ -4114,6 +4200,10 @@ def _build_trigger_state(
         "structure_ready": structure_ok,
         "live_entry_requires_market_open": not market_open,
         "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
+        "breakout_hold_current_confirmed": current_breakout_hold.get("hold_confirmed"),
+        "breakout_hold_completed_confirmed": completed_breakout_hold.get("hold_confirmed"),
+        "breakout_hold_reference_current": current_breakout_hold.get("hold_reference_level"),
+        "breakout_hold_reference_completed": completed_breakout_hold.get("hold_reference_level"),
         "why": why,
     }
 
@@ -6815,7 +6905,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_alignment_v19_2026_04_15",
+        "build_tag": "breakout_hold_confirmation_v20_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7419,7 +7509,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_alignment_v19_2026_04_15",
+        "build_tag": "breakout_hold_confirmation_v20_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
