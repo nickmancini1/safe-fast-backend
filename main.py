@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
@@ -8100,7 +8100,21 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     description="Canonical production continuous endpoint. Use this route for continuous SAFE-FAST monitoring.",
     operation_id="safe_fast_continuous",
 )
-async def safe_fast_continuous(request: ContinuousShadowRequest) -> Any:
+async def safe_fast_continuous(
+    request: ContinuousShadowRequest = Body(
+        ...,
+        openapi_examples={
+            "default": {
+                "summary": "Default SAFE-FAST continuous request",
+                "value": {
+                    "option_type": "C",
+                    "open_positions": 0,
+                    "weekly_trade_count": 0,
+                },
+            }
+        },
+    )
+) -> Any:
     try:
         return await _build_continuous_shadow_payload(request)
     except Exception as e:
@@ -8130,7 +8144,7 @@ def _default_on_demand_request() -> OnDemandRequest:
         open_positions=0,
         weekly_trade_count=0,
     )
-    
+
 
 @app.get("/safe-fast/on-demand/default", include_in_schema=False, deprecated=True)
 async def safe_fast_on_demand_default() -> Any:
@@ -8157,5 +8171,19 @@ async def safe_fast_on_demand_default_simple() -> Any:
     description="Canonical on-demand SAFE-FAST read. Use this route for direct setup decisions.",
     operation_id="safe_fast_on_demand",
 )
-async def safe_fast_on_demand(request: OnDemandRequest) -> Any:
+async def safe_fast_on_demand(
+    request: OnDemandRequest = Body(
+        ...,
+        openapi_examples={
+            "default": {
+                "summary": "Default SAFE-FAST on-demand request",
+                "value": {
+                    "option_type": "C",
+                    "open_positions": 0,
+                    "weekly_trade_count": 0,
+                },
+            }
+        },
+    )
+) -> Any:
     return await _build_on_demand_payload(request)
