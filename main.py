@@ -3589,6 +3589,7 @@ def _final_verdict(
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     if request.open_positions > 0:
         return "NO_TRADE"
@@ -3599,6 +3600,8 @@ def _final_verdict(
     ):
         return "NO_TRADE"
     if liquidity_context.get("liquidity_pass") is False:
+        return "NO_TRADE"
+    if (wall_thesis_fit_context or {}).get("wall_thesis_fit_status") == "fail":
         return "NO_TRADE"
     if engine_status == "NO_TRADE":
         return "NO_TRADE"
@@ -3779,6 +3782,7 @@ def _build_user_facing_block(
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
@@ -3889,6 +3893,18 @@ def _build_user_facing_block(
             }
         if structure_context.get("wall_pass") is False:
             reason = "Wall thesis and strike placement do not match."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
+        if (wall_thesis_fit_context or {}).get("wall_thesis_fit_status") == "fail":
+            reason = (wall_thesis_fit_context or {}).get("why_wall_thesis_fit_passes_or_fails") or "Wall thesis and strike placement do not match."
             if market_closed_context:
                 reason = f"After-hours structural read: {reason}"
             return {
@@ -4148,6 +4164,7 @@ def _build_checklist_block(
     primary_candidate: Optional[Dict[str, Any]],
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     ema_value = chart_check.get("ema50_1h") if chart_check else None
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
@@ -4182,10 +4199,25 @@ def _build_checklist_block(
     priority_rank = {name: idx for idx, name in enumerate(priority_order)}
     decision_blockers_priority = sorted(failed_items, key=lambda item: (priority_rank.get(item, 999), item))
 
+    global_gate_failures: List[str] = []
+    wall_thesis_fit_status = (wall_thesis_fit_context or {}).get("wall_thesis_fit_status")
+    if wall_thesis_fit_status == "fail":
+        global_gate_failures.append("wall_thesis_fit")
+
+    effective_failed_items = list(failed_items)
+    for item in global_gate_failures:
+        if item not in effective_failed_items:
+            effective_failed_items.append(item)
+
+    effective_decision_blockers_priority = list(decision_blockers_priority)
+    for item in global_gate_failures:
+        if item not in effective_decision_blockers_priority:
+            effective_decision_blockers_priority.insert(0, item)
+
     live_entry_now_available = bool(
         market_context.get("is_open")
         and time_day_gate.get("fresh_entry_allowed")
-        and not failed_items
+        and not effective_failed_items
         and trigger_state.get("trigger_present") is True
     )
 
@@ -4194,9 +4226,9 @@ def _build_checklist_block(
         "items": items,
         "failed_items": failed_items,
         "decision_blockers_priority": decision_blockers_priority,
-        "effective_failed_items": list(failed_items),
-        "effective_decision_blockers_priority": list(decision_blockers_priority),
-        "global_gate_failures": [],
+        "effective_failed_items": effective_failed_items,
+        "effective_decision_blockers_priority": effective_decision_blockers_priority,
+        "global_gate_failures": global_gate_failures,
         "live_entry_now_available": live_entry_now_available,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
@@ -4210,6 +4242,7 @@ def _failed_reason_messages(
     structure_context: Dict[str, Any],
     liquidity_context: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     reasons: List[str] = []
 
@@ -4224,6 +4257,7 @@ def _failed_reason_messages(
         "invalidation_clear": "invalidation is not clear",
         "fits_risk": "risk does not fit the SAFE-FAST budget",
         "open_trade_already": "an open trade already exists",
+        "wall_thesis_fit": (wall_thesis_fit_context or {}).get("why_wall_thesis_fit_passes_or_fails") or "Wall thesis and strike placement do not match.",
     }
 
     for item in checklist.get("failed_items", []):
@@ -5132,6 +5166,11 @@ async def _screen_ticker_candidate(
     ) if symbol else {"ok": False, "why": "no symbol"}
 
     liquidity_context = _build_liquidity_block(primary_candidate)
+    wall_thesis_fit = _build_wall_thesis_fit_context(
+        option_type=option_type,
+        structure_context=structure_context,
+        primary_candidate=primary_candidate,
+    )
     trigger_state = _build_trigger_state(
         option_type=option_type,
         market_context=market_context,
@@ -5151,6 +5190,7 @@ async def _screen_ticker_candidate(
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit,
     )
 
     checklist = _build_checklist_block(
@@ -5162,6 +5202,7 @@ async def _screen_ticker_candidate(
         primary_candidate=primary_candidate,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit,
     )
 
     reason = summary.get("reason", "No summary available.")
@@ -5177,6 +5218,8 @@ async def _screen_ticker_candidate(
             reason = "Room to first wall is too tight for SAFE-FAST."
         elif structure_context.get("wall_pass") is False:
             reason = "Wall thesis and strike placement do not match."
+        elif wall_thesis_fit.get("wall_thesis_fit_status") == "fail":
+            reason = wall_thesis_fit.get("why_wall_thesis_fit_passes_or_fails") or "Wall thesis and strike placement do not match."
         elif structure_context.get("extension_state") == "extended":
             reason = "Move is too extended from the 1H 50 EMA."
         elif chart_alignment is False:
@@ -5206,6 +5249,7 @@ async def _screen_ticker_candidate(
         "chart_check_error": chart_check_error,
         "structure_context": structure_context,
         "liquidity_context": liquidity_context,
+        "wall_thesis_fit": wall_thesis_fit,
         "trigger_state": trigger_state,
         "checklist": checklist,
     }
@@ -6539,6 +6583,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     chart_check_error = selected.get("chart_check_error") if selected else None
     structure_context = selected.get("structure_context") if selected else {"ok": False, "why": "no screened candidates"}
     liquidity_context = selected.get("liquidity_context") if selected else _build_liquidity_block(primary_candidate)
+    wall_thesis_fit_context = selected.get("wall_thesis_fit") if selected else _build_wall_thesis_fit_context(
+        option_type=clean_option_type,
+        structure_context=structure_context,
+        primary_candidate=primary_candidate,
+    )
     trigger_state = selected.get("trigger_state") if selected else _build_trigger_state(
         option_type=clean_option_type,
         market_context=market_context,
@@ -6555,6 +6604,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         primary_candidate=primary_candidate,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit_context,
     )
     selected_reason = selected.get("reason", summary_payload.get("reason", "No summary available.")) if selected else summary_payload.get("reason", "No summary available.")
 
@@ -6589,6 +6639,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit_context,
     )
     two_path_block = _build_two_path_block(
         market_context=market_context,
@@ -6631,6 +6682,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         structure_context=structure_context,
         liquidity_context=liquidity_context,
         trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit_context,
     )
 
     live_map_block = _build_live_map_block(
@@ -6763,7 +6815,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "early_enough_softening_v16_2026_04_15",
+        "build_tag": "wall_thesis_gate_v18_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -6811,6 +6863,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             user_facing=user_facing_block,
         ),
         "live_map": live_map_block,
+        "wall_thesis_fit_context": wall_thesis_fit_context,
         "trap_check_context": trap_check_context_block,
         "trigger_context": _build_trigger_context_block(
             trigger_state=trigger_state,
@@ -7354,7 +7407,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "early_enough_softening_v16_2026_04_15",
+        "build_tag": "wall_thesis_gate_v18_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
