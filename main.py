@@ -3662,6 +3662,18 @@ def _build_user_facing_block(
                 "setup_state": "NO TRADE",
                 "why": reason,
             }
+        if structure_context.get("chop_risk") is True:
+            reason = "1H structure around the 50 EMA is not clean."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": "stand down",
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
         if structure_context.get("room_pass") is False:
             reason = "Room to first wall is too tight for SAFE-FAST."
             if market_closed_context:
@@ -4853,6 +4865,8 @@ async def _screen_ticker_candidate(
     elif structure_context.get("ok"):
         if structure_context.get("setup_type_allowed") is False:
             reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
+        elif structure_context.get("chop_risk") is True:
+            reason = "1H structure around the 50 EMA is not clean."
         elif structure_context.get("room_pass") is False:
             reason = "Room to first wall is too tight for SAFE-FAST."
         elif structure_context.get("wall_pass") is False:
