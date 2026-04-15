@@ -23,10 +23,10 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
-app = FastAPI(title="SAFE-FAST Backend", version="1.8.5")
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
 API_BASE = "https://api.tastyworks.com"
-USER_AGENT = "safe-fast-backend/1.8.5"
+USER_AGENT = "safe-fast-backend/1.8.6"
 
 TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
 TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
@@ -38,6 +38,21 @@ SYMBOL_ORDER = ["SPY", "QQQ", "IWM", "GLD"]
 
 NY_TZ = ZoneInfo("America/New_York")
 ALLOWED_SETUP_TYPES = {"Ideal", "Clean Fast Break", "Continuation"}
+
+
+def _build_session_basis_context() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "chart_provider": "dxfeed_via_dxlink",
+        "structure_basis": "RTH_ONLY",
+        "bar_anchor": "SESSION_ANCHORED_09_30_ET",
+        "operative_timeframes": ["24H_CONTEXT", "RTH_1H_EXECUTION"],
+        "ema_basis": "RTH_1H_50_EMA",
+        "extended_hours_role": "context_only",
+        "fast_entry_policy": "advisory_execution_microscope_only_not_hardwired_here",
+        "time_of_day_policy": "ADVISORY_ONLY_NO_HARD_CUTOFF",
+        "note": "SAFE-FAST structure uses RTH session-anchored 1H candles. Time of day is context only; no hard late-entry cutoff is enforced in code.",
+    }
 
 
 def _is_allowed_setup_type_name(setup_type: Optional[str]) -> bool:
@@ -650,7 +665,7 @@ def _build_setup_route_context(
     elif extension_state == "extended":
         setup_route_status = "fail"
         why = "Setup route is too extended or too late versus the 1H 50 EMA."
-    elif allowed_setup is False:
+    elif setup_eligible_now is False:
         setup_route_status = "fail"
         why = "This is an allowed SAFE-FAST route class, but the current structure does not qualify it as a valid setup."
     else:
@@ -1256,12 +1271,14 @@ def _time_day_gate(market_context: Dict[str, Any]) -> Dict[str, Any]:
             "fresh_entry_allowed": False,
             "reason": "market_closed",
             "cutoff_et": None,
+            "policy": "market_open_required_only",
         }
 
     return {
         "fresh_entry_allowed": True,
-        "reason": "within_time_window",
+        "reason": "market_open_no_hard_time_cutoff",
         "cutoff_et": None,
+        "policy": "market_open_required_only",
     }
 
 
@@ -2282,6 +2299,7 @@ async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
     return {
         "ok": True,
         "symbol": symbol,
+        "session_basis": _build_session_basis_context(),
         "latest_close": snapshot["latest_close"],
         "ema50_1h": snapshot["ema50_1h"],
         "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
@@ -3367,6 +3385,7 @@ def _final_verdict(
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
 ) -> str:
     if request.open_positions > 0:
         return "NO_TRADE"
@@ -3395,6 +3414,8 @@ def _final_verdict(
             return "NO_TRADE"
         if structure_context.get("setup_eligible_now") is False:
             return "NO_TRADE"
+    if trigger_state.get("trigger_present") is True and trigger_state.get("structure_ready") is True:
+        return "TRADE"
     return "PENDING"
 
 
@@ -3550,6 +3571,7 @@ def _build_user_facing_block(
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
 ) -> Dict[str, Any]:
     ticker = best_ticker or "UNKNOWN"
     ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
@@ -3692,11 +3714,25 @@ def _build_user_facing_block(
             "why": _decorate_why(why, market_closed_context=market_closed_context),
         }
 
+    if final_verdict == "TRADE":
+        trigger_note = trigger_state.get("why") or "trigger_present"
+        return {
+            "good_idea_now": "YES",
+            "ticker": ticker,
+            "action": "enter",
+            "invalidation": f"First RTH 1H close beyond the RTH 1H 50 EMA against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "ACTIVE NOW",
+            "why": _decorate_why(
+                f"Candidate engine, structure, and trigger all pass right now ({trigger_note}).",
+                market_closed_context=market_closed_context,
+            ),
+        }
+
     return {
-        "good_idea_now": "WAIT",
+        "good_idea_now": "NO",
         "ticker": ticker,
-        "action": "wait for full chart confirmation",
-        "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+        "action": "wait",
+        "invalidation": f"First RTH 1H close beyond the RTH 1H 50 EMA against thesis. Current EMA50_1h anchor: {ema_text}.",
         "setup_state": "PENDING",
         "why": _decorate_why(
             "Candidate engine is valid, but trigger/entry-zone timing still needs confirmation.",
@@ -3962,7 +3998,7 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
     checklist = item.get("checklist") or {}
     final_verdict = item.get("final_verdict", "NO_TRADE")
 
-    verdict_rank = {"PENDING": 0, "NO_TRADE": 1}.get(final_verdict, 2)
+    verdict_rank = {"TRADE": 0, "PENDING": 1, "NO_TRADE": 2}.get(final_verdict, 3)
     setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
     room_rank = 0 if structure.get("room_pass") is True else 1
     wall_rank = 0 if structure.get("wall_pass") is True else 1
@@ -4106,20 +4142,10 @@ def _should_freeze_winner_to_raw_engine(
     if not raw_best_ticker:
         return False
 
-    global_gate_reason = str(time_day_gate.get("reason") or "").strip().lower()
-    if global_gate_reason in {
-        "market_closed",
-        "past_monday_thursday_cutoff",
-        "outside_time_window",
-        "outside_day_window",
-    }:
-        return True
-
     if market_context.get("is_open") is False:
         return True
 
-    fresh_entry_allowed = time_day_gate.get("fresh_entry_allowed")
-    if fresh_entry_allowed is False:
+    if time_day_gate.get("fresh_entry_allowed") is False:
         return True
 
     return False
@@ -4225,9 +4251,9 @@ def _resolve_global_gate_primary_blocker(
     screened_reason: Optional[str] = None,
     time_gate_reason: Optional[str] = None,
 ) -> Optional[str]:
-    gate_reason = time_gate_reason or screened_reason
-    if gate_reason in {"past_monday_thursday_cutoff", "outside_time_window", "outside_day_window"}:
-        return "time_day_gate"
+    gate_reason = str(time_gate_reason or screened_reason or "").strip().lower()
+    if gate_reason == "market_closed":
+        return "market_closed"
     return None
 
 
@@ -4384,14 +4410,14 @@ def _build_trigger_context_block(
 
 
 def _derive_global_gate_primary_blocker(trigger_reason: Any) -> Optional[str]:
-    if trigger_reason == "past_monday_thursday_cutoff":
-        return "time_day_gate"
+    if trigger_reason == "market_closed":
+        return "market_closed"
     return None
 
 
 def _derive_global_gate_next_flip(trigger_reason: Any) -> Optional[str]:
-    if trigger_reason == "past_monday_thursday_cutoff":
-        return "fresh_entry_allowed"
+    if trigger_reason == "market_closed":
+        return "market_open"
     return None
 
 
@@ -4810,6 +4836,7 @@ async def _screen_ticker_candidate(
         structure_context=structure_context,
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
+        trigger_state=trigger_state,
     )
 
     checklist = _build_checklist_block(
@@ -5153,7 +5180,7 @@ def _build_python_validation(
 
 
 def _normalize_top_level_status(final_verdict: Optional[str]) -> str:
-    if final_verdict in {"ACTIVE_NOW", "PENDING", "NO_TRADE", "INVALIDATED"}:
+    if final_verdict in {"TRADE", "ACTIVE_NOW", "PENDING", "NO_TRADE", "INVALIDATED"}:
         return str(final_verdict)
     return "NO_TRADE"
 
@@ -5718,6 +5745,7 @@ def _build_on_demand_unavailable_payload(
         "ok": True,
         "mode": "on_demand",
         "build_tag": build_tag,
+        "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": "UNCONFIRMED",
@@ -6234,6 +6262,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         structure_context=structure_context,
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
+        trigger_state=trigger_state,
     )
     two_path_block = _build_two_path_block(
         market_context=market_context,
@@ -6408,7 +6437,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_alert_stage_shadow_2026_04_14",
+        "build_tag": "rth_no_hard_time_gate_cleanup_2026_04_14",
+        "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
         "engine_status": engine_status,
@@ -6984,6 +7014,7 @@ def _build_continuous_snapshot(
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
         "build_tag": "continuous_replay_transition_profile_sandbox_2026_04_14",
+        "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
@@ -7653,6 +7684,7 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
 
     return {
         "build_tag": on_demand_payload.get("build_tag"),
+        "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "simple_output": on_demand_payload.get("simple_output"),
         "user_facing": on_demand_payload.get("user_facing"),
         "decision_context": {
@@ -7834,6 +7866,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "mode": "continuous_shadow",
         "shadow_mode": "snapshot_compare_only",
         "build_tag": on_demand_payload.get("build_tag"),
+        "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "source_of_truth": "frozen_on_demand_baseline",
         "profile_name": profile_name,
         "profile_key": profile_key,
