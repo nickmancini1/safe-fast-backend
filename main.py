@@ -712,8 +712,12 @@ def _build_room_wall_context(structure_context: Dict[str, Any]) -> Dict[str, Any
     return {
         "first_wall": structure_context.get("first_wall"),
         "next_pocket": structure_context.get("next_pocket"),
+        "room_reference_price": structure_context.get("room_reference_price"),
+        "room_reference_basis": structure_context.get("room_reference_basis"),
         "room_to_first_wall": structure_context.get("room_to_first_wall"),
+        "room_to_first_wall_current": structure_context.get("room_to_first_wall_current"),
         "room_ratio": structure_context.get("room_ratio"),
+        "room_ratio_current": structure_context.get("room_ratio_current"),
         "next_pocket_room_ratio": structure_context.get("next_pocket_room_ratio"),
         "room_quality": room_quality,
         "room_pass": room_pass,
@@ -2554,6 +2558,17 @@ def _condense_levels(levels: List[float], tolerance: float, descending: bool = F
     return out
 
 
+def _derive_room_reference_price(
+    latest_close: float,
+    ema50_1h: float,
+) -> float:
+    """
+    Room should be judged from the mapped entry area, not only from the stretched last print.
+    Use a blended reference biased toward the 1H EMA so late prints do not instantly collapse room.
+    """
+    return round(ema50_1h + ((latest_close - ema50_1h) * 0.33), 4)
+
+
 def _find_wall_levels(
     candles: List[Dict[str, Any]],
     latest_close: float,
@@ -3221,10 +3236,25 @@ def _build_structure_context(
 
     trend_ctx = _twentyfour_hour_context(candles, option_type)
     wall_levels = _find_wall_levels(candles, latest_close, option_type)
-    invalidation_distance = abs(latest_close - ema50_1h) if ema50_1h is not None else None
+    room_reference_price = _derive_room_reference_price(latest_close, ema50_1h)
+    room_reference_basis = "ema_weighted_mapped_entry_area"
+
+    invalidation_distance_current = abs(latest_close - ema50_1h) if ema50_1h is not None else None
+    invalidation_distance = abs(room_reference_price - ema50_1h) if ema50_1h is not None else None
+
+    room_to_first_wall_current = wall_levels.get("room_distance")
+    room_to_first_wall = (
+        round(abs(wall_levels.get("first_wall") - room_reference_price), 4)
+        if wall_levels.get("first_wall") is not None else None
+    )
+
+    room_ratio_current = None
+    if room_to_first_wall_current is not None and invalidation_distance_current not in (None, 0):
+        room_ratio_current = room_to_first_wall_current / invalidation_distance_current
+
     room_ratio = None
-    if wall_levels["room_distance"] is not None and invalidation_distance not in (None, 0):
-        room_ratio = wall_levels["room_distance"] / invalidation_distance
+    if room_to_first_wall is not None and invalidation_distance not in (None, 0):
+        room_ratio = room_to_first_wall / invalidation_distance
 
     hidden_left_wick_cluster = _find_hidden_left_wick_cluster(
         candles=candles,
@@ -3253,7 +3283,7 @@ def _build_structure_context(
         room_quality = "unconfirmed"
     elif room_ratio >= 2.0:
         room_quality = "pass"
-    elif room_ratio >= 1.35:
+    elif room_ratio >= 1.25:
         room_quality = "caution"
     else:
         room_quality = "fail"
@@ -3403,8 +3433,12 @@ def _build_structure_context(
         "twentyfour_hour_source": trend_ctx.get("source"),
         "first_wall": wall_levels.get("first_wall"),
         "next_pocket": wall_levels.get("next_pocket"),
-        "room_to_first_wall": wall_levels.get("room_distance"),
+        "room_reference_price": room_reference_price,
+        "room_reference_basis": room_reference_basis,
+        "room_to_first_wall": room_to_first_wall,
+        "room_to_first_wall_current": room_to_first_wall_current,
         "room_ratio": round(room_ratio, 3) if room_ratio is not None else None,
+        "room_ratio_current": round(room_ratio_current, 3) if room_ratio_current is not None else None,
         "room_quality": room_quality,
         "room_pass": room_pass,
         "room_hard_fail": room_hard_fail,
