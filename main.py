@@ -3372,11 +3372,21 @@ def _build_structure_context(
         or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.75)
     )
 
+    emergency_extension_block = bool(
+        extension_material
+        and (
+            (atr_multiple_from_ema is not None and atr_multiple_from_ema >= 2.6 and degraded_entry_quality and early_trigger_window_passed)
+            or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.88 and degraded_entry_quality)
+        )
+    )
+
     extension_blocks_now = bool(
         extension_material and (
             strong_confirmer_count >= 2
-            or (strong_confirmer_count >= 1 and extension_confirmer_count >= 2)
             or (room_hard_fail and early_trigger_window_passed)
+            or (parabolic_exhaustion and degraded_entry_quality)
+            or (volume_climax_exhaustion and degraded_entry_quality)
+            or emergency_extension_block
         )
     )
 
@@ -3404,6 +3414,7 @@ def _build_structure_context(
         "strong_confirmer_flags": strong_confirmer_flags,
         "strong_confirmer_count": strong_confirmer_count,
         "extension_material": extension_material,
+        "emergency_extension_block": emergency_extension_block,
         "extension_soft_flag": bool(
             not extension_blocks_now and (
                 base_extension_ctx.get("extension_caution_0_40_pct")
@@ -6637,7 +6648,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "selectivity_recalibration_v12_2026_04_15",
+        "build_tag": "extension_recalibration_v15_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7228,7 +7239,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "selectivity_recalibration_v12_2026_04_15",
+        "build_tag": "extension_recalibration_v15_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
