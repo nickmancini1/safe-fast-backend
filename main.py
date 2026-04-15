@@ -3923,13 +3923,18 @@ def _build_user_facing_block(
         }
 
     if final_verdict == "TRADE":
+        trade_why = "Trigger is live and the current SAFE-FAST gates pass."
+        trade_action = "enter"
+        if trigger_state.get("why") == "completed_candle_trigger_approved":
+            trade_why = "Completed-candle signal is approved and still valid."
+            trade_action = "enter from completed-candle approval"
         return {
             "good_idea_now": "YES",
             "ticker": ticker,
-            "action": "enter",
+            "action": trade_action,
             "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
             "setup_state": "TRADE",
-            "why": "Trigger is live and the current SAFE-FAST gates pass.",
+            "why": trade_why,
         }
 
     if final_verdict == "NO_TRADE":
@@ -3972,6 +3977,8 @@ def _build_trigger_state(
             "ok": False,
             "trigger_present": False,
             "structural_trigger_present": False,
+            "current_bar_trigger_present": False,
+            "completed_candle_trigger_present": False,
             "trigger_style": trigger_style,
             "trigger_level": None,
             "current_close": None,
@@ -3983,14 +3990,17 @@ def _build_trigger_state(
         }
 
     recent = chart_check.get("recent_candles") or []
-    current_close = chart_check.get("latest_close")
+    current_close = _to_float(chart_check.get("latest_close"))
     price_side = chart_check.get("price_vs_ema50_1h")
+    ema50_1h = _to_float(chart_check.get("ema50_1h"))
 
     if len(recent) < 2 or current_close is None:
         return {
             "ok": False,
             "trigger_present": False,
             "structural_trigger_present": False,
+            "current_bar_trigger_present": False,
+            "completed_candle_trigger_present": False,
             "trigger_style": trigger_style,
             "trigger_level": None,
             "current_close": current_close,
@@ -4002,18 +4012,46 @@ def _build_trigger_state(
         }
 
     prior = recent[:-1] if len(recent) >= 2 else recent
-    window = prior[-3:] if len(prior) >= 3 else prior
+    current_window = prior[-3:] if len(prior) >= 3 else prior
 
-    trigger_level: Optional[float]
-    crossed = False
     if option_type == "C":
-        trigger_level = max((c.get("high") for c in window if c.get("high") is not None), default=None)
-        crossed = bool(trigger_level is not None and current_close > trigger_level)
-        side_ok = price_side == "above"
+        current_trigger_level = max((c.get("high") for c in current_window if c.get("high") is not None), default=None)
+        current_crossed = bool(current_trigger_level is not None and current_close > current_trigger_level)
+        current_side_ok = price_side == "above"
     else:
-        trigger_level = min((c.get("low") for c in window if c.get("low") is not None), default=None)
-        crossed = bool(trigger_level is not None and current_close < trigger_level)
-        side_ok = price_side == "below"
+        current_trigger_level = min((c.get("low") for c in current_window if c.get("low") is not None), default=None)
+        current_crossed = bool(current_trigger_level is not None and current_close < current_trigger_level)
+        current_side_ok = price_side == "below"
+
+    completed_candle = prior[-1] if prior else None
+    completed_window = prior[:-1]
+    completed_window = completed_window[-3:] if len(completed_window) >= 3 else completed_window
+
+    completed_close = _to_float(completed_candle.get("close")) if completed_candle else None
+    completed_side_ok = False
+    completed_crossed = False
+    completed_trigger_level = current_trigger_level
+
+    if option_type == "C":
+        completed_trigger_level = max((c.get("high") for c in completed_window if c.get("high") is not None), default=current_trigger_level)
+        completed_side_ok = bool(
+            completed_close is not None
+            and (
+                (ema50_1h is not None and completed_close > ema50_1h)
+                or price_side == "above"
+            )
+        )
+        completed_crossed = bool(completed_trigger_level is not None and completed_close is not None and completed_close > completed_trigger_level)
+    else:
+        completed_trigger_level = min((c.get("low") for c in completed_window if c.get("low") is not None), default=current_trigger_level)
+        completed_side_ok = bool(
+            completed_close is not None
+            and (
+                (ema50_1h is not None and completed_close < ema50_1h)
+                or price_side == "below"
+            )
+        )
+        completed_crossed = bool(completed_trigger_level is not None and completed_close is not None and completed_close < completed_trigger_level)
 
     structure_ok = bool(
         structure_context.get("allowed_setup") is True
@@ -4024,27 +4062,37 @@ def _build_trigger_state(
         and structure_context.get("noisy_chop_explicit") is not True
     )
 
-    structural_trigger_present = bool(crossed and side_ok and structure_ok)
+    current_bar_structural_trigger_present = bool(current_crossed and current_side_ok and structure_ok)
+    completed_candle_structural_trigger_present = bool(completed_crossed and completed_side_ok and structure_ok)
+    structural_trigger_present = bool(current_bar_structural_trigger_present or completed_candle_structural_trigger_present)
     live_trigger_present = bool(structural_trigger_present and market_open and fresh_entry_allowed)
 
-    why = "trigger_present" if structural_trigger_present else "close_trigger_not_hit"
+    why = "trigger_present" if current_bar_structural_trigger_present else "close_trigger_not_hit"
     if not structure_ok:
         why = "structure_not_ready"
-    elif not side_ok:
-        why = "wrong_side_of_ema"
-    elif not crossed:
-        why = "close_trigger_not_hit"
-    elif structural_trigger_present and not market_open:
+    elif current_bar_structural_trigger_present and not market_open:
         why = "structural_trigger_present_market_closed"
-    elif structural_trigger_present and not fresh_entry_allowed:
+    elif current_bar_structural_trigger_present and not fresh_entry_allowed:
         why = time_gate_reason
+    elif completed_candle_structural_trigger_present and market_open and fresh_entry_allowed:
+        why = "completed_candle_trigger_approved"
+    elif completed_candle_structural_trigger_present and not market_open:
+        why = "completed_candle_trigger_market_closed"
+    elif completed_candle_structural_trigger_present and not fresh_entry_allowed:
+        why = time_gate_reason
+    elif not current_side_ok and not completed_side_ok:
+        why = "wrong_side_of_ema"
+    elif not current_crossed and not completed_crossed:
+        why = "close_trigger_not_hit"
 
     return {
         "ok": True,
         "trigger_present": live_trigger_present,
         "structural_trigger_present": structural_trigger_present,
+        "current_bar_trigger_present": bool(current_bar_structural_trigger_present and market_open and fresh_entry_allowed),
+        "completed_candle_trigger_present": bool(completed_candle_structural_trigger_present and market_open and fresh_entry_allowed),
         "trigger_style": trigger_style,
-        "trigger_level": _round_or_none(trigger_level, 4),
+        "trigger_level": _round_or_none(current_trigger_level, 4),
         "current_close": _round_or_none(current_close, 4),
         "price_vs_ema50_1h": price_side,
         "structure_ready": structure_ok,
@@ -4619,6 +4667,8 @@ def _build_trigger_context_block(
         "ok": True,
         "trigger_present": trigger_state.get("trigger_present"),
         "structural_trigger_present": trigger_state.get("structural_trigger_present"),
+        "current_bar_trigger_present": trigger_state.get("current_bar_trigger_present"),
+        "completed_candle_trigger_present": trigger_state.get("completed_candle_trigger_present"),
         "trigger_reason": trigger_state.get("why"),
         "structure_ready": trigger_state.get("structure_ready"),
         "trigger_style": trigger_state.get("trigger_style"),
