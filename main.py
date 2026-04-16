@@ -7056,7 +7056,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "thesis_gate_enforcement_v23_2026_04_15",
+        "build_tag": "continuous_thesis_gate_alignment_v24_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7344,6 +7344,7 @@ _CONTINUOUS_STATE_FAMILY_MAP: Dict[str, str] = {
     "APPROVAL_READY": "SIGNAL",
     "PENDING_COMPLETED_CANDLE_APPROVAL": "SIGNAL",
     "PENDING_TRIGGER_CONFIRMATION": "SIGNAL",
+    "PENDING_THROUGH_WALL": "SIGNAL",
     "BLOCKED_OPEN_POSITION": "ACCOUNT",
     "BLOCKED_WEEKLY_CAP": "ACCOUNT",
     "BLOCKED_IV_HIGH": "IV",
@@ -7447,6 +7448,8 @@ def _derive_continuous_state_source(
         return "final_verdict"
     if current_state in {"APPROVAL_READY", "PENDING_COMPLETED_CANDLE_APPROVAL", "PENDING_TRIGGER_CONFIRMATION"}:
         return "signal_state"
+    if current_state == "PENDING_THROUGH_WALL":
+        return "thesis_gate"
     if current_state == "EXIT_NOW":
         return "exit_state"
     if current_state == "NO_CANDIDATE":
@@ -7485,6 +7488,8 @@ def _derive_continuous_state_reason(
         return str(snapshot.get("final_verdict") or "trade").lower()
     if current_state in {"APPROVAL_READY", "PENDING_COMPLETED_CANDLE_APPROVAL", "PENDING_TRIGGER_CONFIRMATION"}:
         return current_state.lower()
+    if current_state == "PENDING_THROUGH_WALL":
+        return "through_the_wall_next_pocket_not_clear"
     if current_state == "NO_CANDIDATE":
         return snapshot.get("primary_blocker") or "no_candidate_available"
     if current_state == latent_structure_state and current_state is not None:
@@ -7518,6 +7523,7 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     time_gate_reason = snapshot.get("time_gate_reason")
     final_verdict = str(snapshot.get("final_verdict") or "").upper()
     breakout_hold_pending = bool(snapshot.get("breakout_hold_pending"))
+    thesis_gate_pending = bool(snapshot.get("thesis_gate_pending"))
 
     if primary_blocker == "open_trade_already" or next_flip_needed == "open_trade_already":
         return "BLOCKED_OPEN_POSITION"
@@ -7529,6 +7535,9 @@ def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
 
     if breakout_hold_pending:
         return "PENDING_BREAKOUT_HOLD"
+
+    if thesis_gate_pending:
+        return "PENDING_THROUGH_WALL"
 
     if final_verdict == "TRADE":
         return "TRADE_READY"
@@ -7672,7 +7681,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "thesis_gate_enforcement_v23_2026_04_15",
+        "build_tag": "continuous_thesis_gate_alignment_v24_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
@@ -7700,6 +7709,22 @@ def _build_continuous_snapshot(
             entry_context.get("mid_candle_block_reason")
             if str(entry_context.get("mid_candle_block_reason") or "").strip().lower() == "breakout_hold_not_confirmed"
             else None
+        ),
+        "effective_wall_thesis": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("effective_wall_thesis"),
+        "breakout_path_required": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("breakout_path_required"),
+        "current_price_beyond_first_wall": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("current_price_beyond_first_wall"),
+        "next_pocket": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket"),
+        "next_pocket_room_ratio": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket_room_ratio"),
+        "thesis_gate_pending": bool(
+            (((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("effective_wall_thesis") == "THROUGH_THE_WALL")
+            and (
+                (((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("wall_thesis_fit_status") != "pass")
+                or (((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket") is None)
+                or (
+                    (((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket_room_ratio") is None)
+                    or float(((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket_room_ratio") or 0) < 1.5
+                )
+            )
         ),
         "final_verdict": on_demand_payload.get("final_verdict"),
         "global_gate_failures": _ordered_unique_strings((on_demand_payload.get("checklist") or {}).get("global_gate_failures") or (approval_requirements_context.get("global_gate_failures") or [])),
@@ -7775,6 +7800,7 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
     next_flip_needed = snapshot.get("next_flip_needed")
     final_verdict = str(snapshot.get("final_verdict") or "").upper()
     breakout_hold_pending = bool(snapshot.get("breakout_hold_pending"))
+    thesis_gate_pending = bool(snapshot.get("thesis_gate_pending"))
 
     hard_blockers = {"allowed_setup_type", "clear_room", "early_enough", "one_hour_clean_around_ema"}
     hard_blockers_active = [item for item in decision_blockers if item in hard_blockers]
@@ -7789,6 +7815,11 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
     elif breakout_hold_pending:
         alert_stage = "PENDING_BREAKOUT_HOLD"
         alert_reason = "Breakout crossed, but hold above resistance is not confirmed yet."
+        should_alert_candidate = False
+        alert_severity = "info"
+    elif thesis_gate_pending:
+        alert_stage = "PENDING_THROUGH_WALL"
+        alert_reason = "Breakout path requires a clear next pocket beyond the first wall."
         should_alert_candidate = False
         alert_severity = "info"
     elif final_verdict == "TRADE":
@@ -7885,6 +7916,9 @@ def _continuous_meaningful_changed_fields(
 
     if previous.get("breakout_hold_pending") != current.get("breakout_hold_pending"):
         _add("breakout_hold_pending", previous.get("breakout_hold_pending"), current.get("breakout_hold_pending"))
+
+    if previous.get("thesis_gate_pending") != current.get("thesis_gate_pending"):
+        _add("thesis_gate_pending", previous.get("thesis_gate_pending"), current.get("thesis_gate_pending"))
 
     if previous.get("invalidation_hit") != current.get("invalidation_hit"):
         _add("invalidation_hit", previous.get("invalidation_hit"), current.get("invalidation_hit"))
@@ -8036,6 +8070,7 @@ def _build_true_transition_context(
         "approval_ready_now",
         "approval_ready_on_completed_candle",
         "breakout_hold_pending",
+        "thesis_gate_pending",
         "current_state",
         "global_gate_failures",
         "invalidation_hit",
@@ -8423,6 +8458,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "why_now": summary_note,
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "breakout_hold_pending": snapshot.get("breakout_hold_pending"),
+        "thesis_gate_pending": snapshot.get("thesis_gate_pending"),
         "invalidation": snapshot.get("invalidation"),
     }
 
