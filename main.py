@@ -4744,6 +4744,92 @@ def _select_screened_best_candidate(
     return None
 
 
+
+def _format_trade_day_level(value: Any) -> Optional[str]:
+    numeric = _to_float(value)
+    if numeric is None:
+        if value is None:
+            return None
+        text_value = str(value).strip()
+        return text_value or None
+    text_value = f"{round(numeric, 4):.4f}".rstrip("0").rstrip(".")
+    return text_value or "0"
+
+
+def _normalize_trade_day_action(
+    action: Optional[str],
+    setup_state: Optional[str],
+    good_idea_now: Optional[str],
+) -> str:
+    text_value = str(action or "").strip().lower()
+    state_value = str(setup_state or "").strip().upper()
+    idea_value = str(good_idea_now or "").strip().upper()
+
+    if idea_value == "YES" or state_value == "TRADE":
+        return "enter"
+    if "live trigger" in text_value:
+        return "wait for live trigger"
+    if text_value in {"wait", "stand down"}:
+        return text_value
+    if "review for next regular session" in text_value or "market is closed" in text_value:
+        return "wait"
+    if "enter" in text_value:
+        return "enter"
+    return "stand down"
+
+
+def _derive_trade_day_acceptability_condition(
+    user_facing: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+) -> Optional[str]:
+    setup_state = str(user_facing.get("setup_state") or "").strip().upper()
+    if setup_state != "PENDING":
+        return None
+
+    trigger_level_text = _format_trade_day_level(trigger_state.get("trigger_level"))
+    trigger_reason = str(trigger_state.get("why") or "").strip()
+    waiting_on = str(trigger_state.get("live_entry_waiting_on") or "").strip()
+
+    if waiting_on == "market_open" or "Market is closed" in str(user_facing.get("why") or ""):
+        if trigger_level_text:
+            return f"Next regular session opens and price still confirms through {trigger_level_text}."
+        return "Next regular session opens and the live trigger is still valid."
+
+    if trigger_reason in {"waiting_for_completed_breakout_close", "close_trigger_not_hit"} and trigger_level_text:
+        return f"Get a valid 1H close through the trigger at {trigger_level_text}."
+
+    if trigger_reason == "wrong_side_of_ema":
+        return "Reclaim the 1H 50 EMA and confirm the trigger."
+
+    if trigger_reason == "next_bar_hold_not_confirmed":
+        return "Hold correctly on the next 1H bar after the breakout candle."
+
+    return "Get a live SAFE-FAST trigger with structure still clean."
+
+
+def _build_trade_day_response_lines(
+    *,
+    good_idea_now: Any,
+    ticker: Any,
+    action: Any,
+    why: Any,
+    invalidation: Any,
+    what_would_make_it_acceptable: Optional[str] = None,
+) -> List[str]:
+    lines = [
+        f"GOOD IDEA NOW: {good_idea_now}",
+        f"Ticker: {ticker}",
+        f"Action: {action}",
+        f"Why: {why}",
+    ]
+    if what_would_make_it_acceptable:
+        lines.append(f"What would make it acceptable: {what_would_make_it_acceptable}")
+    lines.append(f"Invalidation: {invalidation}")
+    return lines
+
+
+
+
 def _build_simple_output_block(
     user_facing: Dict[str, Any],
     trigger_state: Dict[str, Any],
@@ -4753,17 +4839,37 @@ def _build_simple_output_block(
     macro_brief = user_facing.get("macro_brief")
     if macro_brief is None and macro_context is not None:
         macro_brief = _build_macro_brief(macro_context)
+
+    normalized_action = _normalize_trade_day_action(
+        user_facing.get("action"),
+        user_facing.get("setup_state"),
+        user_facing.get("good_idea_now"),
+    )
+    acceptable_condition = _derive_trade_day_acceptability_condition(user_facing, trigger_state)
+    response_lines = _build_trade_day_response_lines(
+        good_idea_now=user_facing.get("good_idea_now"),
+        ticker=user_facing.get("ticker"),
+        action=normalized_action,
+        why=user_facing.get("why"),
+        invalidation=user_facing.get("invalidation"),
+        what_would_make_it_acceptable=acceptable_condition,
+    )
+
     return {
         "design_goal": "complex_inputs_simple_outputs",
         "good_idea_now": user_facing.get("good_idea_now"),
         "ticker": user_facing.get("ticker"),
-        "action": user_facing.get("action"),
+        "action": normalized_action,
         "invalidation": user_facing.get("invalidation"),
         "setup_state": user_facing.get("setup_state"),
         "why": user_facing.get("why"),
+        "what_would_make_it_acceptable": acceptable_condition,
         "macro_brief": macro_brief,
         "signal_present": signal_present,
+        "response_lines": response_lines,
+        "response_text": "\n".join(response_lines),
     }
+
 
 
 
@@ -6212,16 +6318,35 @@ def _build_on_demand_unavailable_payload(
     primary_blocker = "data_unavailable"
 
     simple_output = {
-        "design_goal": "complex_inputs_simple_outputs",
-        "good_idea_now": "NO",
-        "ticker": None,
-        "action": "stand down",
-        "invalidation": "Unavailable while candidate engine is down for this run.",
-        "setup_state": "NO TRADE",
-        "why": reason_text,
-        "macro_brief": _build_macro_brief(macro_context),
-        "signal_present": False,
-    }
+    "design_goal": "complex_inputs_simple_outputs",
+    "good_idea_now": "NO",
+    "ticker": None,
+    "action": "stand down",
+    "invalidation": "Unavailable while candidate engine is down for this run.",
+    "setup_state": "NO TRADE",
+    "why": reason_text,
+    "what_would_make_it_acceptable": None,
+    "macro_brief": _build_macro_brief(macro_context),
+    "signal_present": False,
+    "response_lines": _build_trade_day_response_lines(
+        good_idea_now="NO",
+        ticker=None,
+        action="stand down",
+        why=reason_text,
+        invalidation="Unavailable while candidate engine is down for this run.",
+        what_would_make_it_acceptable=None,
+    ),
+    "response_text": "\n".join(
+        _build_trade_day_response_lines(
+            good_idea_now="NO",
+            ticker=None,
+            action="stand down",
+            why=reason_text,
+            invalidation="Unavailable while candidate engine is down for this run.",
+            what_would_make_it_acceptable=None,
+        )
+    ),
+}
 
     ten_second_answers = [
         {
@@ -7776,12 +7901,13 @@ def _build_continuous_snapshot(
         "time_day_gate": time_day_gate,
         "setup_type": market_closed_tester.get("setup_type"),
         "summary": {
-            "ticker": simple_output.get("ticker"),
-            "action": simple_output.get("action"),
-            "setup_state": simple_output.get("setup_state"),
-            "good_idea_now": simple_output.get("good_idea_now"),
-            "why": simple_output.get("why"),
-        },
+    "ticker": simple_output.get("ticker"),
+    "action": simple_output.get("action"),
+    "setup_state": simple_output.get("setup_state"),
+    "good_idea_now": simple_output.get("good_idea_now"),
+    "why": simple_output.get("why"),
+    "what_would_make_it_acceptable": simple_output.get("what_would_make_it_acceptable"),
+},
         "market_closed_tester": market_closed_tester,
         "replay_test_context": {},
         "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
@@ -8419,6 +8545,7 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     }
 
 
+
 def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     current_state = snapshot.get("current_state")
     latent_structure_state = snapshot.get("latent_structure_state")
@@ -8459,10 +8586,52 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     elif market_open is False and underlying_state != current_state and underlying_state is not None:
         summary_note = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
 
+    good_idea_now = summary.get("good_idea_now")
+    ticker = summary.get("ticker")
+    action = _normalize_trade_day_action(
+        summary.get("action"),
+        summary.get("setup_state"),
+        good_idea_now,
+    )
+    acceptable_condition = summary.get("what_would_make_it_acceptable")
+    headline = "This is a trade now" if good_idea_now == "YES" else "This is not a trade now"
+
+    if snapshot.get("invalidation_hit"):
+        what_changed = "Invalidation hit."
+    elif good_idea_now == "YES":
+        what_changed = "Trigger and approval are live."
+    elif market_open is False:
+        what_changed = "Market is closed, so live entry is off."
+    elif next_flip_needed:
+        what_changed = f"Still waiting on {next_flip_needed}."
+    elif effective_primary_blocker:
+        what_changed = f"Still blocked by {effective_primary_blocker}."
+    else:
+        what_changed = "No material state change."
+
+    if good_idea_now == "YES":
+        what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
+    elif acceptable_condition:
+        what_matters_now = acceptable_condition
+    elif next_flip_needed:
+        what_matters_now = f"Flip {next_flip_needed}."
+    elif effective_primary_blocker:
+        what_matters_now = f"Clear {effective_primary_blocker}."
+    else:
+        what_matters_now = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
+
+    response_lines = [
+        headline,
+        f"Ticker: {ticker}",
+        f"What changed: {what_changed}",
+        f"Why: {summary_note}",
+        f"What matters now: {what_matters_now}",
+    ]
+
     return {
-        "ticker": summary.get("ticker"),
-        "good_idea_now": summary.get("good_idea_now"),
-        "action": summary.get("action"),
+        "ticker": ticker,
+        "good_idea_now": good_idea_now,
+        "action": action,
         "setup_state": summary.get("setup_state"),
         "now_state": current_state,
         "underlying_state": underlying_state,
@@ -8487,6 +8656,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "should_alert_now": snapshot.get("should_alert_now"),
         "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
         "why_now": summary_note,
+        "what_would_make_it_acceptable": acceptable_condition,
+        "headline": headline,
+        "what_changed": what_changed,
+        "what_matters_now": what_matters_now,
+        "response_lines": response_lines,
+        "response_text": "\n".join(response_lines),
         "macro_brief": snapshot.get("macro_brief"),
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "breakout_hold_pending": snapshot.get("breakout_hold_pending"),
