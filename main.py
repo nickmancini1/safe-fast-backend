@@ -8944,6 +8944,187 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "response_lines": response_lines,
         "response_text": "\n".join(response_lines),
     }
+async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
+    profile_name = _sanitize_continuous_profile_name(request.profile_name)
+    on_demand_request = _continuous_shadow_to_on_demand_request(request)
+    base_profile_key = _continuous_profile_key(profile_name, on_demand_request)
+    replay_profile_active = bool(request.replay_timestamp_et or request.replay_label)
+    profile_key = f"{base_profile_key}__replay" if replay_profile_active else base_profile_key
+
+    stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
+    previous_snapshot = stored_state.get("latest_snapshot")
+
+    on_demand_payload = await _build_on_demand_payload(on_demand_request)
+    current_snapshot = _build_continuous_snapshot(
+        on_demand_payload=on_demand_payload,
+        request=on_demand_request,
+        profile_name=profile_name,
+        profile_key=profile_key,
+        shadow_request=request,
+    )
+    transition_summary = _compare_continuous_snapshots(previous_snapshot, current_snapshot)
+    true_transition_context = _build_true_transition_context(previous_snapshot, current_snapshot)
+    transition_fingerprint = _continuous_transition_fingerprint(
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+    )
+
+    last_alert_fingerprint = stored_state.get("last_alert_fingerprint")
+    deduped = bool(
+        previous_snapshot
+        and true_transition_context.get("should_alert_candidate")
+        and transition_fingerprint == last_alert_fingerprint
+    )
+    alert_decision_context = _build_continuous_alert_decision_context(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+        deduped=deduped,
+        replay_profile_active=replay_profile_active,
+    )
+    should_alert = bool(alert_decision_context.get("should_alert"))
+
+    current_snapshot["alert_dispatch_state"] = alert_decision_context.get("dispatch_state")
+    current_snapshot["would_alert_now"] = alert_decision_context.get("would_alert_now")
+    current_snapshot["should_alert_now"] = should_alert
+    current_snapshot["alert_suppressed_reasons"] = alert_decision_context.get("suppressed_reasons") or []
+    current_snapshot["readable_summary"] = _build_continuous_readable_summary(current_snapshot)
+
+    alert_payload = _build_continuous_alert_payload(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+        alert_decision_context=alert_decision_context,
+    )
+
+    persisted = False
+    state_file = None
+    if request.persist_state:
+        persisted = True
+        state_file = str(_continuous_state_path(profile_key))
+        _save_continuous_state(
+            profile_key,
+            {
+                "profile_name": profile_name,
+                "profile_key": profile_key,
+                "updated_at": current_snapshot.get("timestamp_et"),
+                "latest_snapshot": current_snapshot,
+                "previous_snapshot": previous_snapshot,
+                "last_transition": transition_summary,
+                "last_true_transition": true_transition_context,
+                "last_transition_fingerprint": transition_fingerprint,
+                "last_alert_fingerprint": transition_fingerprint if should_alert else last_alert_fingerprint,
+                "last_alert_timestamp": current_snapshot.get("timestamp_et") if should_alert else stored_state.get("last_alert_timestamp"),
+            },
+        )
+
+    response_payload = {
+        "ok": bool(on_demand_payload.get("ok")),
+        "mode": "continuous_shadow",
+        "shadow_mode": "snapshot_compare_only",
+        "build_tag": on_demand_payload.get("build_tag"),
+        "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
+        "source_of_truth": "frozen_on_demand_baseline",
+        "profile_name": profile_name,
+        "profile_key": profile_key,
+        "base_profile_key": base_profile_key,
+        "replay_profile_active": replay_profile_active,
+        "current_snapshot": current_snapshot,
+        "previous_snapshot": previous_snapshot,
+        "transition_summary": {
+            **transition_summary,
+            "should_alert": should_alert,
+            "deduped": deduped,
+            "transition_fingerprint": transition_fingerprint,
+        },
+        "true_transition_context": {
+            **true_transition_context,
+            "should_alert": should_alert,
+            "deduped": deduped,
+            "transition_fingerprint": transition_fingerprint,
+        },
+        "alert_decision_context": alert_decision_context,
+        "alert_payload": alert_payload,
+        "persistence": {
+            "enabled": request.persist_state,
+            "persisted": persisted,
+            "state_file": state_file,
+            "previous_snapshot_found": bool(previous_snapshot),
+        },
+        "read_this_first": "readable_summary",
+        "api_surface": {
+            "canonical_continuous_post": "/safe-fast/continuous",
+            "canonical_on_demand_post": "/safe-fast/on-demand",
+        },
+        "readable_summary": current_snapshot.get("readable_summary"),
+        "alert_candidate_context": current_snapshot.get("alert_candidate_context"),
+        "market_closed_tester": current_snapshot.get("market_closed_tester"),
+        "replay_test_context": current_snapshot.get("replay_test_context"),
+        "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
+        "on_demand_excerpt": {
+            **_build_continuous_on_demand_excerpt(on_demand_payload),
+            "replay_test_context": current_snapshot.get("replay_test_context"),
+        },
+    }
+    return _json_safe_for_response(response_payload)
+
+
+@app.post(
+    "/safe-fast/continuous",
+    tags=["SAFE-FAST"],
+    summary="SAFE-FAST Continuous",
+    description="Canonical production continuous endpoint. Use this route for continuous SAFE-FAST monitoring.",
+    operation_id="safe_fast_continuous",
+)
+
+
+@app.post(
+    "/safe-fast/continuous",
+    tags=["SAFE-FAST"],
+    summary="SAFE-FAST Continuous",
+    description="Canonical production continuous endpoint. Use this route for continuous SAFE-FAST monitoring.",
+    operation_id="safe_fast_continuous",
+)
+async def safe_fast_continuous(
+    request: ContinuousShadowRequest = Body(
+        ...,
+        openapi_examples={
+            "default": {
+                "summary": "Default SAFE-FAST continuous request",
+                "value": {
+                    "option_type": "C",
+                    "open_positions": 0,
+                    "weekly_trade_count": 0,
+                },
+            }
+        },
+    )
+) -> Any:
+    try:
+        return await _build_continuous_shadow_payload(request)
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_shadow",
+                "shadow_mode": "snapshot_compare_only",
+                "error_type": "continuous_shadow_runtime_error",
+                "reason": str(e),
+                "profile_name": _sanitize_continuous_profile_name(request.profile_name),
+                "request_profile": _model_dump(request),
+                "api_surface": {
+                    "canonical_continuous_post": "/safe-fast/continuous",
+                    "canonical_on_demand_post": "/safe-fast/on-demand",
+                },
+            }
+        )
+
+
+
+
+
+
+
 def _default_on_demand_request() -> OnDemandRequest:
     return OnDemandRequest(
         option_type="C",
