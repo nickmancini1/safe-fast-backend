@@ -542,29 +542,37 @@ def _build_trigger_scan_context(
     current_hold_context = _build_breakout_hold_context(
         option_type=option_type,
         current_close=_to_float(current_bar_eval.get("close")),
-        trigger_level=_to_float(current_bar_eval.get("reference_trigger_level")),
+        trigger_level=_to_float(completed_eval.get("reference_trigger_level")),
         structure_context=structure_context,
+        breakout_candle=most_recent_completed,
+        follow_through_candle=current_bar,
     )
     completed_hold_context = _build_breakout_hold_context(
         option_type=option_type,
         current_close=_to_float(current_bar_eval.get("close")),
         trigger_level=_to_float(completed_eval.get("reference_trigger_level")),
         structure_context=structure_context,
+        breakout_candle=most_recent_completed,
+        follow_through_candle=current_bar,
     )
 
-    if current_bar_eval.get("raw_chart_trigger_pass") and current_hold_context.get("hold_confirmed") is not True:
+    if current_bar_eval.get("raw_chart_trigger_pass") and not (
+        completed_eval.get("raw_chart_trigger_pass") and current_hold_context.get("hold_confirmed") is True
+    ):
         current_bar_eval["gated_trigger_pass"] = False
         current_bar_eval["status"] = "fail"
-        current_bar_eval["why"] = "breakout_hold_not_confirmed"
+        current_bar_eval["why"] = current_hold_context.get("reason") or "next_bar_hold_not_confirmed"
     if completed_eval.get("raw_chart_trigger_pass") and completed_hold_context.get("hold_confirmed") is not True:
         completed_eval["gated_trigger_pass"] = False
         completed_eval["status"] = "fail"
-        completed_eval["why"] = "breakout_hold_not_confirmed"
+        completed_eval["why"] = completed_hold_context.get("reason") or "next_bar_hold_not_confirmed"
 
     current_bar_eval["breakout_hold_confirmed"] = current_hold_context.get("hold_confirmed")
     current_bar_eval["breakout_hold_reference_level"] = current_hold_context.get("hold_reference_level")
+    current_bar_eval["breakout_hold_reclaim_limit_level"] = current_hold_context.get("reclaim_limit_level")
     completed_eval["breakout_hold_confirmed"] = completed_hold_context.get("hold_confirmed")
     completed_eval["breakout_hold_reference_level"] = completed_hold_context.get("hold_reference_level")
+    completed_eval["breakout_hold_reclaim_limit_level"] = completed_hold_context.get("reclaim_limit_level")
 
     if current_bar_eval.get("gated_trigger_pass"):
         trigger_scan_status = "pass_current_bar"
@@ -4014,30 +4022,87 @@ def _build_breakout_hold_context(
     current_close: Optional[float],
     trigger_level: Optional[float],
     structure_context: Optional[Dict[str, Any]],
+    breakout_candle: Optional[Dict[str, Any]] = None,
+    follow_through_candle: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     first_wall = _to_float((structure_context or {}).get("first_wall"))
     candidates = [level for level in [trigger_level, first_wall] if level is not None]
     hold_reference_level: Optional[float] = None
     hold_confirmed = False
+    hold_style = "close_only"
+    reclaim_limit_level: Optional[float] = None
 
     if candidates:
         if option_type == "C":
             hold_reference_level = max(candidates)
-            hold_confirmed = bool(current_close is not None and current_close > hold_reference_level)
         else:
             hold_reference_level = min(candidates)
+
+    breakout_open = _to_float((breakout_candle or {}).get("open"))
+    breakout_high = _to_float((breakout_candle or {}).get("high"))
+    breakout_low = _to_float((breakout_candle or {}).get("low"))
+    breakout_close = _to_float((breakout_candle or {}).get("close"))
+
+    follow_open = _to_float((follow_through_candle or {}).get("open"))
+    follow_low = _to_float((follow_through_candle or {}).get("low"))
+    follow_close = _to_float((follow_through_candle or {}).get("close"))
+
+    if hold_reference_level is not None and breakout_candle and follow_through_candle:
+        hold_style = "next_bar_hold"
+        breakout_range = None
+        if breakout_high is not None and breakout_low is not None:
+            breakout_range = abs(breakout_high - breakout_low)
+
+        if option_type == "C":
+            reclaim_limit_level = hold_reference_level
+            if breakout_range is not None and breakout_close is not None:
+                reclaim_limit_level = max(hold_reference_level, breakout_close - (breakout_range / 3.0))
+            hold_confirmed = bool(
+                breakout_close is not None
+                and breakout_close > hold_reference_level
+                and follow_open is not None
+                and follow_open >= hold_reference_level
+                and follow_close is not None
+                and follow_close > hold_reference_level
+                and follow_low is not None
+                and follow_low >= reclaim_limit_level
+            )
+        else:
+            reclaim_limit_level = hold_reference_level
+            if breakout_range is not None and breakout_close is not None:
+                reclaim_limit_level = min(hold_reference_level, breakout_close + (breakout_range / 3.0))
+            hold_confirmed = bool(
+                breakout_close is not None
+                and breakout_close < hold_reference_level
+                and follow_open is not None
+                and follow_open <= hold_reference_level
+                and follow_close is not None
+                and follow_close < hold_reference_level
+                and follow_low is not None
+                and follow_low <= reclaim_limit_level
+            )
+    elif hold_reference_level is not None:
+        if option_type == "C":
+            hold_confirmed = bool(current_close is not None and current_close > hold_reference_level)
+        else:
             hold_confirmed = bool(current_close is not None and current_close < hold_reference_level)
 
     if hold_reference_level is None:
         reason = "hold_reference_unavailable"
+    elif hold_confirmed and hold_style == "next_bar_hold":
+        reason = "next_bar_hold_confirmed"
     elif hold_confirmed:
         reason = "breakout_hold_confirmed"
+    elif hold_style == "next_bar_hold":
+        reason = "next_bar_hold_not_confirmed"
     else:
         reason = "breakout_hold_not_confirmed"
 
     return {
         "hold_reference_level": _round_or_none(hold_reference_level, 4),
         "hold_confirmed": hold_confirmed,
+        "hold_style": hold_style,
+        "reclaim_limit_level": _round_or_none(reclaim_limit_level, 4),
         "reason": reason,
     }
 
@@ -4134,17 +4199,23 @@ def _build_trigger_state(
         )
         completed_crossed = bool(completed_trigger_level is not None and completed_close is not None and completed_close < completed_trigger_level)
 
+    current_bar_candle = recent[-1] if recent else None
+
     current_breakout_hold = _build_breakout_hold_context(
         option_type=option_type,
         current_close=current_close,
-        trigger_level=current_trigger_level,
+        trigger_level=completed_trigger_level,
         structure_context=structure_context,
+        breakout_candle=completed_candle,
+        follow_through_candle=current_bar_candle,
     )
     completed_breakout_hold = _build_breakout_hold_context(
         option_type=option_type,
         current_close=current_close,
         trigger_level=completed_trigger_level,
         structure_context=structure_context,
+        breakout_candle=completed_candle,
+        follow_through_candle=current_bar_candle,
     )
 
     structure_ok = bool(
@@ -4157,7 +4228,7 @@ def _build_trigger_state(
     )
 
     current_bar_structural_trigger_present = bool(
-        current_crossed and current_side_ok and structure_ok and current_breakout_hold.get("hold_confirmed") is True
+        completed_crossed and current_side_ok and structure_ok and current_breakout_hold.get("hold_confirmed") is True
     )
     completed_candle_structural_trigger_present = bool(
         completed_crossed and completed_side_ok and structure_ok and completed_breakout_hold.get("hold_confirmed") is True
@@ -4168,10 +4239,10 @@ def _build_trigger_state(
     why = "trigger_present" if current_bar_structural_trigger_present else "close_trigger_not_hit"
     if not structure_ok:
         why = "structure_not_ready"
-    elif current_crossed and current_side_ok and current_breakout_hold.get("hold_confirmed") is not True:
-        why = "breakout_hold_not_confirmed"
     elif completed_crossed and completed_side_ok and completed_breakout_hold.get("hold_confirmed") is not True:
-        why = "breakout_hold_not_confirmed"
+        why = completed_breakout_hold.get("reason") or "next_bar_hold_not_confirmed"
+    elif current_crossed and current_side_ok and not completed_crossed:
+        why = "waiting_for_completed_breakout_close"
     elif current_bar_structural_trigger_present and not market_open:
         why = "structural_trigger_present_market_closed"
     elif current_bar_structural_trigger_present and not fresh_entry_allowed:
@@ -6905,7 +6976,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_breakout_hold_alignment_v21_2026_04_15",
+        "build_tag": "strong_next_bar_hold_v22_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7521,7 +7592,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_breakout_hold_alignment_v21_2026_04_15",
+        "build_tag": "strong_next_bar_hold_v22_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
