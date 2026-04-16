@@ -4756,6 +4756,7 @@ def _format_trade_day_level(value: Any) -> Optional[str]:
     return text_value or "0"
 
 
+
 def _normalize_trade_day_action(
     action: Optional[str],
     setup_state: Optional[str],
@@ -4778,19 +4779,180 @@ def _normalize_trade_day_action(
     return "stand down"
 
 
+def _humanize_trade_day_blocker(blocker: Optional[str]) -> Optional[str]:
+    blocker_text = str(blocker or "").strip()
+    if not blocker_text:
+        return None
+    mapping = {
+        "one_hour_clean_around_ema": "1H structure is still not clean around the 50 EMA",
+        "clear_trigger": "there is still no approved live trigger",
+        "clear_room": "room to the next level is too tight",
+        "early_enough": "the move is now too late / too extended",
+        "allowed_setup_type": "the detected route is not one of the 3 allowed SAFE-FAST setup types",
+        "open_trade_already": "you already have an open position",
+        "weekly_trade_cap_reached": "the weekly trade cap is already reached",
+        "time_gate_context": "the live entry window is closed",
+    }
+    return mapping.get(blocker_text, blocker_text.replace("_", " "))
+
+
+def _is_long_trigger_style(trigger_style: Optional[str]) -> bool:
+    return str(trigger_style or "").strip().lower() == "close_above_recent_high"
+
+
+def _build_trade_day_state_details(
+    user_facing: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    structure_context: Optional[Dict[str, Any]] = None,
+    decision_context: Optional[Dict[str, Any]] = None,
+    time_day_gate: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    structure_context = structure_context or {}
+    decision_context = decision_context or {}
+    time_day_gate = time_day_gate or {}
+
+    trigger_reason = str(trigger_state.get("why") or "").strip()
+    trigger_style = trigger_state.get("trigger_style")
+    current_close = _to_float(trigger_state.get("current_close"))
+    trigger_level = _to_float(trigger_state.get("trigger_level"))
+    hold_reference = _to_float(
+        trigger_state.get("breakout_hold_reference_current")
+        or trigger_state.get("breakout_hold_reference_completed")
+    )
+    structure_ready = trigger_state.get("structure_ready")
+    primary_blocker = decision_context.get("primary_blocker")
+    blockers = _ordered_unique_strings(decision_context.get("blockers") or [])
+    failed_reasons = _ordered_unique_strings(decision_context.get("failed_reasons") or [])
+    market_closed = str(time_day_gate.get("reason") or "").strip().lower() == "market_closed"
+
+    long_style = _is_long_trigger_style(trigger_style)
+    price_pushed_through_trigger = bool(
+        current_close is not None
+        and trigger_level is not None
+        and (
+            current_close > trigger_level if long_style else current_close < trigger_level
+        )
+    )
+
+    overlap_hits = structure_context.get("overlap_hits_last4")
+    if overlap_hits is None:
+        overlap_hits = structure_context.get("overlap_chop_hits_last4")
+
+    trigger_line = None
+    if trigger_reason in {"next_bar_hold_not_confirmed", "breakout_hold_not_confirmed"}:
+        if hold_reference is not None:
+            level_text = _format_trade_day_level(hold_reference) or str(hold_reference)
+            side_text = "above resistance" if long_style else "below support"
+            trigger_line = f"Breakout attempted, but the required 1H hold {side_text} at {level_text} is not proven yet."
+        else:
+            trigger_line = "Breakout attempted, but the required 1H hold is not proven yet."
+    elif trigger_reason == "waiting_for_completed_breakout_close":
+        if trigger_level is not None:
+            level_text = _format_trade_day_level(trigger_level) or str(trigger_level)
+            side_text = "through resistance" if long_style else "through support"
+            trigger_line = f"Price traded through {level_text} intrabar, but there is no completed 1H close {side_text} yet."
+        else:
+            trigger_line = "Price pushed through intrabar, but there is no completed 1H breakout close yet."
+    elif trigger_reason == "close_trigger_not_hit" and trigger_level is not None:
+        level_text = _format_trade_day_level(trigger_level) or str(trigger_level)
+        side_text = "through resistance" if long_style else "through support"
+        trigger_line = f"No completed 1H close {side_text} at {level_text} yet."
+    elif trigger_state.get("trigger_present") is True:
+        trigger_line = "The live trigger is approved now."
+
+    blocker_line = None
+    if structure_context.get("noisy_chop_explicit") is True:
+        if overlap_hits is not None:
+            blocker_line = f"1H structure is messy around the 50 EMA (noisy chop: {overlap_hits} overlap hits in the last 4 candles)."
+        else:
+            blocker_line = "1H structure is messy around the 50 EMA because explicit noisy chop is present."
+    elif structure_context.get("chop_risk") is True or primary_blocker == "one_hour_clean_around_ema":
+        blocker_line = "1H structure is still not clean around the 50 EMA."
+    elif primary_blocker:
+        blocker_human = _humanize_trade_day_blocker(primary_blocker)
+        blocker_line = blocker_human[0].upper() + blocker_human[1:] + "." if blocker_human else None
+
+    timing_line = None
+    if structure_context.get("extension_blocks_now") is True or str(structure_context.get("extension_state") or "").strip().lower() == "extended":
+        timing_line = "The move is late / extended now, so the original clean entry is gone."
+    elif structure_context.get("early_trigger_window_passed") is True and structure_context.get("degraded_entry_quality") is True:
+        timing_line = "The clean early window already passed, so entry quality is degraded."
+    elif structure_context.get("early_trigger_window_passed") is True:
+        timing_line = "The clean early window already passed."
+    elif structure_context.get("degraded_entry_quality") is True:
+        timing_line = "Entry quality is degraded versus the mapped ideal trigger."
+
+    time_line = "Market is closed, so no live entry can be taken right now." if market_closed else None
+
+    status_path: List[str] = []
+    for line in [trigger_line, blocker_line, timing_line, time_line]:
+        if line and line not in status_path:
+            status_path.append(line)
+
+    state_summary = " ".join(status_path[:3]).strip() or str(user_facing.get("why") or "").strip()
+    if not state_summary and failed_reasons:
+        state_summary = failed_reasons[0]
+
+    return {
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "failed_reasons": failed_reasons,
+        "trigger_reason": trigger_reason,
+        "structure_ready": structure_ready,
+        "trigger_line": trigger_line,
+        "blocker_line": blocker_line,
+        "timing_line": timing_line,
+        "time_line": time_line,
+        "price_pushed_through_trigger": price_pushed_through_trigger,
+        "state_summary": state_summary,
+        "status_path": status_path,
+    }
+
+
 def _derive_trade_day_acceptability_condition(
     user_facing: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    structure_context: Optional[Dict[str, Any]] = None,
+    decision_context: Optional[Dict[str, Any]] = None,
+    time_day_gate: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    setup_state = str(user_facing.get("setup_state") or "").strip().upper()
-    if setup_state != "PENDING":
-        return None
-
     trigger_level_text = _format_trade_day_level(trigger_state.get("trigger_level"))
+    hold_reference_text = _format_trade_day_level(
+        trigger_state.get("breakout_hold_reference_current")
+        or trigger_state.get("breakout_hold_reference_completed")
+    )
     trigger_reason = str(trigger_state.get("why") or "").strip()
     waiting_on = str(trigger_state.get("live_entry_waiting_on") or "").strip()
+    state_details = _build_trade_day_state_details(
+        user_facing=user_facing,
+        trigger_state=trigger_state,
+        structure_context=structure_context,
+        decision_context=decision_context,
+        time_day_gate=time_day_gate,
+    )
+    blockers = state_details.get("blockers") or []
+    primary_blocker = state_details.get("primary_blocker")
+    setup_state = str(user_facing.get("setup_state") or "").strip().upper()
+    user_why = str(user_facing.get("why") or "").strip()
 
-    if waiting_on == "market_open" or "Market is closed" in str(user_facing.get("why") or ""):
+    if setup_state == "TRADE":
+        return None
+    if "No valid candidate engine setup" in user_why or str(user_facing.get("ticker") or "").strip().upper() == "UNKNOWN":
+        return None
+
+    if primary_blocker == "one_hour_clean_around_ema" and trigger_reason in {"next_bar_hold_not_confirmed", "breakout_hold_not_confirmed"}:
+        if hold_reference_text:
+            return f"First get a clean 1H structure around the EMA, then get a confirmed close-and-hold through {hold_reference_text}."
+        return "First get a clean 1H structure around the EMA, then get a confirmed breakout hold."
+    if primary_blocker == "one_hour_clean_around_ema":
+        if trigger_level_text:
+            return f"First get a clean 1H structure around the EMA, then get a valid 1H close through {trigger_level_text}."
+        return "First get a clean 1H structure around the EMA, then get a valid live trigger."
+    if primary_blocker == "early_enough":
+        return "Need a fresh reclaim / reset that restores early entry quality before a new trigger."
+    if waiting_on == "market_open" or "Market is closed" in user_why:
+        if blockers and "one_hour_clean_around_ema" in blockers and trigger_level_text:
+            return f"Next regular session opens, 1H structure is still clean around the EMA, and price confirms through {trigger_level_text}."
         if trigger_level_text:
             return f"Next regular session opens and price still confirms through {trigger_level_text}."
         return "Next regular session opens and the live trigger is still valid."
@@ -4801,10 +4963,15 @@ def _derive_trade_day_acceptability_condition(
     if trigger_reason == "wrong_side_of_ema":
         return "Reclaim the 1H 50 EMA and confirm the trigger."
 
-    if trigger_reason == "next_bar_hold_not_confirmed":
+    if trigger_reason in {"next_bar_hold_not_confirmed", "breakout_hold_not_confirmed"}:
+        if hold_reference_text:
+            return f"Get a confirmed 1H close-and-hold through {hold_reference_text} without losing the reclaim level."
         return "Hold correctly on the next 1H bar after the breakout candle."
 
-    return "Get a live SAFE-FAST trigger with structure still clean."
+    if setup_state in {"PENDING", "NO TRADE"}:
+        return "Get a live SAFE-FAST trigger with structure still clean."
+
+    return None
 
 
 def _build_trade_day_response_lines(
@@ -4815,6 +4982,9 @@ def _build_trade_day_response_lines(
     why: Any,
     invalidation: Any,
     what_would_make_it_acceptable: Optional[str] = None,
+    status_line: Optional[str] = None,
+    blocker_line: Optional[str] = None,
+    timing_line: Optional[str] = None,
 ) -> List[str]:
     lines = [
         f"GOOD IDEA NOW: {good_idea_now}",
@@ -4822,18 +4992,26 @@ def _build_trade_day_response_lines(
         f"Action: {action}",
         f"Why: {why}",
     ]
+    if status_line:
+        lines.append(f"Status: {status_line}")
+    if blocker_line:
+        lines.append(f"Blocker: {blocker_line}")
+    if timing_line:
+        lines.append(f"Timing: {timing_line}")
     if what_would_make_it_acceptable:
         lines.append(f"What would make it acceptable: {what_would_make_it_acceptable}")
     lines.append(f"Invalidation: {invalidation}")
     return lines
 
 
-
-
 def _build_simple_output_block(
     user_facing: Dict[str, Any],
     trigger_state: Dict[str, Any],
     macro_context: Optional[Dict[str, Any]] = None,
+    structure_context: Optional[Dict[str, Any]] = None,
+    decision_context: Optional[Dict[str, Any]] = None,
+    approval_context: Optional[Dict[str, Any]] = None,
+    time_day_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     signal_present = bool(trigger_state.get("trigger_present") is True)
     macro_brief = user_facing.get("macro_brief")
@@ -4845,7 +5023,20 @@ def _build_simple_output_block(
         user_facing.get("setup_state"),
         user_facing.get("good_idea_now"),
     )
-    acceptable_condition = _derive_trade_day_acceptability_condition(user_facing, trigger_state)
+    state_details = _build_trade_day_state_details(
+        user_facing=user_facing,
+        trigger_state=trigger_state,
+        structure_context=structure_context,
+        decision_context=decision_context,
+        time_day_gate=time_day_gate,
+    )
+    acceptable_condition = _derive_trade_day_acceptability_condition(
+        user_facing=user_facing,
+        trigger_state=trigger_state,
+        structure_context=structure_context,
+        decision_context=decision_context,
+        time_day_gate=time_day_gate,
+    )
     response_lines = _build_trade_day_response_lines(
         good_idea_now=user_facing.get("good_idea_now"),
         ticker=user_facing.get("ticker"),
@@ -4853,6 +5044,9 @@ def _build_simple_output_block(
         why=user_facing.get("why"),
         invalidation=user_facing.get("invalidation"),
         what_would_make_it_acceptable=acceptable_condition,
+        status_line=state_details.get("trigger_line"),
+        blocker_line=state_details.get("blocker_line"),
+        timing_line=state_details.get("timing_line"),
     )
 
     return {
@@ -4866,10 +5060,19 @@ def _build_simple_output_block(
         "what_would_make_it_acceptable": acceptable_condition,
         "macro_brief": macro_brief,
         "signal_present": signal_present,
+        "primary_blocker": state_details.get("primary_blocker"),
+        "status_summary": state_details.get("state_summary"),
+        "status_path": state_details.get("status_path"),
+        "status_line": state_details.get("trigger_line"),
+        "blocker_line": state_details.get("blocker_line"),
+        "timing_line": state_details.get("timing_line"),
+        "time_line": state_details.get("time_line"),
+        "trigger_reason": state_details.get("trigger_reason"),
+        "structure_ready": state_details.get("structure_ready"),
+        "approval_next_flip_needed": (approval_context or {}).get("next_flip_needed"),
         "response_lines": response_lines,
         "response_text": "\n".join(response_lines),
     }
-
 
 
 
@@ -7279,6 +7482,10 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             user_facing=user_facing_block,
             trigger_state=trigger_state,
             macro_context=macro_context,
+            structure_context=structure_context,
+            decision_context=decision_context_block,
+            approval_context=approval_context_block,
+            time_day_gate=time_day_gate,
         ),
         "screened_best_context": screened_best_context_block,
         "market_context": market_context,
@@ -7907,7 +8114,27 @@ def _build_continuous_snapshot(
     "good_idea_now": simple_output.get("good_idea_now"),
     "why": simple_output.get("why"),
     "what_would_make_it_acceptable": simple_output.get("what_would_make_it_acceptable"),
+    "status_summary": simple_output.get("status_summary"),
+    "status_path": simple_output.get("status_path"),
+    "status_line": simple_output.get("status_line"),
+    "blocker_line": simple_output.get("blocker_line"),
+    "timing_line": simple_output.get("timing_line"),
+    "time_line": simple_output.get("time_line"),
 },
+        "status_summary": simple_output.get("status_summary"),
+        "status_path": simple_output.get("status_path"),
+        "status_line": simple_output.get("status_line"),
+        "blocker_line": simple_output.get("blocker_line"),
+        "timing_line": simple_output.get("timing_line"),
+        "time_line": simple_output.get("time_line"),
+        "primary_blocker_human": _humanize_trade_day_blocker(decision_context.get("primary_blocker")),
+        "noisy_chop_explicit": (on_demand_payload.get("structure_context") or {}).get("noisy_chop_explicit"),
+        "overlap_hits_last4": ((on_demand_payload.get("structure_context") or {}).get("overlap_hits_last4")
+            if (on_demand_payload.get("structure_context") or {}).get("overlap_hits_last4") is not None
+            else (on_demand_payload.get("structure_context") or {}).get("overlap_chop_hits_last4")),
+        "early_trigger_window_passed": (on_demand_payload.get("structure_context") or {}).get("early_trigger_window_passed"),
+        "degraded_entry_quality": (on_demand_payload.get("structure_context") or {}).get("degraded_entry_quality"),
+        "extension_state": (on_demand_payload.get("structure_context") or {}).get("extension_state"),
         "market_closed_tester": market_closed_tester,
         "replay_test_context": {},
         "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
@@ -8546,6 +8773,7 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
 
 
 
+
 def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     current_state = snapshot.get("current_state")
     latent_structure_state = snapshot.get("latent_structure_state")
@@ -8580,12 +8808,6 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         if len(top_blockers) >= 3:
             break
 
-    summary_note = summary.get("why")
-    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
-        summary_note = f"{summary.get('why')} Underneath that, structure is still {underlying_state}."
-    elif market_open is False and underlying_state != current_state and underlying_state is not None:
-        summary_note = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
-
     good_idea_now = summary.get("good_idea_now")
     ticker = summary.get("ticker")
     action = _normalize_trade_day_action(
@@ -8596,16 +8818,61 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     acceptable_condition = summary.get("what_would_make_it_acceptable")
     headline = "This is a trade now" if good_idea_now == "YES" else "This is not a trade now"
 
+    status_summary = snapshot.get("status_summary") or summary.get("status_summary")
+    status_path = snapshot.get("status_path") or summary.get("status_path") or []
+    status_line = snapshot.get("status_line") or summary.get("status_line")
+    blocker_line = snapshot.get("blocker_line") or summary.get("blocker_line")
+    timing_line = snapshot.get("timing_line") or summary.get("timing_line")
+    time_line = snapshot.get("time_line") or summary.get("time_line")
+    breakout_hold_pending = bool(snapshot.get("breakout_hold_pending"))
+    hold_reference = _format_trade_day_level(
+        snapshot.get("breakout_hold_reference_current")
+        or snapshot.get("breakout_hold_reference_completed")
+    )
+    overlap_hits = snapshot.get("overlap_hits_last4")
+    noisy_chop_explicit = bool(snapshot.get("noisy_chop_explicit"))
+    early_trigger_window_passed = bool(snapshot.get("early_trigger_window_passed"))
+    degraded_entry_quality = bool(snapshot.get("degraded_entry_quality"))
+    next_flip_human = _humanize_trade_day_blocker(next_flip_needed) if next_flip_needed else None
+    primary_blocker_human = snapshot.get("primary_blocker_human") or _humanize_trade_day_blocker(effective_primary_blocker)
+
+    summary_note = summary.get("why")
+    if status_summary and status_summary not in str(summary_note or ""):
+        summary_note = f"{summary_note} {status_summary}".strip()
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
+        summary_note = f"{summary_note} Underneath that, structure is still {underlying_state}.".strip()
+    elif market_open is False and underlying_state != current_state and underlying_state is not None:
+        summary_note = f"{summary_note} Underneath that, structure is still {underlying_state}.".strip()
+
     if snapshot.get("invalidation_hit"):
         what_changed = "Invalidation hit."
     elif good_idea_now == "YES":
         what_changed = "Trigger and approval are live."
+    elif breakout_hold_pending and effective_primary_blocker == "one_hour_clean_around_ema":
+        what_changed = "Breakout attempted, but hold is not proven and 1H structure is still messy."
+    elif breakout_hold_pending:
+        what_changed = "Breakout attempted, but the hold is not proven yet."
+    elif effective_primary_blocker == "one_hour_clean_around_ema" and noisy_chop_explicit:
+        if overlap_hits is not None:
+            what_changed = f"Still blocked: noisy chop is present ({overlap_hits} overlap hits in the last 4 candles)."
+        else:
+            what_changed = "Still blocked: 1H structure is messy around the 50 EMA."
+    elif effective_primary_blocker == "early_enough" or str(snapshot.get("extension_state") or "").strip().lower() == "extended":
+        what_changed = "The move is late / extended now."
+    elif early_trigger_window_passed and degraded_entry_quality:
+        what_changed = "The clean early window already passed, so entry quality is degraded."
     elif market_open is False:
         what_changed = "Market is closed, so live entry is off."
     elif next_flip_needed:
-        what_changed = f"Still waiting on {next_flip_needed}."
+        if next_flip_human:
+            what_changed = f"Still waiting on {next_flip_human}."
+        else:
+            what_changed = f"Still waiting on {next_flip_needed}."
     elif effective_primary_blocker:
-        what_changed = f"Still blocked by {effective_primary_blocker}."
+        if primary_blocker_human:
+            what_changed = f"Still blocked because {primary_blocker_human}."
+        else:
+            what_changed = f"Still blocked by {effective_primary_blocker}."
     else:
         what_changed = "No material state change."
 
@@ -8613,10 +8880,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
     elif acceptable_condition:
         what_matters_now = acceptable_condition
-    elif next_flip_needed:
-        what_matters_now = f"Flip {next_flip_needed}."
-    elif effective_primary_blocker:
-        what_matters_now = f"Clear {effective_primary_blocker}."
+    elif breakout_hold_pending and hold_reference:
+        what_matters_now = f"Get a confirmed 1H close-and-hold through {hold_reference}."
+    elif next_flip_human:
+        what_matters_now = f"Flip {next_flip_human}."
+    elif primary_blocker_human:
+        what_matters_now = f"Clear the blocker: {primary_blocker_human}."
     else:
         what_matters_now = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
 
@@ -8625,8 +8894,14 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         f"Ticker: {ticker}",
         f"What changed: {what_changed}",
         f"Why: {summary_note}",
-        f"What matters now: {what_matters_now}",
     ]
+    if status_line:
+        response_lines.append(f"Status: {status_line}")
+    if blocker_line:
+        response_lines.append(f"Blocker: {blocker_line}")
+    if timing_line:
+        response_lines.append(f"Timing: {timing_line}")
+    response_lines.append(f"What matters now: {what_matters_now}")
 
     return {
         "ticker": ticker,
@@ -8656,190 +8931,19 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "should_alert_now": snapshot.get("should_alert_now"),
         "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
         "why_now": summary_note,
+        "status_summary": status_summary,
+        "status_path": status_path,
+        "status_line": status_line,
+        "blocker_line": blocker_line,
+        "timing_line": timing_line,
+        "time_line": time_line,
         "what_would_make_it_acceptable": acceptable_condition,
         "headline": headline,
         "what_changed": what_changed,
         "what_matters_now": what_matters_now,
         "response_lines": response_lines,
         "response_text": "\n".join(response_lines),
-        "macro_brief": snapshot.get("macro_brief"),
-        "first_failed_reason": failed_reasons[0] if failed_reasons else None,
-        "breakout_hold_pending": snapshot.get("breakout_hold_pending"),
-        "thesis_gate_pending": snapshot.get("thesis_gate_pending"),
-        "invalidation": snapshot.get("invalidation"),
     }
-
-
-async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
-    profile_name = _sanitize_continuous_profile_name(request.profile_name)
-    on_demand_request = _continuous_shadow_to_on_demand_request(request)
-    base_profile_key = _continuous_profile_key(profile_name, on_demand_request)
-    replay_profile_active = bool(request.replay_timestamp_et or request.replay_label)
-    profile_key = f"{base_profile_key}__replay" if replay_profile_active else base_profile_key
-
-    stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
-    previous_snapshot = stored_state.get("latest_snapshot")
-
-    on_demand_payload = await _build_on_demand_payload(on_demand_request)
-    current_snapshot = _build_continuous_snapshot(
-        on_demand_payload=on_demand_payload,
-        request=on_demand_request,
-        profile_name=profile_name,
-        profile_key=profile_key,
-        shadow_request=request,
-    )
-    transition_summary = _compare_continuous_snapshots(previous_snapshot, current_snapshot)
-    true_transition_context = _build_true_transition_context(previous_snapshot, current_snapshot)
-    transition_fingerprint = _continuous_transition_fingerprint(
-        current_snapshot=current_snapshot,
-        transition_summary=true_transition_context,
-    )
-
-    last_alert_fingerprint = stored_state.get("last_alert_fingerprint")
-    deduped = bool(
-        previous_snapshot
-        and true_transition_context.get("should_alert_candidate")
-        and transition_fingerprint == last_alert_fingerprint
-    )
-    alert_decision_context = _build_continuous_alert_decision_context(
-        previous_snapshot=previous_snapshot,
-        current_snapshot=current_snapshot,
-        transition_summary=true_transition_context,
-        deduped=deduped,
-        replay_profile_active=replay_profile_active,
-    )
-    should_alert = bool(alert_decision_context.get("should_alert"))
-
-    current_snapshot["alert_dispatch_state"] = alert_decision_context.get("dispatch_state")
-    current_snapshot["would_alert_now"] = alert_decision_context.get("would_alert_now")
-    current_snapshot["should_alert_now"] = should_alert
-    current_snapshot["alert_suppressed_reasons"] = alert_decision_context.get("suppressed_reasons") or []
-    current_snapshot["readable_summary"] = _build_continuous_readable_summary(current_snapshot)
-
-    alert_payload = _build_continuous_alert_payload(
-        previous_snapshot=previous_snapshot,
-        current_snapshot=current_snapshot,
-        transition_summary=true_transition_context,
-        alert_decision_context=alert_decision_context,
-    )
-
-    persisted = False
-    state_file = None
-    if request.persist_state:
-        persisted = True
-        state_file = str(_continuous_state_path(profile_key))
-        _save_continuous_state(
-            profile_key,
-            {
-                "profile_name": profile_name,
-                "profile_key": profile_key,
-                "updated_at": current_snapshot.get("timestamp_et"),
-                "latest_snapshot": current_snapshot,
-                "previous_snapshot": previous_snapshot,
-                "last_transition": transition_summary,
-                "last_true_transition": true_transition_context,
-                "last_transition_fingerprint": transition_fingerprint,
-                "last_alert_fingerprint": transition_fingerprint if should_alert else last_alert_fingerprint,
-                "last_alert_timestamp": current_snapshot.get("timestamp_et") if should_alert else stored_state.get("last_alert_timestamp"),
-            },
-        )
-
-    response_payload = {
-        "ok": bool(on_demand_payload.get("ok")),
-        "mode": "continuous_shadow",
-        "shadow_mode": "snapshot_compare_only",
-        "build_tag": on_demand_payload.get("build_tag"),
-        "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
-        "source_of_truth": "frozen_on_demand_baseline",
-        "profile_name": profile_name,
-        "profile_key": profile_key,
-        "base_profile_key": base_profile_key,
-        "replay_profile_active": replay_profile_active,
-        "current_snapshot": current_snapshot,
-        "previous_snapshot": previous_snapshot,
-        "transition_summary": {
-            **transition_summary,
-            "should_alert": should_alert,
-            "deduped": deduped,
-            "transition_fingerprint": transition_fingerprint,
-        },
-        "true_transition_context": {
-            **true_transition_context,
-            "should_alert": should_alert,
-            "deduped": deduped,
-            "transition_fingerprint": transition_fingerprint,
-        },
-        "alert_decision_context": alert_decision_context,
-        "alert_payload": alert_payload,
-        "persistence": {
-            "enabled": request.persist_state,
-            "persisted": persisted,
-            "state_file": state_file,
-            "previous_snapshot_found": bool(previous_snapshot),
-        },
-        "read_this_first": "readable_summary",
-        "api_surface": {
-            "canonical_continuous_post": "/safe-fast/continuous",
-            "canonical_on_demand_post": "/safe-fast/on-demand",
-        },
-        "readable_summary": current_snapshot.get("readable_summary"),
-        "alert_candidate_context": current_snapshot.get("alert_candidate_context"),
-        "market_closed_tester": current_snapshot.get("market_closed_tester"),
-        "replay_test_context": current_snapshot.get("replay_test_context"),
-        "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
-        "on_demand_excerpt": {
-            **_build_continuous_on_demand_excerpt(on_demand_payload),
-            "replay_test_context": current_snapshot.get("replay_test_context"),
-        },
-    }
-    return _json_safe_for_response(response_payload)
-
-
-@app.post(
-    "/safe-fast/continuous",
-    tags=["SAFE-FAST"],
-    summary="SAFE-FAST Continuous",
-    description="Canonical production continuous endpoint. Use this route for continuous SAFE-FAST monitoring.",
-    operation_id="safe_fast_continuous",
-)
-async def safe_fast_continuous(
-    request: ContinuousShadowRequest = Body(
-        ...,
-        openapi_examples={
-            "default": {
-                "summary": "Default SAFE-FAST continuous request",
-                "value": {
-                    "option_type": "C",
-                    "open_positions": 0,
-                    "weekly_trade_count": 0,
-                },
-            }
-        },
-    )
-) -> Any:
-    try:
-        return await _build_continuous_shadow_payload(request)
-    except Exception as e:
-        return _json_safe_for_response(
-            {
-                "ok": False,
-                "mode": "continuous_shadow",
-                "shadow_mode": "snapshot_compare_only",
-                "error_type": "continuous_shadow_runtime_error",
-                "reason": str(e),
-                "profile_name": _sanitize_continuous_profile_name(request.profile_name),
-                "request_profile": _model_dump(request),
-                "api_surface": {
-                    "canonical_continuous_post": "/safe-fast/continuous",
-                    "canonical_on_demand_post": "/safe-fast/on-demand",
-                },
-            }
-        )
-
-
-
-
-
 def _default_on_demand_request() -> OnDemandRequest:
     return OnDemandRequest(
         option_type="C",
