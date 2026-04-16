@@ -918,8 +918,12 @@ def _build_wall_thesis_fit_context(
     primary_candidate: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     wall_thesis = structure_context.get("wall_thesis")
+    effective_wall_thesis = structure_context.get("effective_wall_thesis") or wall_thesis
     first_wall = _to_float(structure_context.get("first_wall"))
     next_pocket = _to_float(structure_context.get("next_pocket"))
+    next_pocket_room_ratio = _to_float(structure_context.get("next_pocket_room_ratio"))
+    current_price_beyond_first_wall = structure_context.get("current_price_beyond_first_wall")
+    breakout_path_required = bool(structure_context.get("breakout_path_required"))
     long_strike = _to_float(primary_candidate.get("long_strike")) if primary_candidate else None
     short_strike = _to_float(primary_candidate.get("short_strike")) if primary_candidate else None
 
@@ -947,19 +951,22 @@ def _build_wall_thesis_fit_context(
                 magnet_hits.append(level)
         short_strike_on_magnet_level = bool(magnet_hits) if magnet_hits else False
 
-    requires_breakout = wall_thesis == "THROUGH_THE_WALL"
+    requires_breakout = effective_wall_thesis == "THROUGH_THE_WALL"
 
     if primary_candidate is None:
         status = "unconfirmed"
         why = "Wall-thesis fit is unconfirmed because no primary candidate is available."
-    elif wall_thesis not in {"TO_THE_WALL", "THROUGH_THE_WALL"}:
+    elif effective_wall_thesis not in {"TO_THE_WALL", "THROUGH_THE_WALL"}:
         status = "unconfirmed"
         why = "Wall thesis is still unconfirmed from the available structure inputs."
     elif short_strike is None or first_wall is None:
         status = "unconfirmed"
         why = "Wall-thesis fit is unconfirmed because strike or wall data is missing."
-    elif wall_thesis == "TO_THE_WALL":
-        if short_strike_on_magnet_level:
+    elif effective_wall_thesis == "TO_THE_WALL":
+        if breakout_path_required or current_price_beyond_first_wall is True:
+            status = "fail"
+            why = "TO_THE_WALL fails because price is already through the first wall, so this now requires a THROUGH_THE_WALL thesis."
+        elif short_strike_on_magnet_level:
             status = "fail"
             why = "TO_THE_WALL fails because the short strike sits on a magnet level."
         elif short_strike_vs_first_wall != "beyond_first_wall":
@@ -972,19 +979,29 @@ def _build_wall_thesis_fit_context(
         if next_pocket is None:
             status = "fail"
             why = "THROUGH_THE_WALL fails because no clear next pocket is mapped beyond the first wall."
+        elif next_pocket_room_ratio is None or next_pocket_room_ratio < 1.5:
+            status = "fail"
+            why = "THROUGH_THE_WALL fails because the next pocket beyond the first wall is not clear enough."
         elif short_strike_vs_first_wall not in {"on_wall_zone", "beyond_first_wall"}:
             status = "fail"
             why = "THROUGH_THE_WALL fails because the short strike is not positioned for a breakout path."
+        elif current_price_beyond_first_wall is True:
+            status = "pass"
+            why = "THROUGH_THE_WALL fits because price is through the first wall and a clear next pocket is mapped."
         else:
             status = "pass"
             why = "THROUGH_THE_WALL fits because breakout continuation into the next pocket is mapped."
 
     return {
         "wall_thesis": wall_thesis,
+        "effective_wall_thesis": effective_wall_thesis,
         "long_strike": long_strike,
         "short_strike": short_strike,
         "first_wall": structure_context.get("first_wall"),
         "next_pocket": structure_context.get("next_pocket"),
+        "next_pocket_room_ratio": _round_or_none(next_pocket_room_ratio, 3),
+        "current_price_beyond_first_wall": current_price_beyond_first_wall,
+        "breakout_path_required": breakout_path_required,
         "short_strike_vs_first_wall": short_strike_vs_first_wall,
         "requires_breakout": requires_breakout,
         "short_strike_on_magnet_level": short_strike_on_magnet_level,
@@ -3161,39 +3178,96 @@ def _wall_thesis(
     first_wall: Optional[float],
     next_pocket: Optional[float],
     invalidation_distance: Optional[float],
+    latest_close: Optional[float] = None,
 ) -> Dict[str, Any]:
     if not primary_candidate or first_wall is None:
         return {
             "wall_thesis": "unconfirmed",
+            "effective_wall_thesis": "unconfirmed",
             "wall_pass": None,
+            "next_pocket_room_ratio": None,
+            "current_price_beyond_first_wall": None,
+            "breakout_path_required": False,
+            "why": "wall_or_candidate_unconfirmed",
         }
 
     short_strike = _to_float(primary_candidate.get("short_strike"))
     if short_strike is None:
         return {
             "wall_thesis": "unconfirmed",
+            "effective_wall_thesis": "unconfirmed",
             "wall_pass": None,
+            "next_pocket_room_ratio": None,
+            "current_price_beyond_first_wall": None,
+            "breakout_path_required": False,
+            "why": "short_strike_unconfirmed",
         }
 
     next_pocket_room = None
     if next_pocket is not None and invalidation_distance not in (None, 0):
         next_pocket_room = abs(next_pocket - first_wall) / invalidation_distance
 
-    if option_type == "C":
-        if short_strike > first_wall:
-            return {"wall_thesis": "TO_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
-        if next_pocket is not None and (next_pocket_room or 0) >= 1.5:
-            return {"wall_thesis": "THROUGH_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
-    else:
-        if short_strike < first_wall:
-            return {"wall_thesis": "TO_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
-        if next_pocket is not None and (next_pocket_room or 0) >= 1.5:
-            return {"wall_thesis": "THROUGH_THE_WALL", "wall_pass": True, "next_pocket_room_ratio": next_pocket_room}
+    current_price_beyond_first_wall = None
+    if latest_close is not None:
+        if option_type == "C":
+            current_price_beyond_first_wall = latest_close > first_wall
+        else:
+            current_price_beyond_first_wall = latest_close < first_wall
+
+    strike_supports_to_wall = short_strike > first_wall if option_type == "C" else short_strike < first_wall
+    through_the_wall_available = bool(next_pocket is not None and (next_pocket_room or 0) >= 1.5)
+
+    if current_price_beyond_first_wall is True:
+        if through_the_wall_available:
+            return {
+                "wall_thesis": "THROUGH_THE_WALL_REQUIRED",
+                "effective_wall_thesis": "THROUGH_THE_WALL",
+                "wall_pass": True,
+                "next_pocket_room_ratio": next_pocket_room,
+                "current_price_beyond_first_wall": True,
+                "breakout_path_required": True,
+                "why": "price_is_already_through_first_wall",
+            }
+        return {
+            "wall_thesis": "THROUGH_THE_WALL_REQUIRED",
+            "effective_wall_thesis": "THROUGH_THE_WALL",
+            "wall_pass": False,
+            "next_pocket_room_ratio": next_pocket_room,
+            "current_price_beyond_first_wall": True,
+            "breakout_path_required": True,
+            "why": "price_is_through_first_wall_but_no_clear_next_pocket",
+        }
+
+    if strike_supports_to_wall:
+        return {
+            "wall_thesis": "TO_THE_WALL",
+            "effective_wall_thesis": "TO_THE_WALL",
+            "wall_pass": True,
+            "next_pocket_room_ratio": next_pocket_room,
+            "current_price_beyond_first_wall": current_price_beyond_first_wall,
+            "breakout_path_required": False,
+            "why": "to_the_wall_path",
+        }
+
+    if through_the_wall_available:
+        return {
+            "wall_thesis": "THROUGH_THE_WALL",
+            "effective_wall_thesis": "THROUGH_THE_WALL",
+            "wall_pass": True,
+            "next_pocket_room_ratio": next_pocket_room,
+            "current_price_beyond_first_wall": current_price_beyond_first_wall,
+            "breakout_path_required": False,
+            "why": "through_the_wall_path",
+        }
 
     return {
         "wall_thesis": "WALL_MISMATCH",
+        "effective_wall_thesis": "WALL_MISMATCH",
         "wall_pass": False,
         "next_pocket_room_ratio": next_pocket_room,
+        "current_price_beyond_first_wall": current_price_beyond_first_wall,
+        "breakout_path_required": False,
+        "why": "wall_thesis_and_strike_do_not_match",
     }
 
 
@@ -3339,6 +3413,7 @@ def _build_structure_context(
         first_wall=wall_levels.get("first_wall"),
         next_pocket=wall_levels.get("next_pocket"),
         invalidation_distance=invalidation_distance,
+        latest_close=latest_close,
     )
 
     atr14 = _calc_atr(candles, 14)
@@ -3542,6 +3617,7 @@ def _build_structure_context(
         "twentyfour_hour_trend": trend_ctx.get("label"),
         "twentyfour_hour_supportive": trend_ctx.get("supportive"),
         "twentyfour_hour_source": trend_ctx.get("source"),
+        "latest_close": latest_close,
         "first_wall": wall_levels.get("first_wall"),
         "next_pocket": wall_levels.get("next_pocket"),
         "room_reference_price": room_reference_price,
@@ -3555,8 +3631,12 @@ def _build_structure_context(
         "room_hard_fail": room_hard_fail,
         "room_soft_flag": room_soft_flag,
         "wall_thesis": wall_ctx.get("wall_thesis"),
+        "effective_wall_thesis": wall_ctx.get("effective_wall_thesis", wall_ctx.get("wall_thesis")),
         "wall_pass": wall_ctx.get("wall_pass"),
         "next_pocket_room_ratio": wall_ctx.get("next_pocket_room_ratio"),
+        "current_price_beyond_first_wall": wall_ctx.get("current_price_beyond_first_wall"),
+        "breakout_path_required": wall_ctx.get("breakout_path_required"),
+        "wall_thesis_reason": wall_ctx.get("why"),
         "extension_state": extension_ctx.get("state"),
         "pct_from_ema": extension_ctx.get("pct_from_ema"),
         "late_move": extension_ctx.get("late_move"),
@@ -6976,7 +7056,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "strong_next_bar_hold_v22_2026_04_15",
+        "build_tag": "thesis_gate_enforcement_v23_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7592,7 +7672,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "strong_next_bar_hold_v22_2026_04_15",
+        "build_tag": "thesis_gate_enforcement_v23_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
