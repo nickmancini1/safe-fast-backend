@@ -1,3 +1,4 @@
+# FIX_MARKER: continuous_decision_context_block_defined_v2
 from __future__ import annotations
 
 # fresh full main.py build with entry_context bridge 2026-04-09T16:05:00Z
@@ -7423,7 +7424,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "macro_surface_v25_2026_04_15",
+        "build_tag": "macro_surface_v25_2026_04_16_fix1",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -8044,7 +8045,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "macro_surface_v25_2026_04_15",
+        "build_tag": "macro_surface_v25_2026_04_16_fix1",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
