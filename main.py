@@ -7312,6 +7312,16 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         request=request,
     )
     trap_check_context_block = live_map_block.get("trap_check_context") or _build_trap_check_context(structure_context)
+    decision_context_block = _build_decision_context_block(
+        summary_payload=summary_payload,
+        selected=selected,
+        engine_status=engine_status,
+        final_verdict=final_verdict,
+        best_ticker=best_ticker,
+        checklist_block=checklist_block,
+        failed_reasons=failed_reasons_block,
+        user_facing=user_facing_block,
+    )
     entry_context_block = _build_entry_context_block(
         trigger_state=trigger_state,
         live_map=live_map_block,
@@ -7441,16 +7451,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             final_verdict=final_verdict,
             best_ticker=best_ticker,
         ),
-        "decision_context": _build_decision_context_block(
-            summary_payload=summary_payload,
-            selected=selected,
-            engine_status=engine_status,
-            final_verdict=final_verdict,
-            best_ticker=best_ticker,
-            checklist_block=checklist_block,
-            failed_reasons=failed_reasons_block,
-            user_facing=user_facing_block,
-        ),
+        "decision_context": decision_context_block,
         "blocker_context": _build_blocker_context_block(
             checklist_block=checklist_block,
             failed_reasons=failed_reasons_block,
