@@ -140,6 +140,28 @@ def _decorate_why(why_text: Optional[str], market_closed_context: bool = False) 
     return text_value
 
 
+def _build_macro_brief(macro_context: Dict[str, Any]) -> str:
+    if not isinstance(macro_context, dict):
+        return "unconfirmed"
+    if macro_context.get("ok") is not True:
+        requested = macro_context.get("requested")
+        if requested is False:
+            return "skipped"
+        return "unconfirmed"
+    if macro_context.get("has_major_event_today"):
+        return "major event today"
+    if macro_context.get("has_major_event_tomorrow"):
+        return "major event tomorrow"
+    risk_level = str(macro_context.get("risk_level") or "").strip().lower()
+    if risk_level == "normal":
+        return "clear today"
+    if risk_level == "high":
+        return "event risk high"
+    if risk_level:
+        return risk_level
+    return "unconfirmed"
+
+
 def _build_price_zone(
     low: Optional[float],
     high: Optional[float],
@@ -4725,8 +4747,12 @@ def _select_screened_best_candidate(
 def _build_simple_output_block(
     user_facing: Dict[str, Any],
     trigger_state: Dict[str, Any],
+    macro_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     signal_present = bool(trigger_state.get("trigger_present") is True)
+    macro_brief = user_facing.get("macro_brief")
+    if macro_brief is None and macro_context is not None:
+        macro_brief = _build_macro_brief(macro_context)
     return {
         "design_goal": "complex_inputs_simple_outputs",
         "good_idea_now": user_facing.get("good_idea_now"),
@@ -4735,6 +4761,7 @@ def _build_simple_output_block(
         "invalidation": user_facing.get("invalidation"),
         "setup_state": user_facing.get("setup_state"),
         "why": user_facing.get("why"),
+        "macro_brief": macro_brief,
         "signal_present": signal_present,
     }
 
@@ -6192,6 +6219,7 @@ def _build_on_demand_unavailable_payload(
         "invalidation": "Unavailable while candidate engine is down for this run.",
         "setup_state": "NO TRADE",
         "why": reason_text,
+        "macro_brief": _build_macro_brief(macro_context),
         "signal_present": False,
     }
 
@@ -6882,6 +6910,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         trigger_state=trigger_state,
         wall_thesis_fit_context=wall_thesis_fit_context,
     )
+    user_facing_block["macro_brief"] = _build_macro_brief(macro_context)
     two_path_block = _build_two_path_block(
         market_context=market_context,
         time_day_gate=time_day_gate,
@@ -7056,7 +7085,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "continuous_thesis_gate_alignment_v24_2026_04_15",
+        "build_tag": "macro_surface_v25_2026_04_15",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7124,6 +7153,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         "simple_output": _build_simple_output_block(
             user_facing=user_facing_block,
             trigger_state=trigger_state,
+            macro_context=macro_context,
         ),
         "screened_best_context": screened_best_context_block,
         "market_context": market_context,
@@ -7681,7 +7711,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "continuous_thesis_gate_alignment_v24_2026_04_15",
+        "build_tag": "macro_surface_v25_2026_04_15",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
@@ -7734,6 +7764,7 @@ def _build_continuous_snapshot(
         "weekly_trade_count": request_payload.get("weekly_trade_count"),
         "invalidation": simple_output.get("invalidation"),
         "invalidation_level_1h_ema50": on_demand_payload.get("invalidation_level_1h_ema50"),
+        "macro_brief": ((on_demand_payload.get("simple_output") or {}).get("macro_brief")),
         "targets": on_demand_payload.get("targets") or {},
         "winner_shift_context": winner_shift_context,
         "iv_context": iv_context,
@@ -8456,6 +8487,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "should_alert_now": snapshot.get("should_alert_now"),
         "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
         "why_now": summary_note,
+        "macro_brief": snapshot.get("macro_brief"),
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "breakout_hold_pending": snapshot.get("breakout_hold_pending"),
         "thesis_gate_pending": snapshot.get("thesis_gate_pending"),
