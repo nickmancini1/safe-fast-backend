@@ -4844,22 +4844,34 @@ def _build_trade_day_state_details(
         if hold_reference is not None:
             level_text = _format_trade_day_level(hold_reference) or str(hold_reference)
             side_text = "above resistance" if long_style else "below support"
-            trigger_line = f"Breakout attempted, but the required 1H hold {side_text} at {level_text} is not proven yet."
+            trigger_line = f"Confirmation is still missing: the required 1H hold {side_text} at {level_text} is not proven yet."
         else:
-            trigger_line = "Breakout attempted, but the required 1H hold is not proven yet."
+            trigger_line = "Confirmation is still missing: the required 1H hold is not proven yet."
     elif trigger_reason == "waiting_for_completed_breakout_close":
         if trigger_level is not None:
             level_text = _format_trade_day_level(trigger_level) or str(trigger_level)
             side_text = "through resistance" if long_style else "through support"
-            trigger_line = f"Price traded through {level_text} intrabar, but there is no completed 1H close {side_text} yet."
+            trigger_line = f"Confirmation is still missing: price traded through {level_text} intrabar, but there is no completed 1H close {side_text} yet."
         else:
-            trigger_line = "Price pushed through intrabar, but there is no completed 1H breakout close yet."
+            trigger_line = "Confirmation is still missing: price pushed through intrabar, but there is no completed 1H breakout close yet."
     elif trigger_reason == "close_trigger_not_hit" and trigger_level is not None:
         level_text = _format_trade_day_level(trigger_level) or str(trigger_level)
         side_text = "through resistance" if long_style else "through support"
-        trigger_line = f"No completed 1H close {side_text} at {level_text} yet."
+        trigger_line = f"Confirmation is still missing: there is no completed 1H close {side_text} at {level_text} yet."
     elif trigger_state.get("trigger_present") is True:
-        trigger_line = "The live trigger is approved now."
+        trigger_line = "Confirmation is live now: the trigger is approved."
+    elif trigger_level is not None and current_close is not None:
+        trigger_text = _format_trade_day_level(trigger_level) or str(trigger_level)
+        if price_pushed_through_trigger:
+            if structure_ready is False:
+                trigger_line = f"Confirmation is still missing: price is through the trigger at {trigger_text}, but 1H structure is not clean yet."
+            elif hold_reference is not None:
+                hold_text = _format_trade_day_level(hold_reference) or str(hold_reference)
+                side_text = "above resistance" if long_style else "below support"
+                trigger_line = f"Confirmation is still missing: price is through the trigger, but the 1H hold {side_text} at {hold_text} is not proven yet."
+        else:
+            side_text = "above resistance" if long_style else "below support"
+            trigger_line = f"Confirmation is still missing: price is not holding {side_text} at the trigger {trigger_text} yet."
 
     blocker_line = None
     if structure_context.get("noisy_chop_explicit") is True:
@@ -7434,7 +7446,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "macro_surface_v25_2026_04_16_fix3_on_demand_status_path",
+        "build_tag": "macro_surface_v25_2026_04_16_fix4_confirmation_path",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -8055,7 +8067,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "macro_surface_v25_2026_04_16_fix3_on_demand_status_path",
+        "build_tag": "macro_surface_v25_2026_04_16_fix4_confirmation_path",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
@@ -8787,7 +8799,7 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
 
 
 def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    # FIX_MARKER: continuous_status_path_no_dup_v1
+    # FIX_MARKER: continuous_status_path_no_dup_v2_confirmation
     current_state = snapshot.get("current_state")
     latent_structure_state = snapshot.get("latent_structure_state")
     primary_blocker = snapshot.get("primary_blocker")
