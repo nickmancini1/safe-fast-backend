@@ -4924,6 +4924,78 @@ def _derive_trade_day_acceptability_condition(
     return "Get a live SAFE-FAST trigger with structure still clean."
 
 
+
+
+def _strip_after_hours_prefix(reason: Any) -> str:
+    text = str(reason or "").strip()
+    prefix = "After-hours structural read: "
+    if text.startswith(prefix):
+        return text[len(prefix):].strip()
+    return text
+
+
+def _humanize_blocker_key(blocker: Any) -> str:
+    key = str(blocker or "").strip()
+    mapping = {
+        "one_hour_clean_around_ema": "clean 1H structure around the 50 EMA",
+        "clear_room": "clear room to the next level",
+        "early_enough": "early entry quality",
+        "clear_trigger": "a valid trigger",
+        "wall_thesis_fit": "wall-thesis fit",
+        "time_day_gate": "market open / live-entry window",
+        "time_gate_context": "market open / live-entry window",
+        "failed_breakout_hold": "a confirmed breakout hold",
+        "next_bar_hold_failed": "a confirmed breakout hold",
+        "ath_open_air": "rebuilt 1H structure near all-time highs",
+    }
+    return mapping.get(key, key.replace("_", " "))
+
+
+def _humanize_next_step(blocker: Any) -> str:
+    key = str(blocker or "").strip()
+    mapping = {
+        "one_hour_clean_around_ema": "Get clean 1H structure around the 50 EMA.",
+        "clear_room": "Get clear room to the next level.",
+        "early_enough": "Wait for a reset that restores early entry quality.",
+        "clear_trigger": "Wait for a valid trigger.",
+        "wall_thesis_fit": "Fix wall-thesis fit.",
+        "time_day_gate": "Wait for the market to open.",
+        "time_gate_context": "Wait for the market to open.",
+        "failed_breakout_hold": "Rebuild the breakout hold.",
+        "next_bar_hold_failed": "Rebuild the breakout hold.",
+        "ath_open_air": "Rebuild 1H structure near the highs.",
+    }
+    if key in mapping:
+        return mapping[key]
+    human = _humanize_blocker_key(key)
+    if human:
+        human = human[0].upper() + human[1:]
+        return f"Clear {human}."
+    return "Wait for a cleaner SAFE-FAST state."
+
+
+def _derive_also_failing_line(
+    failed_reasons: Optional[List[Any]],
+    primary_reason: Any,
+    max_items: int = 2,
+) -> Optional[str]:
+    primary_clean = _strip_after_hours_prefix(primary_reason).strip().rstrip(".").lower()
+    items: List[str] = []
+    for reason in failed_reasons or []:
+        clean = str(reason or "").strip().rstrip(".")
+        if not clean:
+            continue
+        if primary_clean and clean.lower() == primary_clean:
+            continue
+        if clean not in items:
+            items.append(clean)
+        if len(items) >= max_items:
+            break
+    if not items:
+        return None
+    return "; ".join(items) + "."
+
+
 def _build_trade_day_response_lines(
     *,
     good_idea_now: Any,
@@ -4932,6 +5004,7 @@ def _build_trade_day_response_lines(
     why: Any,
     invalidation: Any,
     what_would_make_it_acceptable: Optional[str] = None,
+    also_failing: Optional[str] = None,
 ) -> List[str]:
     lines = [
         f"GOOD IDEA NOW: {good_idea_now}",
@@ -4939,6 +5012,8 @@ def _build_trade_day_response_lines(
         f"Action: {action}",
         f"Why: {why}",
     ]
+    if also_failing:
+        lines.append(f"Also failing: {also_failing}")
     if what_would_make_it_acceptable:
         lines.append(f"What would make it acceptable: {what_would_make_it_acceptable}")
     lines.append(f"Invalidation: {invalidation}")
@@ -4951,6 +5026,7 @@ def _build_simple_output_block(
     user_facing: Dict[str, Any],
     trigger_state: Dict[str, Any],
     macro_context: Optional[Dict[str, Any]] = None,
+    failed_reasons: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     signal_present = bool(trigger_state.get("trigger_present") is True)
     macro_brief = user_facing.get("macro_brief")
@@ -4963,6 +5039,10 @@ def _build_simple_output_block(
         user_facing.get("good_idea_now"),
     )
     acceptable_condition = _derive_trade_day_acceptability_condition(user_facing, trigger_state)
+    also_failing = _derive_also_failing_line(
+        failed_reasons,
+        user_facing.get("why"),
+    )
     response_lines = _build_trade_day_response_lines(
         good_idea_now=user_facing.get("good_idea_now"),
         ticker=user_facing.get("ticker"),
@@ -4970,6 +5050,7 @@ def _build_simple_output_block(
         why=user_facing.get("why"),
         invalidation=user_facing.get("invalidation"),
         what_would_make_it_acceptable=acceptable_condition,
+        also_failing=also_failing,
     )
 
     return {
@@ -4983,6 +5064,7 @@ def _build_simple_output_block(
         "what_would_make_it_acceptable": acceptable_condition,
         "macro_brief": macro_brief,
         "signal_present": signal_present,
+        "also_failing": also_failing,
         "response_lines": response_lines,
         "response_text": "\n".join(response_lines),
     }
@@ -7400,6 +7482,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             user_facing=user_facing_block,
             trigger_state=trigger_state,
             macro_context=macro_context,
+            failed_reasons=failed_reasons_block,
         ),
         "screened_best_context": screened_best_context_block,
         "market_context": market_context,
@@ -8755,9 +8838,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     elif market_open is False:
         what_changed = "Market is closed, so live entry is off."
     elif next_flip_needed:
-        what_changed = f"Still waiting on {next_flip_needed}."
+        what_changed = f"Still waiting on {_humanize_blocker_key(next_flip_needed)}."
     elif effective_primary_blocker:
-        what_changed = f"Still blocked by {effective_primary_blocker}."
+        what_changed = f"Still blocked by {_humanize_blocker_key(effective_primary_blocker)}."
     else:
         what_changed = "No material state change."
 
@@ -8766,19 +8849,26 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     elif acceptable_condition:
         what_matters_now = acceptable_condition
     elif next_flip_needed:
-        what_matters_now = f"Flip {next_flip_needed}."
+        what_matters_now = _humanize_next_step(next_flip_needed)
     elif effective_primary_blocker:
-        what_matters_now = f"Clear {effective_primary_blocker}."
+        what_matters_now = _humanize_next_step(effective_primary_blocker)
     else:
         what_matters_now = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
+
+    also_failing = _derive_also_failing_line(
+        failed_reasons,
+        summary_note,
+    )
 
     response_lines = [
         headline,
         f"Ticker: {ticker}",
         f"What changed: {what_changed}",
         f"Why: {summary_note}",
-        f"What matters now: {what_matters_now}",
     ]
+    if also_failing:
+        response_lines.append(f"Also failing: {also_failing}")
+    response_lines.append(f"What matters now: {what_matters_now}")
 
     return {
         "ticker": ticker,
@@ -8812,6 +8902,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "headline": headline,
         "what_changed": what_changed,
         "what_matters_now": what_matters_now,
+        "also_failing": also_failing,
         "response_lines": response_lines,
         "response_text": "\n".join(response_lines),
         "macro_brief": snapshot.get("macro_brief"),
