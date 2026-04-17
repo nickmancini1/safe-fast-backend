@@ -4983,24 +4983,32 @@ def _build_trade_day_response_lines(
     why: Any,
     invalidation: Any,
     what_would_make_it_acceptable: Optional[str] = None,
+    status_path: Optional[List[str]] = None,
     status_line: Optional[str] = None,
     blocker_line: Optional[str] = None,
     timing_line: Optional[str] = None,
+    time_line: Optional[str] = None,
 ) -> List[str]:
+    clean_status_path: List[str] = []
+    for item in (status_path or []):
+        if isinstance(item, str) and item.strip() and item.strip() not in clean_status_path:
+            clean_status_path.append(item.strip())
+    for item in [status_line, blocker_line, timing_line, time_line]:
+        if isinstance(item, str) and item.strip() and item.strip() not in clean_status_path:
+            clean_status_path.append(item.strip())
+
     lines = [
         f"GOOD IDEA NOW: {good_idea_now}",
         f"Ticker: {ticker}",
         f"Action: {action}",
-        f"Why: {why}",
     ]
-    if status_line:
-        lines.append(f"Status: {status_line}")
-    if blocker_line:
-        lines.append(f"Blocker: {blocker_line}")
-    if timing_line:
-        lines.append(f"Timing: {timing_line}")
+    if clean_status_path:
+        lines.append("Status path:")
+        lines.extend([f"- {item}" for item in clean_status_path])
+    elif why:
+        lines.append(f"Why: {why}")
     if what_would_make_it_acceptable:
-        lines.append(f"What would make it acceptable: {what_would_make_it_acceptable}")
+        lines.append(f"What matters now: {what_would_make_it_acceptable}")
     lines.append(f"Invalidation: {invalidation}")
     return lines
 
@@ -5045,9 +5053,11 @@ def _build_simple_output_block(
         why=user_facing.get("why"),
         invalidation=user_facing.get("invalidation"),
         what_would_make_it_acceptable=acceptable_condition,
+        status_path=state_details.get("status_path"),
         status_line=state_details.get("trigger_line"),
         blocker_line=state_details.get("blocker_line"),
         timing_line=state_details.get("timing_line"),
+        time_line=state_details.get("time_line"),
     )
 
     return {
@@ -7424,7 +7434,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "macro_surface_v25_2026_04_16_fix2_status_path",
+        "build_tag": "macro_surface_v25_2026_04_16_fix3_on_demand_status_path",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -8045,7 +8055,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "macro_surface_v25_2026_04_16_fix2_status_path",
+        "build_tag": "macro_surface_v25_2026_04_16_fix3_on_demand_status_path",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
