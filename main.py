@@ -7424,7 +7424,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "macro_surface_v25_2026_04_16_fix1",
+        "build_tag": "macro_surface_v25_2026_04_16_fix2_status_path",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -8045,7 +8045,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "macro_surface_v25_2026_04_16_fix1",
+        "build_tag": "macro_surface_v25_2026_04_16_fix2_status_path",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
@@ -8777,6 +8777,7 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
 
 
 def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    # FIX_MARKER: continuous_status_path_no_dup_v1
     current_state = snapshot.get("current_state")
     latent_structure_state = snapshot.get("latent_structure_state")
     primary_blocker = snapshot.get("primary_blocker")
@@ -8838,13 +8839,17 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     next_flip_human = _humanize_trade_day_blocker(next_flip_needed) if next_flip_needed else None
     primary_blocker_human = snapshot.get("primary_blocker_human") or _humanize_trade_day_blocker(effective_primary_blocker)
 
-    summary_note = summary.get("why")
-    if status_summary and status_summary not in str(summary_note or ""):
-        summary_note = f"{summary_note} {status_summary}".strip()
-    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
-        summary_note = f"{summary_note} Underneath that, structure is still {underlying_state}.".strip()
+    summary_note = summary.get("why") or status_summary
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state and underlying_state is not None:
+        if summary_note:
+            summary_note = f"{summary_note} Underneath that, structure is still {underlying_state}.".strip()
+        else:
+            summary_note = f"Underneath that, structure is still {underlying_state}."
     elif market_open is False and underlying_state != current_state and underlying_state is not None:
-        summary_note = f"{summary_note} Underneath that, structure is still {underlying_state}.".strip()
+        if summary_note:
+            summary_note = f"{summary_note} Underneath that, structure is still {underlying_state}.".strip()
+        else:
+            summary_note = f"Underneath that, structure is still {underlying_state}."
 
     if snapshot.get("invalidation_hit"):
         what_changed = "Invalidation hit."
@@ -8891,18 +8896,23 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     else:
         what_matters_now = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
 
+    clean_status_path: List[str] = []
+    for item in status_path or []:
+        if isinstance(item, str) and item.strip() and item not in clean_status_path:
+            clean_status_path.append(item.strip())
+    for item in [status_line, blocker_line, timing_line, time_line]:
+        if isinstance(item, str) and item.strip() and item not in clean_status_path:
+            clean_status_path.append(item.strip())
+
     response_lines = [
         headline,
         f"Ticker: {ticker}",
-        f"What changed: {what_changed}",
-        f"Why: {summary_note}",
     ]
-    if status_line:
-        response_lines.append(f"Status: {status_line}")
-    if blocker_line:
-        response_lines.append(f"Blocker: {blocker_line}")
-    if timing_line:
-        response_lines.append(f"Timing: {timing_line}")
+    if clean_status_path:
+        response_lines.append("Status path:")
+        response_lines.extend([f"- {item}" for item in clean_status_path])
+    elif summary_note:
+        response_lines.append(f"Why: {summary_note}")
     response_lines.append(f"What matters now: {what_matters_now}")
 
     return {
