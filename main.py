@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v25_2026_04_17_fix7_plain_english_secondary_blockers"
+BUILD_TAG = "macro_surface_v25_2026_04_17_fix8_afterhours_context_header"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -8828,8 +8828,13 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         summary.get("setup_state"),
         good_idea_now,
     )
+    market_closed_context_only = bool(market_closed_tester.get("market_closed_context_only"))
+    if market_closed_context_only:
+        action = "wait for next session"
     acceptable_condition = summary.get("what_would_make_it_acceptable")
     headline = "This is a trade now" if good_idea_now == "YES" else "This is not a trade now"
+    if market_closed_context_only:
+        headline = "Market is closed. This is context only."
 
     if snapshot.get("invalidation_hit"):
         what_changed = "Invalidation hit."
@@ -8860,15 +8865,26 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         summary_note,
     )
 
-    response_lines = [
-        headline,
-        f"Ticker: {ticker}",
-        f"What changed: {what_changed}",
-        f"Why: {summary_note}",
-    ]
-    if also_failing:
-        response_lines.append(f"Also failing: {also_failing}")
-    response_lines.append(f"What matters now: {what_matters_now}")
+    if market_closed_context_only:
+        response_lines = [
+            headline,
+            f"Ticker: {ticker}",
+            f"Action: {action}",
+            f"Why: {summary_note}",
+        ]
+        if also_failing:
+            response_lines.append(f"Also failing: {also_failing}")
+        response_lines.append(f"What matters next session: {what_matters_now}")
+    else:
+        response_lines = [
+            headline,
+            f"Ticker: {ticker}",
+            f"What changed: {what_changed}",
+            f"Why: {summary_note}",
+        ]
+        if also_failing:
+            response_lines.append(f"Also failing: {also_failing}")
+        response_lines.append(f"What matters now: {what_matters_now}")
 
     return {
         "ticker": ticker,
