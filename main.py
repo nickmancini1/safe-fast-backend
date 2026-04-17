@@ -23,6 +23,9 @@ from pydantic import BaseModel
 
 from dxlink_candles import get_1h_ema50_snapshot
 
+
+BUILD_TAG = "macro_surface_v25_2026_04_17_fix6_compare_and_afterhours"
+
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
 API_BASE = "https://api.tastyworks.com"
@@ -6431,7 +6434,7 @@ def _build_on_demand_unavailable_payload(
     status_code: int = 503,
 ) -> Dict[str, Any]:
     reason_text = _coerce_error_reason(reason)
-    build_tag = "continuous_compact_ticker_summary_2026_04_13"
+    build_tag = BUILD_TAG
     failed_reasons = [reason_text]
     primary_blocker = "data_unavailable"
 
@@ -7328,7 +7331,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "macro_surface_v25_2026_04_15",
+        "build_tag": BUILD_TAG,
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -7954,7 +7957,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "macro_surface_v25_2026_04_15",
+        "build_tag": BUILD_TAG,
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
@@ -8225,6 +8228,21 @@ def _continuous_meaningful_changed_fields(
     return changes
 
 
+def _continuous_context_changed_fields(
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    changes: Dict[str, Dict[str, Any]] = {}
+
+    def _add(field: str, previous_value: Any, current_value: Any) -> None:
+        changes[field] = {"previous": previous_value, "current": current_value}
+
+    if previous.get("best_ticker") != current.get("best_ticker"):
+        _add("best_ticker", previous.get("best_ticker"), current.get("best_ticker"))
+
+    return changes
+
+
 def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return _continuous_meaningful_changed_fields(previous, current)
 
@@ -8241,16 +8259,23 @@ def _compare_continuous_snapshots(
             "meaningful_transition": False,
             "should_alert_candidate": False,
             "changed_fields": {},
+            "context_changed_fields": {},
             "summary": "Initial shadow snapshot created.",
         }
 
     changed_fields = _continuous_changed_fields(previous, current)
+    context_changed_fields = _continuous_context_changed_fields(previous, current)
     meaningful_transition = bool(changed_fields)
 
     if not meaningful_transition:
         transition_type = "NO_MEANINGFUL_CHANGE"
         severity = "info"
-        summary = "No meaningful state change."
+        if "best_ticker" in context_changed_fields:
+            prev_ticker = context_changed_fields["best_ticker"]["previous"]
+            curr_ticker = context_changed_fields["best_ticker"]["current"]
+            summary = f"No meaningful state change. Harmless ticker reshuffle: {prev_ticker} -> {curr_ticker}."
+        else:
+            summary = "No meaningful state change."
     elif "invalidation_hit" in changed_fields and current.get("invalidation_hit"):
         transition_type = "INVALIDATION_HIT"
         severity = "high"
@@ -8306,6 +8331,7 @@ def _compare_continuous_snapshots(
         "meaningful_transition": meaningful_transition,
         "should_alert_candidate": meaningful_transition,
         "changed_fields": changed_fields,
+        "context_changed_fields": context_changed_fields,
         "summary": summary,
     }
 
@@ -8366,10 +8392,12 @@ def _build_true_transition_context(
             "events": [],
             "watched_fields": watched_fields,
             "changed_fields": {},
+            "context_changed_fields": {},
         }
 
     events: List[Dict[str, Any]] = []
     changed_fields = _continuous_meaningful_changed_fields(previous, current)
+    context_changed_fields = _continuous_context_changed_fields(previous, current)
 
     def _add_event(event: str, previous_value: Any, current_value: Any, severity: str, summary: str) -> None:
         events.append(
@@ -8478,7 +8506,12 @@ def _build_true_transition_context(
     if not transition_detected:
         transition_type = "NO_TRUE_TRANSITION"
         severity = "info"
-        summary = "No true transition."
+        if "best_ticker" in context_changed_fields:
+            prev_ticker = context_changed_fields["best_ticker"]["previous"]
+            curr_ticker = context_changed_fields["best_ticker"]["current"]
+            summary = f"No true transition. Harmless ticker reshuffle: {prev_ticker} -> {curr_ticker}."
+        else:
+            summary = "No true transition."
         primary_event = None
     elif len(events) == 1:
         transition_type = events[0]["event"]
@@ -8507,6 +8540,7 @@ def _build_true_transition_context(
         "events": events,
         "watched_fields": watched_fields,
         "changed_fields": changed_fields,
+        "context_changed_fields": context_changed_fields,
     }
 
 def _build_continuous_alert_decision_context(
