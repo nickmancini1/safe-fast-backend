@@ -6539,7 +6539,7 @@ def _build_on_demand_unavailable_payload(
     status_code: int = 503,
 ) -> Dict[str, Any]:
     reason_text = _coerce_error_reason(reason)
-    build_tag = "continuous_compact_ticker_summary_2026_04_13"
+    build_tag = "macro_surface_v25_2026_04_17_fix5_continuous_transition_readable"
     failed_reasons = [reason_text]
     primary_blocker = "data_unavailable"
 
@@ -7446,7 +7446,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     return {
         "ok": True,
         "mode": "on_demand",
-        "build_tag": "macro_surface_v25_2026_04_16_fix4_confirmation_path",
+        "build_tag": "macro_surface_v25_2026_04_17_fix5_continuous_transition_readable",
         "session_basis_context": _build_session_basis_context(),
         "source_of_truth": "candidate_engine",
         "read_this_first": "simple_output",
@@ -8067,7 +8067,7 @@ def _build_continuous_snapshot(
         "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
         "request_profile": request_payload,
         "shadow_request_profile": shadow_request_profile,
-        "build_tag": "macro_surface_v25_2026_04_16_fix4_confirmation_path",
+        "build_tag": "macro_surface_v25_2026_04_17_fix5_continuous_transition_readable",
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
@@ -8363,6 +8363,205 @@ def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]
 
 
 
+
+
+def _format_continuous_transition_value(field: str, value: Any) -> str:
+    if field in {"primary_blocker", "next_flip_needed"}:
+        human = _humanize_trade_day_blocker(value)
+        return human or "none"
+    if field == "best_ticker":
+        return str(value or "none")
+    if field == "final_verdict":
+        return str(value or "UNCONFIRMED")
+    if field == "global_gate_failures":
+        values = _ordered_unique_strings(value or [])
+        return ", ".join(values) if values else "none"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if value is None:
+        return "none"
+    return str(value)
+
+
+def _build_continuous_transition_change_line(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+    transition_context: Dict[str, Any],
+) -> str:
+    if not previous:
+        return "Started tracking this continuous profile."
+
+    if not bool(transition_context.get("transition_detected")):
+        return "No meaningful state change since the last check."
+
+    changed_fields = transition_context.get("changed_fields") or {}
+    primary_event = str(transition_context.get("primary_event") or "").strip()
+
+    if primary_event == "INVALIDATION_HIT":
+        return "Invalidation just hit. Exit now."
+
+    if primary_event == "FINAL_VERDICT_CHANGED":
+        return (
+            f"Verdict changed from "
+            f"{_format_continuous_transition_value('final_verdict', previous.get('final_verdict'))} "
+            f"to {_format_continuous_transition_value('final_verdict', current.get('final_verdict'))}."
+        )
+
+    if primary_event == "PRIMARY_BLOCKER_CHANGED":
+        prev_value = _format_continuous_transition_value("primary_blocker", previous.get("primary_blocker"))
+        curr_value = _format_continuous_transition_value("primary_blocker", current.get("primary_blocker"))
+        return f"Primary blocker changed from {prev_value} to {curr_value}."
+
+    if primary_event == "COMPLETED_CANDLE_APPROVAL_CHANGED":
+        return (
+            "Completed-candle approval just turned on."
+            if current.get("approval_ready_on_completed_candle")
+            else "Completed-candle approval just turned off."
+        )
+
+    if primary_event == "INTRABAR_APPROVAL_CHANGED":
+        return (
+            "Intrabar approval just turned on."
+            if current.get("approval_ready_now")
+            else "Intrabar approval just turned off."
+        )
+
+    if primary_event == "BREAKOUT_HOLD_CHANGED":
+        return (
+            "Breakout crossed, but the hold above resistance is still not proven yet."
+            if current.get("breakout_hold_pending")
+            else "The breakout-hold issue cleared."
+        )
+
+    if primary_event == "FINAL_GATE_CHANGED":
+        prev_value = _format_continuous_transition_value("global_gate_failures", (changed_fields.get("global_gate_failures") or {}).get("previous"))
+        curr_value = _format_continuous_transition_value("global_gate_failures", (changed_fields.get("global_gate_failures") or {}).get("current"))
+        return f"Final gate blockers changed from {prev_value} to {curr_value}."
+
+    if primary_event == "WINNER_CHANGED_WITH_STATE_CHANGE":
+        return (
+            f"Best ticker changed from "
+            f"{_format_continuous_transition_value('best_ticker', previous.get('best_ticker'))} "
+            f"to {_format_continuous_transition_value('best_ticker', current.get('best_ticker'))}."
+        )
+
+    if primary_event == "ACCOUNT_STATE_CHANGED":
+        prev_open = previous.get("open_positions")
+        curr_open = current.get("open_positions")
+        prev_week = previous.get("weekly_trade_count")
+        curr_week = current.get("weekly_trade_count")
+        return f"Account state changed: open positions {prev_open} → {curr_open}, weekly trade count {prev_week} → {curr_week}."
+
+    if primary_event == "NEXT_FLIP_CHANGED":
+        prev_value = _format_continuous_transition_value("next_flip_needed", previous.get("next_flip_needed"))
+        curr_value = _format_continuous_transition_value("next_flip_needed", current.get("next_flip_needed"))
+        return f"Next required flip changed from {prev_value} to {curr_value}."
+
+    if primary_event == "MULTIPLE_TRUE_TRANSITIONS":
+        event_lines = []
+        for event in (transition_context.get("events") or [])[:3]:
+            evt = str(event.get("event") or "")
+            if evt == "PRIMARY_BLOCKER_CHANGED":
+                event_lines.append(
+                    f"primary blocker: {_format_continuous_transition_value('primary_blocker', event.get('previous'))} → "
+                    f"{_format_continuous_transition_value('primary_blocker', event.get('current'))}"
+                )
+            elif evt == "NEXT_FLIP_CHANGED":
+                event_lines.append(
+                    f"next flip: {_format_continuous_transition_value('next_flip_needed', event.get('previous'))} → "
+                    f"{_format_continuous_transition_value('next_flip_needed', event.get('current'))}"
+                )
+            else:
+                event_lines.append(str(event.get("summary") or evt).strip())
+        return "Multiple state changes: " + " | ".join([line for line in event_lines if line])
+
+    summary = str(transition_context.get("summary") or "").strip()
+    return summary or "Continuous state changed."
+
+
+def _build_continuous_alert_delivery_line(
+    *,
+    alert_decision_context: Dict[str, Any],
+) -> str:
+    if alert_decision_context.get("replay_profile_active"):
+        return "Alert delivery is suppressed because this is a replay profile."
+    if alert_decision_context.get("should_alert"):
+        return "Alert delivery is ready now."
+    if alert_decision_context.get("would_alert_now"):
+        return "This would alert now."
+    if alert_decision_context.get("dispatch_state") == "WAITING_FOR_MEANINGFUL_TRANSITION":
+        return "No alert will fire until a meaningful state change happens."
+    return "No alert will fire right now."
+
+
+def _build_continuous_transition_readable(
+    *,
+    previous_snapshot: Optional[Dict[str, Any]],
+    current_snapshot: Dict[str, Any],
+    transition_context: Dict[str, Any],
+    alert_decision_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    readable_summary = current_snapshot.get("readable_summary") or {}
+    ticker = readable_summary.get("ticker") or ((current_snapshot.get("summary") or {}).get("ticker"))
+    transition_detected = bool(transition_context.get("transition_detected"))
+    initial_snapshot = previous_snapshot is None
+    change_line = _build_continuous_transition_change_line(
+        previous_snapshot,
+        current_snapshot,
+        transition_context,
+    )
+    confirmation_line = (
+        readable_summary.get("status_line")
+        or readable_summary.get("blocker_line")
+        or readable_summary.get("timing_line")
+        or readable_summary.get("time_line")
+        or readable_summary.get("why_now")
+    )
+    alert_reason_line = current_snapshot.get("alert_reason") or readable_summary.get("alert_reason")
+    what_matters_now = readable_summary.get("what_matters_now") or readable_summary.get("what_would_make_it_acceptable")
+    delivery_line = _build_continuous_alert_delivery_line(alert_decision_context=alert_decision_context)
+
+    if initial_snapshot:
+        headline = "Initial continuous snapshot"
+    elif transition_detected:
+        headline = "State change detected"
+    else:
+        headline = "No meaningful state change"
+
+    response_lines = [headline]
+    if ticker:
+        response_lines.append(f"Ticker: {ticker}")
+    response_lines.append(f"Change: {change_line}")
+    if confirmation_line:
+        response_lines.append(f"Confirmation: {confirmation_line}")
+    if alert_reason_line:
+        response_lines.append(f"Alert reason: {alert_reason_line}")
+    response_lines.append(f"Alert delivery: {delivery_line}")
+    if what_matters_now:
+        response_lines.append(f"What matters now: {what_matters_now}")
+
+    return {
+        "headline": headline,
+        "ticker": ticker,
+        "transition_detected": transition_detected,
+        "initial_snapshot": initial_snapshot,
+        "transition_type": transition_context.get("transition_type"),
+        "primary_event": transition_context.get("primary_event"),
+        "severity": transition_context.get("severity"),
+        "change_line": change_line,
+        "confirmation_line": confirmation_line,
+        "alert_reason_line": alert_reason_line,
+        "alert_delivery_line": delivery_line,
+        "what_matters_now": what_matters_now,
+        "dispatch_state": alert_decision_context.get("dispatch_state"),
+        "should_alert_now": alert_decision_context.get("should_alert"),
+        "would_alert_now": alert_decision_context.get("would_alert_now"),
+        "suppressed_reasons": alert_decision_context.get("suppressed_reasons") or [],
+        "response_lines": response_lines,
+        "response_text": "\n".join(response_lines),
+    }
+
+
 def _compare_continuous_snapshots(
     previous: Optional[Dict[str, Any]],
     current: Dict[str, Any],
@@ -8395,7 +8594,7 @@ def _compare_continuous_snapshots(
     elif "primary_blocker" in changed_fields:
         transition_type = "PRIMARY_BLOCKER_CHANGED"
         severity = "medium"
-        summary = f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}."
+        summary = f"Primary blocker changed from {_format_continuous_transition_value('primary_blocker', previous.get('primary_blocker'))} to {_format_continuous_transition_value('primary_blocker', current.get('primary_blocker'))}."
     elif "approval_ready_on_completed_candle" in changed_fields:
         transition_type = "COMPLETED_CANDLE_APPROVAL_CHANGED"
         severity = "high" if current.get("approval_ready_on_completed_candle") else "medium"
@@ -8419,7 +8618,7 @@ def _compare_continuous_snapshots(
     elif "best_ticker" in changed_fields:
         transition_type = "WINNER_CHANGED_WITH_STATE_CHANGE"
         severity = "medium"
-        summary = f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')} with a state change."
+        summary = f"Best ticker changed from {_format_continuous_transition_value('best_ticker', previous.get('best_ticker'))} to {_format_continuous_transition_value('best_ticker', current.get('best_ticker'))} with a state change."
     elif "account_state" in changed_fields:
         transition_type = "ACCOUNT_STATE_CHANGED"
         severity = "medium"
@@ -8427,7 +8626,7 @@ def _compare_continuous_snapshots(
     elif "next_flip_needed" in changed_fields:
         transition_type = "NEXT_FLIP_CHANGED"
         severity = "medium"
-        summary = f"Next flip needed changed from {previous.get('next_flip_needed')} to {current.get('next_flip_needed')}."
+        summary = f"Next flip needed changed from {_format_continuous_transition_value('next_flip_needed', previous.get('next_flip_needed'))} to {_format_continuous_transition_value('next_flip_needed', current.get('next_flip_needed'))}."
     else:
         transition_type = "DETAIL_CHANGED"
         severity = "info"
@@ -8541,7 +8740,7 @@ def _build_true_transition_context(
             previous.get("primary_blocker"),
             current.get("primary_blocker"),
             "medium",
-            f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}.",
+            f"Primary blocker changed from {_format_continuous_transition_value('primary_blocker', previous.get('primary_blocker'))} to {_format_continuous_transition_value('primary_blocker', current.get('primary_blocker'))}.",
         )
 
     if "approval_ready_on_completed_candle" in changed_fields:
@@ -8568,7 +8767,7 @@ def _build_true_transition_context(
             previous.get("breakout_hold_pending"),
             current.get("breakout_hold_pending"),
             "medium",
-            "Breakout hold confirmation state changed.",
+            "Breakout-hold confirmation state changed.",
         )
 
     if "global_gate_failures" in changed_fields:
@@ -8586,7 +8785,7 @@ def _build_true_transition_context(
             previous.get("best_ticker"),
             current.get("best_ticker"),
             "medium",
-            f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')} with a state change.",
+            f"Best ticker changed from {_format_continuous_transition_value('best_ticker', previous.get('best_ticker'))} to {_format_continuous_transition_value('best_ticker', current.get('best_ticker'))} with a state change.",
         )
 
     if "account_state" in changed_fields:
@@ -8604,7 +8803,7 @@ def _build_true_transition_context(
             previous.get("next_flip_needed"),
             current.get("next_flip_needed"),
             "medium",
-            f"Next flip needed changed from {previous.get('next_flip_needed')} to {current.get('next_flip_needed')}.",
+            f"Next flip needed changed from {_format_continuous_transition_value('next_flip_needed', previous.get('next_flip_needed'))} to {_format_continuous_transition_value('next_flip_needed', current.get('next_flip_needed'))}.",
         )
 
     transition_detected = bool(events)
@@ -8740,6 +8939,7 @@ def _build_continuous_alert_payload(
         "transition_type": transition_summary.get("transition_type"),
         "severity": transition_summary.get("severity"),
         "message": transition_summary.get("summary"),
+        "transition_readable": current_snapshot.get("transition_readable"),
         "ticker": summary.get("ticker"),
         "state": current_snapshot.get("current_state"),
         "alert_stage": current_snapshot.get("alert_stage"),
@@ -9023,6 +9223,12 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     current_snapshot["should_alert_now"] = should_alert
     current_snapshot["alert_suppressed_reasons"] = alert_decision_context.get("suppressed_reasons") or []
     current_snapshot["readable_summary"] = _build_continuous_readable_summary(current_snapshot)
+    current_snapshot["transition_readable"] = _build_continuous_transition_readable(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_context=true_transition_context,
+        alert_decision_context=alert_decision_context,
+    )
 
     alert_payload = _build_continuous_alert_payload(
         previous_snapshot=previous_snapshot,
@@ -9086,11 +9292,13 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "previous_snapshot_found": bool(previous_snapshot),
         },
         "read_this_first": "readable_summary",
+        "read_this_when_transition_detected": "transition_readable",
         "api_surface": {
             "canonical_continuous_post": "/safe-fast/continuous",
             "canonical_on_demand_post": "/safe-fast/on-demand",
         },
         "readable_summary": current_snapshot.get("readable_summary"),
+        "transition_readable": current_snapshot.get("transition_readable"),
         "alert_candidate_context": current_snapshot.get("alert_candidate_context"),
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
         "replay_test_context": current_snapshot.get("replay_test_context"),
