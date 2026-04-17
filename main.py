@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v25_2026_04_17_fix6_compare_and_afterhours"
+BUILD_TAG = "macro_surface_v25_2026_04_17_fix7_plain_english_secondary_blockers"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
