@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v25_2026_04_17_fix8_afterhours_context_header"
+BUILD_TAG = "macro_surface_v25_2026_04_17_fix9_ondemand_context_header"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -5033,25 +5033,43 @@ def _build_simple_output_block(
     if macro_brief is None and macro_context is not None:
         macro_brief = _build_macro_brief(macro_context)
 
+    why_text = str(user_facing.get("why") or "").strip()
+    market_closed_context = why_text.startswith("After-hours structural read:")
+
     normalized_action = _normalize_trade_day_action(
         user_facing.get("action"),
         user_facing.get("setup_state"),
         user_facing.get("good_idea_now"),
     )
+    if market_closed_context:
+        normalized_action = "wait for next session"
+
     acceptable_condition = _derive_trade_day_acceptability_condition(user_facing, trigger_state)
     also_failing = _derive_also_failing_line(
         failed_reasons,
         user_facing.get("why"),
     )
-    response_lines = _build_trade_day_response_lines(
-        good_idea_now=user_facing.get("good_idea_now"),
-        ticker=user_facing.get("ticker"),
-        action=normalized_action,
-        why=user_facing.get("why"),
-        invalidation=user_facing.get("invalidation"),
-        what_would_make_it_acceptable=acceptable_condition,
-        also_failing=also_failing,
-    )
+
+    if market_closed_context:
+        response_lines = [
+            "Market is closed. This is context only.",
+            f"Ticker: {user_facing.get('ticker')}",
+            f"Action: {normalized_action}",
+            f"Why: {user_facing.get('why')}",
+        ]
+        if also_failing:
+            response_lines.append(f"Also failing: {also_failing}")
+        response_lines.append(f"Invalidation: {user_facing.get('invalidation')}")
+    else:
+        response_lines = _build_trade_day_response_lines(
+            good_idea_now=user_facing.get("good_idea_now"),
+            ticker=user_facing.get("ticker"),
+            action=normalized_action,
+            why=user_facing.get("why"),
+            invalidation=user_facing.get("invalidation"),
+            what_would_make_it_acceptable=acceptable_condition,
+            also_failing=also_failing,
+        )
 
     return {
         "design_goal": "complex_inputs_simple_outputs",
