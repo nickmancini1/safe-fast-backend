@@ -8967,6 +8967,15 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             what_matters_line = None
     blocker_line = f"Blocker: {_humanize_blocker_key(effective_primary_blocker)}." if effective_primary_blocker else None
     alert_reason_line = f"Alert reason: {snapshot.get('alert_reason')}" if snapshot.get("alert_reason") else None
+    if market_closed_context_only:
+        if market_closed_tester.get("would_be_trade_if_open") is True:
+            open_if_open_line = "If market were open: this would be a trade."
+        elif market_closed_tester.get("would_be_trade_if_open") is False:
+            open_if_open_line = "If market were open: this would still not be a trade."
+        else:
+            open_if_open_line = None
+    else:
+        open_if_open_line = None
     if good_idea_now == "YES":
         confirmation_line = "Confirmation: live trigger and approval are confirmed."
     elif snapshot.get("approval_ready_now"):
@@ -9009,6 +9018,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines.append(blocker_line)
         if alert_reason_line:
             response_lines.append(alert_reason_line)
+        if open_if_open_line:
+            response_lines.append(open_if_open_line)
         if also_failing:
             response_lines.append(f"Also failing: {also_failing}")
         if trap_line:
@@ -9069,6 +9080,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
         "alert_stage": snapshot.get("alert_stage"),
         "alert_reason": snapshot.get("alert_reason"),
+        "open_if_open_line": open_if_open_line,
         "alert_dispatch_state": snapshot.get("alert_dispatch_state"),
         "would_alert_now": snapshot.get("would_alert_now"),
         "should_alert_now": snapshot.get("should_alert_now"),
