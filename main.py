@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v25_2026_04_17_fix12_next_session_line"
+BUILD_TAG = "macro_surface_v25_2026_04_17_fix13_continuous_afterhours_invalidation"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -8962,6 +8962,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         if trap_line:
             response_lines.append(f"Trap: {trap_line}")
         response_lines.append(f"What matters next session: {what_matters_now}")
+        if snapshot.get("invalidation"):
+            response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
     else:
         response_lines = [
             headline,
