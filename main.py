@@ -8949,6 +8949,18 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     next_condition_line = f"Next condition: {_humanize_next_step(next_flip_needed)}" if next_flip_needed else None
     blocker_line = f"Blocker: {_humanize_blocker_key(effective_primary_blocker)}." if effective_primary_blocker else None
     alert_reason_line = f"Alert reason: {snapshot.get('alert_reason')}" if snapshot.get("alert_reason") else None
+    if good_idea_now == "YES":
+        confirmation_line = "Confirmation: live trigger and approval are confirmed."
+    elif snapshot.get("approval_ready_now"):
+        confirmation_line = "Confirmation: live trigger is ready now."
+    elif snapshot.get("approval_ready_on_completed_candle"):
+        confirmation_line = "Confirmation: waiting for completed-candle confirmation."
+    elif snapshot.get("breakout_hold_pending"):
+        confirmation_line = "Confirmation: breakout printed, but hold confirmation is still pending."
+    elif snapshot.get("trigger_present"):
+        confirmation_line = "Confirmation: a trigger printed, but it is not confirmed yet."
+    else:
+        confirmation_line = "Confirmation: no live trigger is confirmed yet."
 
     also_failing = _derive_also_failing_line(
         failed_reasons,
@@ -8965,6 +8977,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         ]
         if summary_context_line:
             response_lines.append(f"Context: {summary_context_line}")
+        if confirmation_line:
+            response_lines.append(confirmation_line)
         if blocker_line:
             response_lines.append(blocker_line)
         if alert_reason_line:
@@ -8987,6 +9001,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         ]
         if summary_context_line:
             response_lines.append(f"Context: {summary_context_line}")
+        if confirmation_line:
+            response_lines.append(confirmation_line)
         if blocker_line:
             response_lines.append(blocker_line)
         if alert_reason_line:
@@ -9028,6 +9044,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
         "why_now": summary_note,
         "summary_context_line": summary_context_line,
+        "confirmation_line": confirmation_line,
         "blocker_line": blocker_line,
         "what_would_make_it_acceptable": acceptable_condition,
         "headline": headline,
