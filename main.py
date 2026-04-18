@@ -8937,6 +8937,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
 
     status_text = summary.get("setup_state")
     status_line = f"Status: {status_text}" if status_text else None
+    setup_type = snapshot.get("setup_type")
+    setup_line = f"Setup: {setup_type}" if setup_type else None
 
     if good_idea_now == "YES":
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
@@ -8993,6 +8995,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             headline,
             f"Ticker: {ticker}",
             status_line,
+            setup_line,
             f"Action: {action}",
             f"Why: {summary_note}",
         ]
@@ -9021,6 +9024,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             headline,
             f"Ticker: {ticker}",
             status_line,
+            setup_line,
             f"What changed: {what_changed}",
             f"Why: {summary_note}",
         ]
@@ -9046,6 +9050,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "good_idea_now": good_idea_now,
         "action": action,
         "setup_state": summary.get("setup_state"),
+        "setup_type": setup_type,
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
