@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v25_2026_04_17_fix10_afterhours_action_parity"
+BUILD_TAG = "macro_surface_v25_2026_04_17_fix11_trap_line"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4997,6 +4997,56 @@ def _derive_also_failing_line(
     return "; ".join(items) + "."
 
 
+def _derive_trap_line(
+    trap_check_context: Optional[Dict[str, Any]],
+    max_items: int = 2,
+) -> Optional[str]:
+    trap_check_context = trap_check_context or {}
+    if trap_check_context.get("trap_check_status") != "fail":
+        return None
+
+    checks = trap_check_context.get("checks") or {}
+    ordered_keys = [
+        "hidden_left_structure",
+        "noisy_chop",
+        "overextension_vs_ema",
+        "volume_climax_exhaustion",
+        "parabolic_exhaustion",
+    ]
+    label_map = {
+        "hidden_left_structure": "hidden left structure",
+        "noisy_chop": "noisy chop",
+        "overextension_vs_ema": "overextension vs 1H 50 EMA",
+        "volume_climax_exhaustion": "volume climax / exhaustion",
+        "parabolic_exhaustion": "parabolic exhaustion",
+    }
+
+    items: List[str] = []
+    for key in ordered_keys:
+        check = checks.get(key) or {}
+        if check.get("status") != "fail":
+            continue
+        label = label_map.get(key) or _humanize_blocker_key(key)
+        if not label:
+            continue
+        if label not in items:
+            items.append(label)
+        if len(items) >= max_items:
+            break
+
+    if not items:
+        primary_trap = str(trap_check_context.get("primary_trap") or "").strip()
+        if primary_trap:
+            label = label_map.get(primary_trap) or _humanize_blocker_key(primary_trap)
+            if label:
+                items.append(label)
+
+    if not items:
+        return None
+
+    return "; ".join(items) + "."
+
+
 def _build_trade_day_response_lines(
     *,
     good_idea_now: Any,
@@ -5028,6 +5078,7 @@ def _build_simple_output_block(
     trigger_state: Dict[str, Any],
     macro_context: Optional[Dict[str, Any]] = None,
     failed_reasons: Optional[List[Any]] = None,
+    trap_check_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     signal_present = bool(trigger_state.get("trigger_present") is True)
     macro_brief = user_facing.get("macro_brief")
@@ -5050,6 +5101,7 @@ def _build_simple_output_block(
         failed_reasons,
         user_facing.get("why"),
     )
+    trap_line = _derive_trap_line(trap_check_context)
 
     if market_closed_context:
         response_lines = [
@@ -5060,6 +5112,8 @@ def _build_simple_output_block(
         ]
         if also_failing:
             response_lines.append(f"Also failing: {also_failing}")
+        if trap_line:
+            response_lines.append(f"Trap: {trap_line}")
         response_lines.append(f"Invalidation: {user_facing.get('invalidation')}")
     else:
         response_lines = _build_trade_day_response_lines(
@@ -5071,6 +5125,9 @@ def _build_simple_output_block(
             what_would_make_it_acceptable=acceptable_condition,
             also_failing=also_failing,
         )
+        if trap_line:
+            insert_at = max(len(response_lines) - 1, 4)
+            response_lines.insert(insert_at, f"Trap: {trap_line}")
 
     return {
         "design_goal": "complex_inputs_simple_outputs",
@@ -5084,6 +5141,7 @@ def _build_simple_output_block(
         "macro_brief": macro_brief,
         "signal_present": signal_present,
         "also_failing": also_failing,
+        "trap_line": trap_line,
         "response_lines": response_lines,
         "response_text": "\n".join(response_lines),
     }
@@ -7502,6 +7560,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             trigger_state=trigger_state,
             macro_context=macro_context,
             failed_reasons=failed_reasons_block,
+            trap_check_context=trap_check_context_block,
         ),
         "screened_best_context": screened_best_context_block,
         "market_context": market_context,
@@ -8883,6 +8942,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         failed_reasons,
         summary_note,
     )
+    trap_line = _derive_trap_line(snapshot.get("trap_check_context"))
 
     if market_closed_context_only:
         response_lines = [
@@ -8893,6 +8953,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         ]
         if also_failing:
             response_lines.append(f"Also failing: {also_failing}")
+        if trap_line:
+            response_lines.append(f"Trap: {trap_line}")
         response_lines.append(f"What matters next session: {what_matters_now}")
     else:
         response_lines = [
@@ -8903,6 +8965,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         ]
         if also_failing:
             response_lines.append(f"Also failing: {also_failing}")
+        if trap_line:
+            response_lines.append(f"Trap: {trap_line}")
         response_lines.append(f"What matters now: {what_matters_now}")
 
     return {
@@ -8938,6 +9002,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "what_changed": what_changed,
         "what_matters_now": what_matters_now,
         "also_failing": also_failing,
+        "trap_line": trap_line,
         "response_lines": response_lines,
         "response_text": "\n".join(response_lines),
         "macro_brief": snapshot.get("macro_brief"),
@@ -9142,7 +9207,7 @@ async def safe_fast_on_demand_default_simple() -> Any:
         "screened_best_context": payload.get("screened_best_context"),
         "failed_reasons": payload.get("failed_reasons"),
     }
-    
+
 
 @app.post(
     "/safe-fast/on-demand",
