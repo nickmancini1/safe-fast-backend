@@ -8945,6 +8945,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     setup_type = snapshot.get("setup_type")
     setup_line = f"Setup: {setup_type}" if setup_type else None
     trend_line = f"Trend: {ticker_compact_summary.get('trend_label')}" if ticker_compact_summary.get("trend_label") else None
+    if ticker_compact_summary.get("room_pass") is True:
+        room_line = "Room: enough room before the next major level."
+    elif ticker_compact_summary.get("room_pass") is False:
+        room_line = "Room: cramped before the next major level."
+    else:
+        room_line = None
 
     if good_idea_now == "YES":
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
@@ -9012,6 +9018,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             status_line,
             setup_line,
             trend_line,
+            room_line,
             f"Action: {action}",
             f"Why: {summary_note}",
         ]
@@ -9044,6 +9051,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             status_line,
             setup_line,
             trend_line,
+            room_line,
             f"What changed: {what_changed}",
             f"Why: {summary_note}",
         ]
@@ -9072,6 +9080,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "setup_type": setup_type,
         "trend_label": ticker_compact_summary.get("trend_label"),
         "trend_line": trend_line,
+        "room_line": room_line,
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
