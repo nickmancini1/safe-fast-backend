@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v25_2026_04_17_fix13_continuous_afterhours_invalidation"
+BUILD_TAG = "macro_surface_v25_2026_04_17_fix14_continuous_trap_line"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -8197,6 +8197,7 @@ def _build_continuous_snapshot(
     "what_would_make_it_acceptable": simple_output.get("what_would_make_it_acceptable"),
 },
         "market_closed_tester": market_closed_tester,
+        "trap_check_context": on_demand_payload.get("trap_check_context") or {},
         "replay_test_context": {},
         "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
     }
