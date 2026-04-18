@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v25_2026_04_17_fix9_ondemand_context_header"
+BUILD_TAG = "macro_surface_v25_2026_04_17_fix10_afterhours_action_parity"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4042,12 +4042,13 @@ def _build_user_facing_block(
         (market_context.get("is_open") is False)
         or (str(time_day_gate.get("reason") or "").strip().lower() == "market_closed")
     )
+    action_when_blocked = "wait for next session" if market_closed_context else "stand down"
 
     if request.open_positions > 0:
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
-            "action": "stand down",
+            "action": action_when_blocked,
             "invalidation": "No new entry allowed while open_positions > 0.",
             "setup_state": "NO TRADE",
             "why": "You already have 1 open position. SAFE-FAST allows max 1 open trade total.",
@@ -4057,7 +4058,7 @@ def _build_user_facing_block(
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
-            "action": "stand down",
+            "action": action_when_blocked,
             "invalidation": "No new entry allowed after max weekly trade count is reached.",
             "setup_state": "NO TRADE",
             "why": "Weekly trade count is already at or above the SAFE-FAST max.",
@@ -4069,7 +4070,7 @@ def _build_user_facing_block(
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
-            "action": "stand down",
+            "action": action_when_blocked,
             "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
             "setup_state": "NO TRADE",
             "why": _decorate_why(
@@ -4082,7 +4083,7 @@ def _build_user_facing_block(
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
-            "action": "stand down",
+            "action": action_when_blocked,
             "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
             "setup_state": "NO TRADE",
             "why": _decorate_why(
@@ -4100,7 +4101,7 @@ def _build_user_facing_block(
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
-            "action": "stand down",
+            "action": action_when_blocked,
             "invalidation": "No valid candidate engine setup is available.",
             "setup_state": "NO TRADE",
             "why": _decorate_why(why, market_closed_context=False),
@@ -4114,7 +4115,7 @@ def _build_user_facing_block(
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
-                "action": "stand down",
+                "action": action_when_blocked,
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
                 "why": reason,
@@ -4126,7 +4127,7 @@ def _build_user_facing_block(
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
-                "action": "stand down",
+                "action": action_when_blocked,
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
                 "why": reason,
@@ -4138,7 +4139,7 @@ def _build_user_facing_block(
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
-                "action": "stand down",
+                "action": action_when_blocked,
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
                 "why": reason,
@@ -4150,7 +4151,7 @@ def _build_user_facing_block(
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
-                "action": "stand down",
+                "action": action_when_blocked,
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
                 "why": reason,
@@ -4162,7 +4163,7 @@ def _build_user_facing_block(
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
-                "action": "stand down",
+                "action": action_when_blocked,
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
                 "why": reason,
@@ -4174,7 +4175,7 @@ def _build_user_facing_block(
             return {
                 "good_idea_now": "NO",
                 "ticker": ticker,
-                "action": "stand down",
+                "action": action_when_blocked,
                 "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
                 "setup_state": "NO TRADE",
                 "why": reason,
@@ -4184,7 +4185,7 @@ def _build_user_facing_block(
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
-            "action": "context only",
+            "action": "wait for next session",
             "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
             "setup_state": "CONTEXT ONLY",
             "why": "Market is closed. This is context only; any live entry must wait for the next regular session.",
@@ -4212,7 +4213,7 @@ def _build_user_facing_block(
         return {
             "good_idea_now": "NO",
             "ticker": ticker,
-            "action": "stand down",
+            "action": action_when_blocked,
             "invalidation": "No valid new entry from the current combined read.",
             "setup_state": "NO TRADE",
             "why": why,
