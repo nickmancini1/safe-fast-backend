@@ -8951,6 +8951,14 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         room_line = "Room: cramped before the next major level."
     else:
         room_line = None
+    if ticker_compact_summary.get("extension_blocks_now") is True:
+        extension_line = "Extension: stretched enough to be a blocker."
+    elif ticker_compact_summary.get("extension_state") == "extended":
+        extension_line = "Extension: stretched."
+    elif ticker_compact_summary.get("extension_state") == "caution":
+        extension_line = "Extension: elevated, but only a caution."
+    else:
+        extension_line = None
 
     if good_idea_now == "YES":
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
@@ -9019,6 +9027,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             setup_line,
             trend_line,
             room_line,
+            extension_line,
             f"Action: {action}",
             f"Why: {summary_note}",
         ]
@@ -9052,6 +9061,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             setup_line,
             trend_line,
             room_line,
+            extension_line,
             f"What changed: {what_changed}",
             f"Why: {summary_note}",
         ]
@@ -9081,6 +9091,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "trend_label": ticker_compact_summary.get("trend_label"),
         "trend_line": trend_line,
         "room_line": room_line,
+        "extension_line": extension_line,
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
