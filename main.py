@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v25_2026_04_17_fix11_trap_line"
+BUILD_TAG = "macro_surface_v25_2026_04_17_fix12_next_session_line"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -5079,6 +5079,7 @@ def _build_simple_output_block(
     macro_context: Optional[Dict[str, Any]] = None,
     failed_reasons: Optional[List[Any]] = None,
     trap_check_context: Optional[Dict[str, Any]] = None,
+    next_flip_needed: Optional[str] = None,
 ) -> Dict[str, Any]:
     signal_present = bool(trigger_state.get("trigger_present") is True)
     macro_brief = user_facing.get("macro_brief")
@@ -5102,6 +5103,7 @@ def _build_simple_output_block(
         user_facing.get("why"),
     )
     trap_line = _derive_trap_line(trap_check_context)
+    what_matters_next_session = acceptable_condition or _humanize_next_step(next_flip_needed)
 
     if market_closed_context:
         response_lines = [
@@ -5114,6 +5116,8 @@ def _build_simple_output_block(
             response_lines.append(f"Also failing: {also_failing}")
         if trap_line:
             response_lines.append(f"Trap: {trap_line}")
+        if what_matters_next_session:
+            response_lines.append(f"What matters next session: {what_matters_next_session}")
         response_lines.append(f"Invalidation: {user_facing.get('invalidation')}")
     else:
         response_lines = _build_trade_day_response_lines(
@@ -5142,6 +5146,7 @@ def _build_simple_output_block(
         "signal_present": signal_present,
         "also_failing": also_failing,
         "trap_line": trap_line,
+        "what_matters_next_session": what_matters_next_session if market_closed_context else None,
         "response_lines": response_lines,
         "response_text": "\n".join(response_lines),
     }
@@ -7561,6 +7566,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             macro_context=macro_context,
             failed_reasons=failed_reasons_block,
             trap_check_context=trap_check_context_block,
+            next_flip_needed=approval_context_block.get("next_flip_needed"),
         ),
         "screened_best_context": screened_best_context_block,
         "market_context": market_context,
