@@ -8989,9 +8989,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         response_lines = [
             headline,
             f"Ticker: {ticker}",
+            status_line,
             f"Action: {action}",
             f"Why: {summary_note}",
         ]
+        response_lines = [line for line in response_lines if line]
+        response_lines = [line for line in response_lines if line]
         if summary_context_line:
             response_lines.append(f"Context: {summary_context_line}")
         if confirmation_line:
@@ -9014,6 +9017,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         response_lines = [
             headline,
             f"Ticker: {ticker}",
+            status_line,
             f"What changed: {what_changed}",
             f"Why: {summary_note}",
         ]
