@@ -8935,6 +8935,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     else:
         what_changed = "No material state change."
 
+    status_text = summary.get("setup_state")
+    status_line = f"Status: {status_text}" if status_text else None
+
     if good_idea_now == "YES":
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
     elif acceptable_condition:
