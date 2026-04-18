@@ -8909,6 +8909,11 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
 
     good_idea_now = summary.get("good_idea_now")
     ticker = summary.get("ticker")
+    compact_ticker_summaries = snapshot.get("compact_ticker_summaries") or []
+    ticker_compact_summary = next(
+        (item for item in compact_ticker_summaries if item.get("ticker") == ticker),
+        {},
+    )
     action = _normalize_trade_day_action(
         summary.get("action"),
         summary.get("setup_state"),
@@ -8939,6 +8944,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     status_line = f"Status: {status_text}" if status_text else None
     setup_type = snapshot.get("setup_type")
     setup_line = f"Setup: {setup_type}" if setup_type else None
+    trend_line = f"Trend: {ticker_compact_summary.get('trend_label')}" if ticker_compact_summary.get("trend_label") else None
 
     if good_idea_now == "YES":
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
@@ -9005,6 +9011,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             f"Ticker: {ticker}",
             status_line,
             setup_line,
+            trend_line,
             f"Action: {action}",
             f"Why: {summary_note}",
         ]
@@ -9036,6 +9043,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             f"Ticker: {ticker}",
             status_line,
             setup_line,
+            trend_line,
             f"What changed: {what_changed}",
             f"Why: {summary_note}",
         ]
@@ -9062,6 +9070,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "action": action,
         "setup_state": summary.get("setup_state"),
         "setup_type": setup_type,
+        "trend_label": ticker_compact_summary.get("trend_label"),
+        "trend_line": trend_line,
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
