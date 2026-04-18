@@ -8958,9 +8958,13 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     elif snapshot.get("breakout_hold_pending"):
         confirmation_line = "Confirmation: breakout printed, but hold confirmation is still pending."
     elif snapshot.get("trigger_present"):
-        confirmation_line = "Confirmation: a trigger printed, but it is not confirmed yet."
+        confirmation_line = "Confirmation: a trigger printed, but completed-candle approval is still pending."
+    elif next_flip_needed:
+        confirmation_line = f"Confirmation: waiting for {_humanize_next_step(next_flip_needed)} before any trigger can confirm."
+    elif effective_primary_blocker:
+        confirmation_line = f"Confirmation: still blocked by {_humanize_blocker_key(effective_primary_blocker)} before any trigger can confirm."
     else:
-        confirmation_line = "Confirmation: no live trigger is confirmed yet."
+        confirmation_line = "Confirmation: trigger conditions are not ready yet."
 
     also_failing = _derive_also_failing_line(
         failed_reasons,
