@@ -8953,6 +8953,13 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         if next_step_plain:
             next_step_plain = next_step_plain[0].lower() + next_step_plain[1:]
     next_condition_line = f"Next condition: {next_step_text}" if next_step_text else None
+    next_session_line = f"What matters next session: {what_matters_now}"
+    what_matters_line = f"What matters now: {what_matters_now}"
+    if next_condition_line:
+        next_condition_value = next_condition_line.removeprefix("Next condition: ").strip()
+        if next_condition_value == what_matters_now.strip():
+            next_session_line = None
+            what_matters_line = None
     blocker_line = f"Blocker: {_humanize_blocker_key(effective_primary_blocker)}." if effective_primary_blocker else None
     alert_reason_line = f"Alert reason: {snapshot.get('alert_reason')}" if snapshot.get("alert_reason") else None
     if good_idea_now == "YES":
@@ -8999,7 +9006,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines.append(f"Trap: {trap_line}")
         if next_condition_line:
             response_lines.append(next_condition_line)
-        response_lines.append(f"What matters next session: {what_matters_now}")
+        if next_session_line:
+            response_lines.append(next_session_line)
         if snapshot.get("invalidation"):
             response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
     else:
@@ -9023,7 +9031,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines.append(f"Trap: {trap_line}")
         if next_condition_line:
             response_lines.append(next_condition_line)
-        response_lines.append(f"What matters now: {what_matters_now}")
+        if what_matters_line:
+            response_lines.append(what_matters_line)
 
     return {
         "ticker": ticker,
