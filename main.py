@@ -8900,11 +8900,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         if len(top_blockers) >= 3:
             break
 
-    summary_note = summary.get("why")
-    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
-        summary_note = f"{summary.get('why')} Underneath that, structure is still {underlying_state}."
-    elif market_open is False and underlying_state != current_state and underlying_state is not None:
-        summary_note = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
+    summary_note = summary.get("why") or "No clear summary available."
+    summary_context_line = None
+    if market_open is False and underlying_state != current_state and underlying_state is not None:
+        summary_context_line = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
+    elif current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
+        summary_context_line = f"Underneath that, structure is still {underlying_state}."
 
     good_idea_now = summary.get("good_idea_now")
     ticker = summary.get("ticker")
@@ -8945,6 +8946,10 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     else:
         what_matters_now = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
 
+    next_condition_line = f"Next condition: {_humanize_next_step(next_flip_needed)}" if next_flip_needed else None
+    blocker_line = f"Blocker: {_humanize_blocker_key(effective_primary_blocker)}." if effective_primary_blocker else None
+    alert_reason_line = f"Alert reason: {snapshot.get('alert_reason')}" if snapshot.get("alert_reason") else None
+
     also_failing = _derive_also_failing_line(
         failed_reasons,
         summary_note,
@@ -8958,10 +8963,18 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             f"Action: {action}",
             f"Why: {summary_note}",
         ]
+        if summary_context_line:
+            response_lines.append(f"Context: {summary_context_line}")
+        if blocker_line:
+            response_lines.append(blocker_line)
+        if alert_reason_line:
+            response_lines.append(alert_reason_line)
         if also_failing:
             response_lines.append(f"Also failing: {also_failing}")
         if trap_line:
             response_lines.append(f"Trap: {trap_line}")
+        if next_condition_line:
+            response_lines.append(next_condition_line)
         response_lines.append(f"What matters next session: {what_matters_now}")
         if snapshot.get("invalidation"):
             response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
@@ -8972,10 +8985,18 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             f"What changed: {what_changed}",
             f"Why: {summary_note}",
         ]
+        if summary_context_line:
+            response_lines.append(f"Context: {summary_context_line}")
+        if blocker_line:
+            response_lines.append(blocker_line)
+        if alert_reason_line:
+            response_lines.append(alert_reason_line)
         if also_failing:
             response_lines.append(f"Also failing: {also_failing}")
         if trap_line:
             response_lines.append(f"Trap: {trap_line}")
+        if next_condition_line:
+            response_lines.append(next_condition_line)
         response_lines.append(f"What matters now: {what_matters_now}")
 
     return {
@@ -9006,6 +9027,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "should_alert_now": snapshot.get("should_alert_now"),
         "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
         "why_now": summary_note,
+        "summary_context_line": summary_context_line,
+        "blocker_line": blocker_line,
         "what_would_make_it_acceptable": acceptable_condition,
         "headline": headline,
         "what_changed": what_changed,
