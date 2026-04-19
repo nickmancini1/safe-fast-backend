@@ -8951,6 +8951,11 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         room_line = "Room: cramped before the next major level."
     else:
         room_line = None
+    next_major_level = ticker_compact_summary.get("first_wall")
+    if isinstance(next_major_level, (int, float)):
+        next_level_line = f"Next major level: {next_major_level:.2f}."
+    else:
+        next_level_line = None
     if ticker_compact_summary.get("extension_blocks_now") is True:
         extension_line = "Extension: stretched enough to be a blocker."
     elif ticker_compact_summary.get("extension_state") == "extended":
@@ -9042,6 +9047,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             setup_line,
             trend_line,
             room_line,
+            next_level_line,
             extension_line,
             iv_line,
             price_vs_ema_line,
@@ -9078,6 +9084,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             setup_line,
             trend_line,
             room_line,
+            next_level_line,
             extension_line,
             iv_line,
             price_vs_ema_line,
@@ -9110,6 +9117,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "trend_label": ticker_compact_summary.get("trend_label"),
         "trend_line": trend_line,
         "room_line": room_line,
+        "next_level_line": next_level_line,
         "extension_line": extension_line,
         "iv_line": iv_line,
         "price_vs_ema_line": price_vs_ema_line,
