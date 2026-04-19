@@ -8965,6 +8965,15 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         iv_line = f"IV: {snapshot.get('iv_status')}."
     else:
         iv_line = None
+    price_vs_ema = ticker_compact_summary.get("price_vs_ema50_1h")
+    if price_vs_ema == "above":
+        price_vs_ema_line = "Price vs 1H 50 EMA: above."
+    elif price_vs_ema == "below":
+        price_vs_ema_line = "Price vs 1H 50 EMA: below."
+    elif price_vs_ema == "at":
+        price_vs_ema_line = "Price vs 1H 50 EMA: at the line."
+    else:
+        price_vs_ema_line = None
 
     if good_idea_now == "YES":
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
@@ -9035,6 +9044,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             room_line,
             extension_line,
             iv_line,
+            price_vs_ema_line,
             f"Action: {action}",
             f"Why: {summary_note}",
         ]
@@ -9070,6 +9080,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             room_line,
             extension_line,
             iv_line,
+            price_vs_ema_line,
             f"What changed: {what_changed}",
             f"Why: {summary_note}",
         ]
@@ -9101,6 +9112,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "room_line": room_line,
         "extension_line": extension_line,
         "iv_line": iv_line,
+        "price_vs_ema_line": price_vs_ema_line,
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
