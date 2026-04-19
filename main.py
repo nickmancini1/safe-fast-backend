@@ -5047,6 +5047,90 @@ def _derive_trap_line(
     return "; ".join(items) + "."
 
 
+def _surface_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _surface_item_list(*chunks: Any, max_items: int = 4) -> List[str]:
+    items: List[str] = []
+    seen = set()
+    for chunk in chunks:
+        text = _surface_text(chunk)
+        if not text:
+            continue
+        parts = re.split(r"[;\n]+", text)
+        for part in parts:
+            clean = str(part or "").strip().rstrip(".")
+            if not clean:
+                continue
+            normalized = clean.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            items.append(clean)
+            if len(items) >= max_items:
+                return items
+    return items
+
+
+def _build_decisive_response_surface(
+    *,
+    ticker: Any,
+    action: Any,
+    good_idea_now: Any,
+    reason: Any,
+    next_step: Any,
+    invalidation: Any,
+    market_closed_context_only: bool = False,
+    also_failing: Optional[str] = None,
+    trap_line: Optional[str] = None,
+) -> Dict[str, Any]:
+    ticker_text = _surface_text(ticker)
+    action_text = _surface_text(action)
+    reason_source = _strip_after_hours_prefix(reason) if market_closed_context_only else reason
+    reason_text = _surface_text(reason_source) or "No clear summary available."
+    next_step_text = _surface_text(next_step)
+    invalidation_text = _surface_text(invalidation)
+
+    if next_step_text and invalidation_text:
+        normalized_next_step = next_step_text.rstrip(".").strip().lower()
+        normalized_invalidation = invalidation_text.rstrip(".").strip().lower()
+        if normalized_next_step == normalized_invalidation:
+            next_step_text = None
+
+    watchout_items = _surface_item_list(also_failing, trap_line)
+    watchouts = "; ".join(watchout_items) + "." if watchout_items else None
+
+    if market_closed_context_only:
+        headline = "Market is closed. Context only."
+        next_label = "Next session"
+    else:
+        headline = "Trade now." if str(good_idea_now or "").strip().upper() == "YES" else "No trade now."
+        next_label = "Next"
+
+    response_lines: List[str] = [headline]
+    if ticker_text:
+        response_lines.append(f"Ticker: {ticker_text}")
+    if action_text:
+        response_lines.append(f"Action: {action_text}")
+    response_lines.append(f"Reason: {reason_text}")
+    if watchouts:
+        response_lines.append(f"Watchouts: {watchouts}")
+    if next_step_text:
+        response_lines.append(f"{next_label}: {next_step_text}")
+    if invalidation_text:
+        response_lines.append(f"Invalidation: {invalidation_text}")
+
+    return {
+        "headline": headline,
+        "watchouts": watchouts,
+        "next_step": next_step_text,
+        "response_lines": response_lines,
+        "response_text": "\n".join(response_lines),
+    }
+
+
 def _build_trade_day_response_lines(
     *,
     good_idea_now: Any,
@@ -5056,19 +5140,20 @@ def _build_trade_day_response_lines(
     invalidation: Any,
     what_would_make_it_acceptable: Optional[str] = None,
     also_failing: Optional[str] = None,
+    trap_line: Optional[str] = None,
 ) -> List[str]:
-    lines = [
-        f"GOOD IDEA NOW: {good_idea_now}",
-        f"Ticker: {ticker}",
-        f"Action: {action}",
-        f"Why: {why}",
-    ]
-    if also_failing:
-        lines.append(f"Also failing: {also_failing}")
-    if what_would_make_it_acceptable:
-        lines.append(f"What would make it acceptable: {what_would_make_it_acceptable}")
-    lines.append(f"Invalidation: {invalidation}")
-    return lines
+    surface = _build_decisive_response_surface(
+        ticker=ticker,
+        action=action,
+        good_idea_now=good_idea_now,
+        reason=why,
+        next_step=what_would_make_it_acceptable,
+        invalidation=invalidation,
+        market_closed_context_only=False,
+        also_failing=also_failing,
+        trap_line=trap_line,
+    )
+    return surface.get("response_lines") or []
 
 
 
@@ -5103,35 +5188,19 @@ def _build_simple_output_block(
         user_facing.get("why"),
     )
     trap_line = _derive_trap_line(trap_check_context)
-    what_matters_next_session = acceptable_condition or _humanize_next_step(next_flip_needed)
+    next_step = acceptable_condition or _humanize_next_step(next_flip_needed)
 
-    if market_closed_context:
-        response_lines = [
-            "Market is closed. This is context only.",
-            f"Ticker: {user_facing.get('ticker')}",
-            f"Action: {normalized_action}",
-            f"Why: {user_facing.get('why')}",
-        ]
-        if also_failing:
-            response_lines.append(f"Also failing: {also_failing}")
-        if trap_line:
-            response_lines.append(f"Trap: {trap_line}")
-        if what_matters_next_session:
-            response_lines.append(f"What matters next session: {what_matters_next_session}")
-        response_lines.append(f"Invalidation: {user_facing.get('invalidation')}")
-    else:
-        response_lines = _build_trade_day_response_lines(
-            good_idea_now=user_facing.get("good_idea_now"),
-            ticker=user_facing.get("ticker"),
-            action=normalized_action,
-            why=user_facing.get("why"),
-            invalidation=user_facing.get("invalidation"),
-            what_would_make_it_acceptable=acceptable_condition,
-            also_failing=also_failing,
-        )
-        if trap_line:
-            insert_at = max(len(response_lines) - 1, 4)
-            response_lines.insert(insert_at, f"Trap: {trap_line}")
+    surface = _build_decisive_response_surface(
+        ticker=user_facing.get("ticker"),
+        action=normalized_action,
+        good_idea_now=user_facing.get("good_idea_now"),
+        reason=user_facing.get("why"),
+        next_step=next_step,
+        invalidation=user_facing.get("invalidation"),
+        market_closed_context_only=market_closed_context,
+        also_failing=also_failing,
+        trap_line=trap_line,
+    )
 
     return {
         "design_goal": "complex_inputs_simple_outputs",
@@ -5146,9 +5215,12 @@ def _build_simple_output_block(
         "signal_present": signal_present,
         "also_failing": also_failing,
         "trap_line": trap_line,
-        "what_matters_next_session": what_matters_next_session if market_closed_context else None,
-        "response_lines": response_lines,
-        "response_text": "\n".join(response_lines),
+        "watchouts": surface.get("watchouts"),
+        "headline": surface.get("headline"),
+        "next_step": surface.get("next_step") or next_step,
+        "what_matters_next_session": (surface.get("next_step") or next_step) if market_closed_context else None,
+        "response_lines": surface.get("response_lines") or [],
+        "response_text": surface.get("response_text") or "",
     }
 
 
@@ -8879,10 +8951,6 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     market_closed_tester = snapshot.get("market_closed_tester") or {}
     replay_test_context = snapshot.get("replay_test_context") or {}
 
-    transition_summary = snapshot.get("transition_summary") or {}
-    true_transition_context = snapshot.get("true_transition_context") or {}
-    previous_snapshot = snapshot.get("previous_snapshot")
-
     underlying_state = current_state
     if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and latent_structure_state:
         underlying_state = latent_structure_state
@@ -8904,20 +8972,14 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         if len(top_blockers) >= 3:
             break
 
-    summary_note = summary.get("why") or "No clear summary available."
-    summary_context_line = None
-    if market_open is False and underlying_state != current_state and underlying_state is not None:
-        summary_context_line = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
-    elif current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
-        summary_context_line = f"Underneath that, structure is still {underlying_state}."
+    summary_note = summary.get("why")
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
+        summary_note = f"{summary.get('why')} Underneath that, structure is still {underlying_state}."
+    elif market_open is False and underlying_state != current_state and underlying_state is not None:
+        summary_note = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
 
     good_idea_now = summary.get("good_idea_now")
     ticker = summary.get("ticker")
-    compact_ticker_summaries = snapshot.get("compact_ticker_summaries") or []
-    ticker_compact_summary = next(
-        (item for item in compact_ticker_summaries if item.get("ticker") == ticker),
-        {},
-    )
     action = _normalize_trade_day_action(
         summary.get("action"),
         summary.get("setup_state"),
@@ -8927,122 +8989,21 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     if market_closed_context_only:
         action = "wait for next session"
     acceptable_condition = summary.get("what_would_make_it_acceptable")
-    headline = "This is a trade now" if good_idea_now == "YES" else "This is not a trade now"
-    if market_closed_context_only:
-        headline = "Market is closed. This is context only."
-
-    transition_label = true_transition_context.get("summary") or transition_summary.get("summary")
-    meaningful_transition = bool(true_transition_context.get("meaningful_transition") or transition_summary.get("meaningful_transition"))
-    transition_type = true_transition_context.get("transition_type") or transition_summary.get("transition_type")
-    if transition_type == "INITIAL_SNAPSHOT":
-        update_line = None
-    elif previous_snapshot is not None and not meaningful_transition:
-        update_line = "No meaningful change since the last check."
-    elif transition_label:
-        update_line = f"Changed: {transition_label}"
-    else:
-        update_line = None
+    would_be_trade_if_open = market_closed_tester.get("would_be_trade_if_open")
+    alert_reason = snapshot.get("alert_reason")
 
     if snapshot.get("invalidation_hit"):
-        what_changed = "Invalidation hit."
+        what_changed = "Invalidation hit, so the setup is no longer valid."
     elif good_idea_now == "YES":
-        what_changed = "Trigger and approval are live."
+        what_changed = "Trigger is live and the required approval gates are passing."
     elif market_open is False:
-        what_changed = "Market is closed, so live entry is off."
+        what_changed = "Market is closed, so no live entry can be taken."
     elif next_flip_needed:
-        what_changed = f"Still waiting on {_humanize_blocker_key(next_flip_needed)}."
+        what_changed = f"The next missing condition is {_humanize_blocker_key(next_flip_needed)}."
     elif effective_primary_blocker:
-        what_changed = f"Still blocked by {_humanize_blocker_key(effective_primary_blocker)}."
+        what_changed = f"The main blocker right now is {_humanize_blocker_key(effective_primary_blocker)}."
     else:
         what_changed = "No material state change."
-
-    status_text = summary.get("setup_state")
-    status_line = f"Status: {status_text}" if status_text else None
-    setup_type = snapshot.get("setup_type")
-    setup_line = f"Setup: {setup_type}" if setup_type else None
-    trend_label_value = ticker_compact_summary.get("trend_label")
-    trend_line = f"Trend: {trend_label_value}" if trend_label_value else None
-    if ticker_compact_summary.get("room_pass") is True:
-        room_line = "Room: enough room before the next major level."
-    elif ticker_compact_summary.get("room_pass") is False:
-        room_line = "Room: cramped before the next major level."
-    else:
-        room_line = None
-    next_major_level = ticker_compact_summary.get("first_wall")
-    if isinstance(next_major_level, (int, float)):
-        next_level_line = f"Next major level: {next_major_level:.2f}."
-    else:
-        next_level_line = None
-    if ticker_compact_summary.get("extension_blocks_now") is True:
-        extension_line = "Extension: stretched enough to be a blocker."
-    elif ticker_compact_summary.get("extension_state") == "extended":
-        extension_line = "Extension: stretched."
-    elif ticker_compact_summary.get("extension_state") == "caution":
-        extension_line = "Extension: elevated, but only a caution."
-    else:
-        extension_line = None
-    if snapshot.get("iv_status") == "unconfirmed":
-        iv_line = "IV: unconfirmed in this build."
-    elif snapshot.get("iv_status"):
-        iv_line = f"IV: {snapshot.get('iv_status')}."
-    else:
-        iv_line = None
-    price_vs_ema = ticker_compact_summary.get("price_vs_ema50_1h")
-    if price_vs_ema == "above":
-        price_vs_ema_line = "Price vs 1H 50 EMA: above."
-    elif price_vs_ema == "below":
-        price_vs_ema_line = "Price vs 1H 50 EMA: below."
-    elif price_vs_ema == "at":
-        price_vs_ema_line = "Price vs 1H 50 EMA: at the line."
-    else:
-        price_vs_ema_line = None
-
-    if ticker and status_text and setup_type:
-        overview_line = f"Overview: {ticker} is currently {status_text}. It is a {setup_type} setup."
-    elif ticker and status_text:
-        overview_line = f"Overview: {ticker} is currently {status_text}."
-    elif ticker and setup_type:
-        overview_line = f"Overview: {ticker} is a {setup_type} setup."
-    else:
-        overview_line = None
-
-    if ticker and status_text and setup_type:
-        short_overview_line = f"{ticker}: {status_text} ({setup_type})."
-    elif ticker and status_text:
-        short_overview_line = f"{ticker}: {status_text}."
-    elif ticker and setup_type:
-        short_overview_line = f"{ticker}: {setup_type}."
-    elif ticker:
-        short_overview_line = f"Ticker: {ticker}"
-    else:
-        short_overview_line = None
-
-    context_bits: List[str] = []
-    if trend_label_value:
-        context_bits.append(f"trend is {trend_label_value.lower()}")
-    if ticker_compact_summary.get("room_pass") is True:
-        context_bits.append("there is enough room before the next major level")
-    elif ticker_compact_summary.get("room_pass") is False:
-        context_bits.append("room is cramped before the next major level")
-    if isinstance(next_major_level, (int, float)):
-        context_bits.append(f"the next major level is {next_major_level:.2f}")
-    if ticker_compact_summary.get("extension_blocks_now") is True:
-        context_bits.append("extension is stretched enough to block")
-    elif ticker_compact_summary.get("extension_state") == "extended":
-        context_bits.append("extension is stretched")
-    elif ticker_compact_summary.get("extension_state") == "caution":
-        context_bits.append("extension is only a caution")
-    if snapshot.get("iv_status") == "unconfirmed":
-        context_bits.append("IV is unconfirmed in this build")
-    elif snapshot.get("iv_status"):
-        context_bits.append(f"IV is {snapshot.get('iv_status')}")
-    if price_vs_ema == "above":
-        context_bits.append("price is above the 1H 50 EMA")
-    elif price_vs_ema == "below":
-        context_bits.append("price is below the 1H 50 EMA")
-    elif price_vs_ema == "at":
-        context_bits.append("price is sitting on the 1H 50 EMA")
-    context_summary_line = f"Context: {'; '.join(context_bits)}." if context_bits else None
 
     if good_idea_now == "YES":
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
@@ -9055,219 +9016,29 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     else:
         what_matters_now = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
 
-    if good_idea_now == "YES":
-        decision_line = "Decision: trade is live now."
-    elif market_closed_context_only and market_closed_tester.get("would_be_trade_if_open") is True:
-        decision_line = "Decision: not live now only because the market is closed."
-    elif market_closed_context_only and market_closed_tester.get("would_be_trade_if_open") is False:
-        decision_line = "Decision: still not a trade, even if the market were open."
-    elif next_flip_needed:
-        decision_line = f"Decision: not a trade yet. Still waiting for {_humanize_blocker_key(next_flip_needed)}."
-    elif effective_primary_blocker:
-        decision_line = f"Decision: not a trade. Blocked by {_humanize_blocker_key(effective_primary_blocker)}."
-    elif market_open is False:
-        decision_line = "Decision: not live now because the market is closed."
-    else:
-        decision_line = "Decision: not a trade right now."
-
-    next_step_text = _humanize_next_step(next_flip_needed) if next_flip_needed else None
-    next_step_plain = next_step_text.rstrip(".") if next_step_text else None
-    if next_step_plain and next_step_plain.startswith("Get "):
-        next_step_plain = next_step_plain[4:]
-        if next_step_plain:
-            next_step_plain = next_step_plain[0].lower() + next_step_plain[1:]
-    next_condition_line = f"Next condition: {next_step_text}" if next_step_text else None
-    next_session_line = f"What matters next session: {what_matters_now}"
-    what_matters_line = f"What matters now: {what_matters_now}"
-    reason_line = f"Why: {summary_note}"
-    action_line = f"Action: {action}"
-    invalidation_line = f"Invalidation: {snapshot.get('invalidation')}" if snapshot.get("invalidation") else None
-    if next_condition_line:
-        next_condition_value = next_condition_line.removeprefix("Next condition: ").strip()
-        if next_condition_value == what_matters_now.strip():
-            next_session_line = None
-            what_matters_line = None
-    blocker_line = f"Blocker: {_humanize_blocker_key(effective_primary_blocker)}." if effective_primary_blocker else None
-    show_blocker_line = bool(
-        blocker_line
-        and (
-            effective_primary_blocker is None
-            or next_flip_needed is None
-            or effective_primary_blocker != next_flip_needed
-        )
-    )
-    alert_reason_line = f"Alert reason: {snapshot.get('alert_reason')}" if snapshot.get("alert_reason") else None
-    show_alert_reason_line = bool(
-        alert_reason_line
-        and (
-            not market_closed_context_only
-            or str(snapshot.get("alert_reason") or "").strip() != "Entry window is closed."
-        )
-    )
-    if market_closed_context_only:
-        if market_closed_tester.get("would_be_trade_if_open") is True:
-            open_if_open_line = "If market were open: this would be a trade."
-            concise_open_check_line = "Open check: this would be a trade if the market were open."
-        elif market_closed_tester.get("would_be_trade_if_open") is False:
-            open_if_open_line = "If market were open: this would still not be a trade."
-            concise_open_check_line = "Open check: this would still not be a trade if the market were open."
-        else:
-            open_if_open_line = None
-            concise_open_check_line = None
-    else:
-        open_if_open_line = None
-        concise_open_check_line = None
-    if good_idea_now == "YES":
-        confirmation_line = "Confirmation: live trigger and approval are confirmed."
-    elif snapshot.get("approval_ready_now"):
-        confirmation_line = "Confirmation: live trigger is ready now."
-    elif snapshot.get("approval_ready_on_completed_candle"):
-        confirmation_line = "Confirmation: waiting for completed-candle confirmation."
-    elif snapshot.get("breakout_hold_pending"):
-        confirmation_line = "Confirmation: breakout printed, but hold confirmation is still pending."
-    elif snapshot.get("trigger_present"):
-        confirmation_line = "Confirmation: a trigger printed, but completed-candle approval is still pending."
-    elif next_flip_needed:
-        confirmation_line = f"Confirmation: waiting for {next_step_plain} before any trigger can confirm."
-    elif effective_primary_blocker:
-        confirmation_line = f"Confirmation: still blocked by {_humanize_blocker_key(effective_primary_blocker)} before any trigger can confirm."
-    else:
-        confirmation_line = "Confirmation: trigger conditions are not ready yet."
-
     also_failing = _derive_also_failing_line(
         failed_reasons,
         summary_note,
     )
     trap_line = _derive_trap_line(snapshot.get("trap_check_context"))
 
-    is_repeat_no_change = previous_snapshot is not None and not meaningful_transition
-    is_initial_snapshot = transition_type == "INITIAL_SNAPSHOT"
-    use_short_continuous_format = is_repeat_no_change or is_initial_snapshot
-
-    if market_closed_context_only:
-        if use_short_continuous_format:
-            response_lines = [
-                headline,
-                update_line,
-                decision_line,
-                short_overview_line,
-                reason_line,
-            ]
-            response_lines = [line for line in response_lines if line]
-            if show_blocker_line:
-                response_lines.append(blocker_line)
-            if show_alert_reason_line:
-                response_lines.append(alert_reason_line)
-            if next_condition_line:
-                response_lines.append(next_condition_line)
-            elif next_session_line:
-                response_lines.append(next_session_line)
-            if trap_line:
-                response_lines.append(f"Trap: {trap_line}")
-            elif also_failing:
-                response_lines.append(f"Also failing: {also_failing}")
-            if invalidation_line:
-                response_lines.append(invalidation_line)
-        else:
-            response_lines = [
-                headline,
-                update_line,
-                decision_line,
-                overview_line,
-                context_summary_line,
-                action_line,
-                reason_line,
-            ]
-            response_lines = [line for line in response_lines if line]
-            if summary_context_line:
-                response_lines.append(f"Underneath: {summary_context_line}")
-            if confirmation_line:
-                response_lines.append(confirmation_line)
-            if show_blocker_line:
-                response_lines.append(blocker_line)
-            if show_alert_reason_line:
-                response_lines.append(alert_reason_line)
-            if open_if_open_line:
-                response_lines.append(open_if_open_line)
-            if also_failing:
-                response_lines.append(f"Also failing: {also_failing}")
-            if trap_line:
-                response_lines.append(f"Trap: {trap_line}")
-            if next_condition_line:
-                response_lines.append(next_condition_line)
-            if invalidation_line:
-                response_lines.append(invalidation_line)
-    else:
-        what_changed_line = None if use_short_continuous_format else f"What changed: {what_changed}"
-        if use_short_continuous_format:
-            response_lines = [
-                headline,
-                update_line,
-                decision_line,
-                short_overview_line,
-                reason_line,
-            ]
-            response_lines = [line for line in response_lines if line]
-            if show_blocker_line:
-                response_lines.append(blocker_line)
-            if show_alert_reason_line:
-                response_lines.append(alert_reason_line)
-            if next_condition_line:
-                response_lines.append(next_condition_line)
-            elif what_matters_line:
-                response_lines.append(what_matters_line)
-            if trap_line:
-                response_lines.append(f"Trap: {trap_line}")
-            elif also_failing:
-                response_lines.append(f"Also failing: {also_failing}")
-            if invalidation_line:
-                response_lines.append(invalidation_line)
-        else:
-            response_lines = [
-                headline,
-                update_line,
-                decision_line,
-                overview_line,
-                context_summary_line,
-                what_changed_line,
-                reason_line,
-            ]
-            response_lines = [line for line in response_lines if line]
-            if summary_context_line:
-                response_lines.append(f"Underneath: {summary_context_line}")
-            if confirmation_line:
-                response_lines.append(confirmation_line)
-            if blocker_line:
-                response_lines.append(blocker_line)
-            if alert_reason_line:
-                response_lines.append(alert_reason_line)
-            if also_failing:
-                response_lines.append(f"Also failing: {also_failing}")
-            if trap_line:
-                response_lines.append(f"Trap: {trap_line}")
-            if next_condition_line:
-                response_lines.append(next_condition_line)
-            elif what_matters_line:
-                response_lines.append(what_matters_line)
-            if invalidation_line:
-                response_lines.append(invalidation_line)
+    surface = _build_decisive_response_surface(
+        ticker=ticker,
+        action=action,
+        good_idea_now=good_idea_now,
+        reason=summary_note,
+        next_step=what_matters_now,
+        invalidation=snapshot.get("invalidation"),
+        market_closed_context_only=market_closed_context_only,
+        also_failing=also_failing,
+        trap_line=trap_line,
+    )
 
     return {
         "ticker": ticker,
         "good_idea_now": good_idea_now,
         "action": action,
         "setup_state": summary.get("setup_state"),
-        "setup_type": setup_type,
-        "trend_label": ticker_compact_summary.get("trend_label"),
-        "trend_line": trend_line,
-        "room_line": room_line,
-        "next_level_line": next_level_line,
-        "extension_line": extension_line,
-        "iv_line": iv_line,
-        "price_vs_ema_line": price_vs_ema_line,
-        "overview_line": overview_line,
-        "context_summary_line": context_summary_line,
-        "update_line": update_line,
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
@@ -9285,25 +9056,22 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_trade_allowed": replay_test_context.get("replay_trade_allowed"),
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
         "alert_stage": snapshot.get("alert_stage"),
-        "alert_reason": snapshot.get("alert_reason"),
-        "open_if_open_line": open_if_open_line,
+        "alert_reason": alert_reason,
         "alert_dispatch_state": snapshot.get("alert_dispatch_state"),
         "would_alert_now": snapshot.get("would_alert_now"),
         "should_alert_now": snapshot.get("should_alert_now"),
         "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
-        "decision_line": decision_line,
         "why_now": summary_note,
-        "summary_context_line": summary_context_line,
-        "confirmation_line": confirmation_line,
-        "blocker_line": blocker_line,
         "what_would_make_it_acceptable": acceptable_condition,
-        "headline": headline,
+        "headline": surface.get("headline"),
         "what_changed": what_changed,
         "what_matters_now": what_matters_now,
         "also_failing": also_failing,
         "trap_line": trap_line,
-        "response_lines": response_lines,
-        "response_text": "\n".join(response_lines),
+        "watchouts": surface.get("watchouts"),
+        "next_step": surface.get("next_step") or what_matters_now,
+        "response_lines": surface.get("response_lines") or [],
+        "response_text": surface.get("response_text") or "",
         "macro_brief": snapshot.get("macro_brief"),
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
         "breakout_hold_pending": snapshot.get("breakout_hold_pending"),
@@ -9352,9 +9120,6 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     )
     should_alert = bool(alert_decision_context.get("should_alert"))
 
-    current_snapshot["transition_summary"] = transition_summary
-    current_snapshot["true_transition_context"] = true_transition_context
-    current_snapshot["previous_snapshot"] = previous_snapshot
     current_snapshot["alert_dispatch_state"] = alert_decision_context.get("dispatch_state")
     current_snapshot["would_alert_now"] = alert_decision_context.get("would_alert_now")
     current_snapshot["should_alert_now"] = should_alert
