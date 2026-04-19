@@ -9116,21 +9116,31 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
 
     if market_closed_context_only:
         if use_short_continuous_format:
-            response_lines = [
-                headline,
-                short_update_line,
-                short_overview_line,
-                concise_open_check_line,
-                action_line,
-                reason_line,
-            ]
+            if is_repeat_no_change:
+                response_lines = [
+                    headline,
+                    short_update_line,
+                    short_overview_line,
+                    concise_open_check_line,
+                    blocker_line,
+                    compact_next_line,
+                    invalidation_line,
+                ]
+            else:
+                response_lines = [
+                    headline,
+                    short_overview_line,
+                    concise_open_check_line,
+                    reason_line,
+                    blocker_line,
+                    compact_next_line,
+                    invalidation_line,
+                ]
+                if trap_line:
+                    response_lines.insert(-1 if invalidation_line else len(response_lines), f"Trap: {trap_line}")
+                elif also_failing:
+                    response_lines.insert(-1 if invalidation_line else len(response_lines), f"Also failing: {also_failing}")
             response_lines = [line for line in response_lines if line]
-            if blocker_line:
-                response_lines.append(blocker_line)
-            if compact_next_line:
-                response_lines.append(compact_next_line)
-            if invalidation_line:
-                response_lines.append(invalidation_line)
         else:
             response_lines = [
                 headline,
