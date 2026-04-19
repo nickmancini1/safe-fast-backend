@@ -8879,6 +8879,10 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     market_closed_tester = snapshot.get("market_closed_tester") or {}
     replay_test_context = snapshot.get("replay_test_context") or {}
 
+    transition_summary = snapshot.get("transition_summary") or {}
+    true_transition_context = snapshot.get("true_transition_context") or {}
+    previous_snapshot = snapshot.get("previous_snapshot")
+
     underlying_state = current_state
     if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and latent_structure_state:
         underlying_state = latent_structure_state
@@ -8926,6 +8930,18 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     headline = "This is a trade now" if good_idea_now == "YES" else "This is not a trade now"
     if market_closed_context_only:
         headline = "Market is closed. This is context only."
+
+    transition_label = true_transition_context.get("summary") or transition_summary.get("summary")
+    meaningful_transition = bool(true_transition_context.get("meaningful_transition") or transition_summary.get("meaningful_transition"))
+    transition_type = true_transition_context.get("transition_type") or transition_summary.get("transition_type")
+    if transition_type == "INITIAL_SNAPSHOT":
+        update_line = "Update: first continuous snapshot created."
+    elif previous_snapshot is not None and not meaningful_transition:
+        update_line = "Update: no meaningful change since the last check."
+    elif transition_label:
+        update_line = f"Update: {transition_label}"
+    else:
+        update_line = None
 
     if snapshot.get("invalidation_hit"):
         what_changed = "Invalidation hit."
@@ -9079,6 +9095,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     if market_closed_context_only:
         response_lines = [
             headline,
+            update_line,
             overview_line,
             context_summary_line,
             f"Action: {action}",
@@ -9104,11 +9121,13 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         if snapshot.get("invalidation"):
             response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
     else:
+        what_changed_line = None if (previous_snapshot is not None and not meaningful_transition) else f"What changed: {what_changed}"
         response_lines = [
             headline,
+            update_line,
             overview_line,
             context_summary_line,
-            f"What changed: {what_changed}",
+            what_changed_line,
             f"Why: {summary_note}",
         ]
         response_lines = [line for line in response_lines if line]
@@ -9144,6 +9163,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "price_vs_ema_line": price_vs_ema_line,
         "overview_line": overview_line,
         "context_summary_line": context_summary_line,
+        "update_line": update_line,
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
