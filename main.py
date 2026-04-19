@@ -8174,6 +8174,9 @@ def _build_continuous_snapshot(
     iv_context = on_demand_payload.get("iv_context") or {}
     time_day_gate = on_demand_payload.get("time_day_gate") or {}
     market_closed_tester = _build_market_closed_tester_block(on_demand_payload)
+    reason_display = simple_output.get("why") or user_facing.get("why")
+    if market_closed_tester.get("market_closed_context_only"):
+        reason_display = _strip_after_hours_prefix(reason_display)
 
     breakout_hold_pending = bool(
         str(trigger_state.get("why") or "").strip().lower() == "breakout_hold_not_confirmed"
@@ -8201,7 +8204,7 @@ def _build_continuous_snapshot(
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
-        "user_facing_why": user_facing.get("why"),
+        "reason_display": reason_display,
         "primary_blocker": decision_context.get("primary_blocker"),
         "decision_blockers": decision_context.get("blockers") or [],
         "failed_reasons": decision_context.get("failed_reasons") or [],
@@ -8265,7 +8268,6 @@ def _build_continuous_snapshot(
     "action": simple_output.get("action"),
     "setup_state": simple_output.get("setup_state"),
     "good_idea_now": simple_output.get("good_idea_now"),
-    "why": simple_output.get("why"),
     "what_would_make_it_acceptable": simple_output.get("what_would_make_it_acceptable"),
 },
         "market_closed_tester": market_closed_tester,
@@ -8970,9 +8972,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         if len(top_blockers) >= 3:
             break
 
-    summary_note = summary.get("why")
+    summary_note = snapshot.get("reason_display") or summary.get("why")
     if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
-        summary_note = f"{summary.get('why')} Underneath that, structure is still {underlying_state}."
+        summary_note = f"{summary_note} Underneath that, structure is still {underlying_state}."
     elif market_open is False and underlying_state != current_state and underlying_state is not None:
         summary_note = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
 
@@ -9252,7 +9254,7 @@ async def safe_fast_on_demand_default_simple() -> Any:
         "screened_best_context": payload.get("screened_best_context"),
         "failed_reasons": payload.get("failed_reasons"),
     }
-    
+
 
 @app.post(
     "/safe-fast/on-demand",
