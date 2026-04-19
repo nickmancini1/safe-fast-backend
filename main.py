@@ -9006,6 +9006,17 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     else:
         overview_line = None
 
+    if ticker and status_text and setup_type:
+        short_overview_line = f"{ticker}: {status_text} ({setup_type})."
+    elif ticker and status_text:
+        short_overview_line = f"{ticker}: {status_text}."
+    elif ticker and setup_type:
+        short_overview_line = f"{ticker}: {setup_type}."
+    elif ticker:
+        short_overview_line = f"Ticker: {ticker}"
+    else:
+        short_overview_line = None
+
     context_bits: List[str] = []
     if trend_label_value:
         context_bits.append(f"trend is {trend_label_value.lower()}")
@@ -9101,7 +9112,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines = [
                 headline,
                 update_line,
-                overview_line,
+                short_overview_line,
                 f"Action: {action}",
                 f"Why: {summary_note}",
             ]
@@ -9146,7 +9157,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines = [
                 headline,
                 update_line,
-                overview_line,
+                short_overview_line,
                 f"Why: {summary_note}",
             ]
             response_lines = [line for line in response_lines if line]
