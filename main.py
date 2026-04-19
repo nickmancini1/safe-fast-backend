@@ -8866,7 +8866,6 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
 
 
 
-
 def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     current_state = snapshot.get("current_state")
     latent_structure_state = snapshot.get("latent_structure_state")
@@ -8936,7 +8935,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     meaningful_transition = bool(true_transition_context.get("meaningful_transition") or transition_summary.get("meaningful_transition"))
     transition_type = true_transition_context.get("transition_type") or transition_summary.get("transition_type")
     if transition_type == "INITIAL_SNAPSHOT":
-        update_line = None
+        update_line = "Update: first continuous snapshot created."
     elif previous_snapshot is not None and not meaningful_transition:
         update_line = "Update: no meaningful change since the last check."
     elif transition_label:
@@ -8958,7 +8957,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         what_changed = "No material state change."
 
     status_text = summary.get("setup_state")
+    status_line = f"Status: {status_text}" if status_text else None
     setup_type = snapshot.get("setup_type")
+    setup_line = f"Setup: {setup_type}" if setup_type else None
     trend_label_value = ticker_compact_summary.get("trend_label")
     trend_line = f"Trend: {trend_label_value}" if trend_label_value else None
     if ticker_compact_summary.get("room_pass") is True:
@@ -9063,15 +9064,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     next_condition_line = f"Next condition: {next_step_text}" if next_step_text else None
     next_session_line = f"What matters next session: {what_matters_now}"
     what_matters_line = f"What matters now: {what_matters_now}"
-    reason_line = f"Why: {summary_note}"
-    action_line = f"Action: {action}"
     if next_condition_line:
         next_condition_value = next_condition_line.removeprefix("Next condition: ").strip()
         if next_condition_value == what_matters_now.strip():
             next_session_line = None
             what_matters_line = None
     blocker_line = f"Blocker: {_humanize_blocker_key(effective_primary_blocker)}." if effective_primary_blocker else None
-    invalidation_line = f"Invalidation: {snapshot.get('invalidation')}" if snapshot.get("invalidation") else None
     alert_reason_line = f"Alert reason: {snapshot.get('alert_reason')}" if snapshot.get("alert_reason") else None
     if market_closed_context_only:
         if market_closed_tester.get("would_be_trade_if_open") is True:
@@ -9079,7 +9077,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             concise_open_check_line = "Open check: this would be a trade if the market were open."
         elif market_closed_tester.get("would_be_trade_if_open") is False:
             open_if_open_line = "If market were open: this would still not be a trade."
-            concise_open_check_line = None
+            concise_open_check_line = "Open check: this would still not be a trade if the market were open."
         else:
             open_if_open_line = None
             concise_open_check_line = None
@@ -9112,46 +9110,34 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     is_repeat_no_change = previous_snapshot is not None and not meaningful_transition
     is_initial_snapshot = transition_type == "INITIAL_SNAPSHOT"
     use_short_continuous_format = is_repeat_no_change or is_initial_snapshot
-    short_update_line = None if is_initial_snapshot else update_line
-    compact_next_line = next_condition_line or next_session_line or what_matters_line
 
     if market_closed_context_only:
         if use_short_continuous_format:
-            if is_repeat_no_change:
-                response_lines = [
-                    headline,
-                    short_update_line,
-                    short_overview_line,
-                    blocker_line,
-                    compact_next_line,
-                    invalidation_line,
-                ]
-                if concise_open_check_line:
-                    response_lines.insert(3, concise_open_check_line)
-            else:
-                response_lines = [
-                    headline,
-                    short_overview_line,
-                    reason_line,
-                    blocker_line,
-                    compact_next_line,
-                    invalidation_line,
-                ]
-                if concise_open_check_line:
-                    response_lines.insert(2, concise_open_check_line)
-                if trap_line:
-                    response_lines.insert(-1 if invalidation_line else len(response_lines), f"Trap: {trap_line}")
-                elif also_failing:
-                    response_lines.insert(-1 if invalidation_line else len(response_lines), f"Also failing: {also_failing}")
+            response_lines = [
+                headline,
+                update_line,
+                short_overview_line,
+                concise_open_check_line,
+                f"Action: {action}",
+                f"Why: {summary_note}",
+            ]
             response_lines = [line for line in response_lines if line]
+            if blocker_line:
+                response_lines.append(blocker_line)
+            if next_condition_line:
+                response_lines.append(next_condition_line)
+            elif next_session_line:
+                response_lines.append(next_session_line)
+            if invalidation_line:
+                response_lines.append(invalidation_line)
         else:
             response_lines = [
                 headline,
                 update_line,
                 overview_line,
                 context_summary_line,
-                action_line,
-                reason_line,
+                f"Action: {action}",
+                f"Why: {summary_note}",
             ]
             response_lines = [line for line in response_lines if line]
             if summary_context_line:
@@ -9168,23 +9154,26 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 response_lines.append(f"Also failing: {also_failing}")
             if trap_line:
                 response_lines.append(f"Trap: {trap_line}")
-            if compact_next_line:
-                response_lines.append(compact_next_line)
-            if invalidation_line:
-                response_lines.append(invalidation_line)
+            if next_condition_line:
+                response_lines.append(next_condition_line)
+            if snapshot.get("invalidation"):
+                response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
     else:
         what_changed_line = None if use_short_continuous_format else f"What changed: {what_changed}"
         if use_short_continuous_format:
             response_lines = [
                 headline,
-                short_update_line,
+                update_line,
                 short_overview_line,
-                reason_line,
-                blocker_line,
-                compact_next_line,
-                invalidation_line,
+                f"Why: {summary_note}",
             ]
             response_lines = [line for line in response_lines if line]
+            if blocker_line:
+                response_lines.append(blocker_line)
+            if next_condition_line:
+                response_lines.append(next_condition_line)
+            elif what_matters_line:
+                response_lines.append(what_matters_line)
         else:
             response_lines = [
                 headline,
@@ -9192,7 +9181,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 overview_line,
                 context_summary_line,
                 what_changed_line,
-                reason_line,
+                f"Why: {summary_note}",
             ]
             response_lines = [line for line in response_lines if line]
             if summary_context_line:
@@ -9211,8 +9200,6 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 response_lines.append(next_condition_line)
             elif what_matters_line:
                 response_lines.append(what_matters_line)
-            if invalidation_line:
-                response_lines.append(invalidation_line)
 
     return {
         "ticker": ticker,
@@ -9240,19 +9227,19 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "structure_ready": snapshot.get("structure_ready"),
         "market_open": market_open,
         "time_gate_reason": time_gate_reason,
-        "market_closed_context_only": market_closed_context_only,
+        "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
         "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
         "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
         "replay_test_enabled": replay_test_context.get("enabled"),
-        "replay_trade_allowed": replay_test_context.get("trade_allowed"),
-        "replay_timestamp_et": replay_test_context.get("timestamp_et"),
+        "replay_trade_allowed": replay_test_context.get("replay_trade_allowed"),
+        "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
         "alert_stage": snapshot.get("alert_stage"),
         "alert_reason": snapshot.get("alert_reason"),
         "open_if_open_line": open_if_open_line,
         "alert_dispatch_state": snapshot.get("alert_dispatch_state"),
         "would_alert_now": snapshot.get("would_alert_now"),
         "should_alert_now": snapshot.get("should_alert_now"),
-        "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons") or [],
+        "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
         "why_now": summary_note,
         "summary_context_line": summary_context_line,
         "confirmation_line": confirmation_line,
@@ -9271,6 +9258,181 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "thesis_gate_pending": snapshot.get("thesis_gate_pending"),
         "invalidation": snapshot.get("invalidation"),
     }
+
+
+async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
+    profile_name = _sanitize_continuous_profile_name(request.profile_name)
+    on_demand_request = _continuous_shadow_to_on_demand_request(request)
+    base_profile_key = _continuous_profile_key(profile_name, on_demand_request)
+    replay_profile_active = bool(request.replay_timestamp_et or request.replay_label)
+    profile_key = f"{base_profile_key}__replay" if replay_profile_active else base_profile_key
+
+    stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
+    previous_snapshot = stored_state.get("latest_snapshot")
+
+    on_demand_payload = await _build_on_demand_payload(on_demand_request)
+    current_snapshot = _build_continuous_snapshot(
+        on_demand_payload=on_demand_payload,
+        request=on_demand_request,
+        profile_name=profile_name,
+        profile_key=profile_key,
+        shadow_request=request,
+    )
+    transition_summary = _compare_continuous_snapshots(previous_snapshot, current_snapshot)
+    true_transition_context = _build_true_transition_context(previous_snapshot, current_snapshot)
+    transition_fingerprint = _continuous_transition_fingerprint(
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+    )
+
+    last_alert_fingerprint = stored_state.get("last_alert_fingerprint")
+    deduped = bool(
+        previous_snapshot
+        and true_transition_context.get("should_alert_candidate")
+        and transition_fingerprint == last_alert_fingerprint
+    )
+    alert_decision_context = _build_continuous_alert_decision_context(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+        deduped=deduped,
+        replay_profile_active=replay_profile_active,
+    )
+    should_alert = bool(alert_decision_context.get("should_alert"))
+
+    current_snapshot["transition_summary"] = transition_summary
+    current_snapshot["true_transition_context"] = true_transition_context
+    current_snapshot["previous_snapshot"] = previous_snapshot
+    current_snapshot["alert_dispatch_state"] = alert_decision_context.get("dispatch_state")
+    current_snapshot["would_alert_now"] = alert_decision_context.get("would_alert_now")
+    current_snapshot["should_alert_now"] = should_alert
+    current_snapshot["alert_suppressed_reasons"] = alert_decision_context.get("suppressed_reasons") or []
+    current_snapshot["readable_summary"] = _build_continuous_readable_summary(current_snapshot)
+
+    alert_payload = _build_continuous_alert_payload(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+        alert_decision_context=alert_decision_context,
+    )
+
+    persisted = False
+    state_file = None
+    if request.persist_state:
+        persisted = True
+        state_file = str(_continuous_state_path(profile_key))
+        _save_continuous_state(
+            profile_key,
+            {
+                "profile_name": profile_name,
+                "profile_key": profile_key,
+                "updated_at": current_snapshot.get("timestamp_et"),
+                "latest_snapshot": current_snapshot,
+                "previous_snapshot": previous_snapshot,
+                "last_transition": transition_summary,
+                "last_true_transition": true_transition_context,
+                "last_transition_fingerprint": transition_fingerprint,
+                "last_alert_fingerprint": transition_fingerprint if should_alert else last_alert_fingerprint,
+                "last_alert_timestamp": current_snapshot.get("timestamp_et") if should_alert else stored_state.get("last_alert_timestamp"),
+            },
+        )
+
+    response_payload = {
+        "ok": bool(on_demand_payload.get("ok")),
+        "mode": "continuous_shadow",
+        "shadow_mode": "snapshot_compare_only",
+        "build_tag": on_demand_payload.get("build_tag"),
+        "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
+        "source_of_truth": "frozen_on_demand_baseline",
+        "profile_name": profile_name,
+        "profile_key": profile_key,
+        "base_profile_key": base_profile_key,
+        "replay_profile_active": replay_profile_active,
+        "current_snapshot": current_snapshot,
+        "previous_snapshot": previous_snapshot,
+        "transition_summary": {
+            **transition_summary,
+            "should_alert": should_alert,
+            "deduped": deduped,
+            "transition_fingerprint": transition_fingerprint,
+        },
+        "true_transition_context": {
+            **true_transition_context,
+            "should_alert": should_alert,
+            "deduped": deduped,
+            "transition_fingerprint": transition_fingerprint,
+        },
+        "alert_decision_context": alert_decision_context,
+        "alert_payload": alert_payload,
+        "persistence": {
+            "enabled": request.persist_state,
+            "persisted": persisted,
+            "state_file": state_file,
+            "previous_snapshot_found": bool(previous_snapshot),
+        },
+        "read_this_first": "readable_summary",
+        "api_surface": {
+            "canonical_continuous_post": "/safe-fast/continuous",
+            "canonical_on_demand_post": "/safe-fast/on-demand",
+        },
+        "readable_summary": current_snapshot.get("readable_summary"),
+        "alert_candidate_context": current_snapshot.get("alert_candidate_context"),
+        "market_closed_tester": current_snapshot.get("market_closed_tester"),
+        "replay_test_context": current_snapshot.get("replay_test_context"),
+        "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
+        "on_demand_excerpt": {
+            **_build_continuous_on_demand_excerpt(on_demand_payload),
+            "replay_test_context": current_snapshot.get("replay_test_context"),
+        },
+    }
+    return _json_safe_for_response(response_payload)
+
+
+@app.post(
+    "/safe-fast/continuous",
+    tags=["SAFE-FAST"],
+    summary="SAFE-FAST Continuous",
+    description="Canonical production continuous endpoint. Use this route for continuous SAFE-FAST monitoring.",
+    operation_id="safe_fast_continuous",
+)
+async def safe_fast_continuous(
+    request: ContinuousShadowRequest = Body(
+        ...,
+        openapi_examples={
+            "default": {
+                "summary": "Default SAFE-FAST continuous request",
+                "value": {
+                    "option_type": "C",
+                    "open_positions": 0,
+                    "weekly_trade_count": 0,
+                },
+            }
+        },
+    )
+) -> Any:
+    try:
+        return await _build_continuous_shadow_payload(request)
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_shadow",
+                "shadow_mode": "snapshot_compare_only",
+                "error_type": "continuous_shadow_runtime_error",
+                "reason": str(e),
+                "profile_name": _sanitize_continuous_profile_name(request.profile_name),
+                "request_profile": _model_dump(request),
+                "api_surface": {
+                    "canonical_continuous_post": "/safe-fast/continuous",
+                    "canonical_on_demand_post": "/safe-fast/on-demand",
+                },
+            }
+        )
+
+
+
+
+
 def _default_on_demand_request() -> OnDemandRequest:
     return OnDemandRequest(
         option_type="C",
