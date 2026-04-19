@@ -9111,12 +9111,13 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     is_repeat_no_change = previous_snapshot is not None and not meaningful_transition
     is_initial_snapshot = transition_type == "INITIAL_SNAPSHOT"
     use_short_continuous_format = is_repeat_no_change or is_initial_snapshot
+    short_update_line = None if is_initial_snapshot else update_line
 
     if market_closed_context_only:
         if use_short_continuous_format:
             response_lines = [
                 headline,
-                update_line,
+                short_update_line,
                 short_overview_line,
                 concise_open_check_line,
                 f"Action: {action}",
