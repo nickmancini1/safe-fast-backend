@@ -8959,6 +8959,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         extension_line = "Extension: elevated, but only a caution."
     else:
         extension_line = None
+    if snapshot.get("iv_status") == "unconfirmed":
+        iv_line = "IV: unconfirmed in this build."
+    elif snapshot.get("iv_status"):
+        iv_line = f"IV: {snapshot.get('iv_status')}."
+    else:
+        iv_line = None
 
     if good_idea_now == "YES":
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
@@ -9028,6 +9034,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             trend_line,
             room_line,
             extension_line,
+            iv_line,
             f"Action: {action}",
             f"Why: {summary_note}",
         ]
@@ -9062,6 +9069,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             trend_line,
             room_line,
             extension_line,
+            iv_line,
             f"What changed: {what_changed}",
             f"Why: {summary_note}",
         ]
@@ -9092,6 +9100,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "trend_line": trend_line,
         "room_line": room_line,
         "extension_line": extension_line,
+        "iv_line": iv_line,
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
