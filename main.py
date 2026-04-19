@@ -9099,10 +9099,17 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines = [
                 headline,
                 update_line,
-                overview_line,
                 f"Action: {action}",
-                f"Why: {summary_note}",
             ]
+            response_lines = [line for line in response_lines if line]
+            if blocker_line:
+                response_lines.append(blocker_line)
+            elif summary_note:
+                response_lines.append(f"Why: {summary_note}")
+            if next_condition_line:
+                response_lines.append(next_condition_line)
+            elif next_session_line:
+                response_lines.append(next_session_line)
         else:
             response_lines = [
                 headline,
@@ -9112,34 +9119,41 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 f"Action: {action}",
                 f"Why: {summary_note}",
             ]
-        response_lines = [line for line in response_lines if line]
-        if summary_context_line and not is_repeat_no_change:
-            response_lines.append(f"Underneath: {summary_context_line}")
-        if confirmation_line and not is_repeat_no_change:
-            response_lines.append(confirmation_line)
-        if blocker_line:
-            response_lines.append(blocker_line)
-        if alert_reason_line:
-            response_lines.append(alert_reason_line)
-        if open_if_open_line and not is_repeat_no_change:
-            response_lines.append(open_if_open_line)
-        if also_failing and not is_repeat_no_change:
-            response_lines.append(f"Also failing: {also_failing}")
-        if trap_line:
-            response_lines.append(f"Trap: {trap_line}")
-        if next_condition_line:
-            response_lines.append(next_condition_line)
-        if snapshot.get("invalidation"):
-            response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
+            response_lines = [line for line in response_lines if line]
+            if summary_context_line:
+                response_lines.append(f"Underneath: {summary_context_line}")
+            if confirmation_line:
+                response_lines.append(confirmation_line)
+            if blocker_line:
+                response_lines.append(blocker_line)
+            if alert_reason_line:
+                response_lines.append(alert_reason_line)
+            if open_if_open_line:
+                response_lines.append(open_if_open_line)
+            if also_failing:
+                response_lines.append(f"Also failing: {also_failing}")
+            if trap_line:
+                response_lines.append(f"Trap: {trap_line}")
+            if next_condition_line:
+                response_lines.append(next_condition_line)
+            if snapshot.get("invalidation"):
+                response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
     else:
         what_changed_line = None if is_repeat_no_change else f"What changed: {what_changed}"
         if is_repeat_no_change:
             response_lines = [
                 headline,
                 update_line,
-                overview_line,
-                f"Why: {summary_note}",
             ]
+            response_lines = [line for line in response_lines if line]
+            if blocker_line:
+                response_lines.append(blocker_line)
+            elif summary_note:
+                response_lines.append(f"Why: {summary_note}")
+            if next_condition_line:
+                response_lines.append(next_condition_line)
+            elif what_matters_line:
+                response_lines.append(what_matters_line)
         else:
             response_lines = [
                 headline,
@@ -9149,23 +9163,23 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 what_changed_line,
                 f"Why: {summary_note}",
             ]
-        response_lines = [line for line in response_lines if line]
-        if summary_context_line and not is_repeat_no_change:
-            response_lines.append(f"Underneath: {summary_context_line}")
-        if confirmation_line and not is_repeat_no_change:
-            response_lines.append(confirmation_line)
-        if blocker_line:
-            response_lines.append(blocker_line)
-        if alert_reason_line:
-            response_lines.append(alert_reason_line)
-        if also_failing and not is_repeat_no_change:
-            response_lines.append(f"Also failing: {also_failing}")
-        if trap_line:
-            response_lines.append(f"Trap: {trap_line}")
-        if next_condition_line:
-            response_lines.append(next_condition_line)
-        elif what_matters_line:
-            response_lines.append(what_matters_line)
+            response_lines = [line for line in response_lines if line]
+            if summary_context_line:
+                response_lines.append(f"Underneath: {summary_context_line}")
+            if confirmation_line:
+                response_lines.append(confirmation_line)
+            if blocker_line:
+                response_lines.append(blocker_line)
+            if alert_reason_line:
+                response_lines.append(alert_reason_line)
+            if also_failing:
+                response_lines.append(f"Also failing: {also_failing}")
+            if trap_line:
+                response_lines.append(f"Trap: {trap_line}")
+            if next_condition_line:
+                response_lines.append(next_condition_line)
+            elif what_matters_line:
+                response_lines.append(what_matters_line)
 
     return {
         "ticker": ticker,
