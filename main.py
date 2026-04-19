@@ -9074,12 +9074,16 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     if market_closed_context_only:
         if market_closed_tester.get("would_be_trade_if_open") is True:
             open_if_open_line = "If market were open: this would be a trade."
+            concise_open_check_line = "Open check: this would be a trade if the market were open."
         elif market_closed_tester.get("would_be_trade_if_open") is False:
             open_if_open_line = "If market were open: this would still not be a trade."
+            concise_open_check_line = "Open check: this would still not be a trade if the market were open."
         else:
             open_if_open_line = None
+            concise_open_check_line = None
     else:
         open_if_open_line = None
+        concise_open_check_line = None
     if good_idea_now == "YES":
         confirmation_line = "Confirmation: live trigger and approval are confirmed."
     elif snapshot.get("approval_ready_now"):
@@ -9113,7 +9117,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 headline,
                 update_line,
                 short_overview_line,
-                open_if_open_line,
+                concise_open_check_line,
                 f"Action: {action}",
                 f"Why: {summary_note}",
             ]
