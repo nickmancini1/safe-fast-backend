@@ -9093,19 +9093,21 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     trap_line = _derive_trap_line(snapshot.get("trap_check_context"))
 
     is_repeat_no_change = previous_snapshot is not None and not meaningful_transition
+    is_initial_snapshot = transition_type == "INITIAL_SNAPSHOT"
+    use_short_continuous_format = is_repeat_no_change or is_initial_snapshot
 
     if market_closed_context_only:
-        if is_repeat_no_change:
+        if use_short_continuous_format:
             response_lines = [
                 headline,
                 update_line,
+                overview_line,
                 f"Action: {action}",
+                f"Why: {summary_note}",
             ]
             response_lines = [line for line in response_lines if line]
             if blocker_line:
                 response_lines.append(blocker_line)
-            elif summary_note:
-                response_lines.append(f"Why: {summary_note}")
             if next_condition_line:
                 response_lines.append(next_condition_line)
             elif next_session_line:
@@ -9139,17 +9141,17 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             if snapshot.get("invalidation"):
                 response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
     else:
-        what_changed_line = None if is_repeat_no_change else f"What changed: {what_changed}"
-        if is_repeat_no_change:
+        what_changed_line = None if use_short_continuous_format else f"What changed: {what_changed}"
+        if use_short_continuous_format:
             response_lines = [
                 headline,
                 update_line,
+                overview_line,
+                f"Why: {summary_note}",
             ]
             response_lines = [line for line in response_lines if line]
             if blocker_line:
                 response_lines.append(blocker_line)
-            elif summary_note:
-                response_lines.append(f"Why: {summary_note}")
             if next_condition_line:
                 response_lines.append(next_condition_line)
             elif what_matters_line:
