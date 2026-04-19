@@ -8937,9 +8937,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     if transition_type == "INITIAL_SNAPSHOT":
         update_line = None
     elif previous_snapshot is not None and not meaningful_transition:
-        update_line = "Update: no meaningful change since the last check."
+        update_line = "No meaningful change since the last check."
     elif transition_label:
-        update_line = f"Update: {transition_label}"
+        update_line = f"Changed: {transition_label}"
     else:
         update_line = None
 
@@ -9055,6 +9055,19 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     else:
         what_matters_now = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
 
+    if good_idea_now == "YES":
+        decision_line = "Decision: trade is live now."
+    elif market_closed_context_only and market_closed_tester.get("would_be_trade_if_open") is True:
+        decision_line = "Decision: not live now only because the market is closed."
+    elif next_flip_needed:
+        decision_line = f"Decision: not a trade yet. Still waiting for {_humanize_blocker_key(next_flip_needed)}."
+    elif effective_primary_blocker:
+        decision_line = f"Decision: not a trade. Blocked by {_humanize_blocker_key(effective_primary_blocker)}."
+    elif market_open is False:
+        decision_line = "Decision: not live now because the market is closed."
+    else:
+        decision_line = "Decision: not a trade right now."
+
     next_step_text = _humanize_next_step(next_flip_needed) if next_flip_needed else None
     next_step_plain = next_step_text.rstrip(".") if next_step_text else None
     if next_step_plain and next_step_plain.startswith("Get "):
@@ -9119,6 +9132,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines = [
                 headline,
                 update_line,
+                decision_line,
                 short_overview_line,
                 concise_open_check_line,
                 reason_line,
@@ -9126,6 +9140,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines = [line for line in response_lines if line]
             if blocker_line:
                 response_lines.append(blocker_line)
+            if alert_reason_line:
+                response_lines.append(alert_reason_line)
             if next_condition_line:
                 response_lines.append(next_condition_line)
             elif next_session_line:
@@ -9140,6 +9156,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines = [
                 headline,
                 update_line,
+                decision_line,
                 overview_line,
                 context_summary_line,
                 action_line,
@@ -9170,12 +9187,15 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines = [
                 headline,
                 update_line,
+                decision_line,
                 short_overview_line,
                 reason_line,
             ]
             response_lines = [line for line in response_lines if line]
             if blocker_line:
                 response_lines.append(blocker_line)
+            if alert_reason_line:
+                response_lines.append(alert_reason_line)
             if next_condition_line:
                 response_lines.append(next_condition_line)
             elif what_matters_line:
@@ -9190,6 +9210,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines = [
                 headline,
                 update_line,
+                decision_line,
                 overview_line,
                 context_summary_line,
                 what_changed_line,
@@ -9254,6 +9275,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "would_alert_now": snapshot.get("would_alert_now"),
         "should_alert_now": snapshot.get("should_alert_now"),
         "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
+        "decision_line": decision_line,
         "why_now": summary_note,
         "summary_context_line": summary_context_line,
         "confirmation_line": confirmation_line,
