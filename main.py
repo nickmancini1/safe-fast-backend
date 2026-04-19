@@ -9128,6 +9128,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 response_lines.append(next_condition_line)
             elif next_session_line:
                 response_lines.append(next_session_line)
+            if invalidation_line:
+                response_lines.append(invalidation_line)
         else:
             response_lines = [
                 headline,
