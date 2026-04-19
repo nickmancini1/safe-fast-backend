@@ -8268,7 +8268,6 @@ def _build_continuous_snapshot(
     "action": simple_output.get("action"),
     "setup_state": simple_output.get("setup_state"),
     "good_idea_now": simple_output.get("good_idea_now"),
-    "what_would_make_it_acceptable": simple_output.get("what_would_make_it_acceptable"),
 },
         "market_closed_tester": market_closed_tester,
         "trap_check_context": on_demand_payload.get("trap_check_context") or {},
