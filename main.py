@@ -8944,7 +8944,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     status_line = f"Status: {status_text}" if status_text else None
     setup_type = snapshot.get("setup_type")
     setup_line = f"Setup: {setup_type}" if setup_type else None
-    trend_line = f"Trend: {ticker_compact_summary.get('trend_label')}" if ticker_compact_summary.get("trend_label") else None
+    trend_label_value = ticker_compact_summary.get("trend_label")
+    trend_line = f"Trend: {trend_label_value}" if trend_label_value else None
     if ticker_compact_summary.get("room_pass") is True:
         room_line = "Room: enough room before the next major level."
     elif ticker_compact_summary.get("room_pass") is False:
@@ -8979,6 +8980,42 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         price_vs_ema_line = "Price vs 1H 50 EMA: at the line."
     else:
         price_vs_ema_line = None
+
+    if ticker and status_text and setup_type:
+        overview_line = f"Overview: {ticker} is currently {status_text}. It is a {setup_type} setup."
+    elif ticker and status_text:
+        overview_line = f"Overview: {ticker} is currently {status_text}."
+    elif ticker and setup_type:
+        overview_line = f"Overview: {ticker} is a {setup_type} setup."
+    else:
+        overview_line = None
+
+    context_bits: List[str] = []
+    if trend_label_value:
+        context_bits.append(f"trend is {trend_label_value.lower()}")
+    if ticker_compact_summary.get("room_pass") is True:
+        context_bits.append("there is enough room before the next major level")
+    elif ticker_compact_summary.get("room_pass") is False:
+        context_bits.append("room is cramped before the next major level")
+    if isinstance(next_major_level, (int, float)):
+        context_bits.append(f"the next major level is {next_major_level:.2f}")
+    if ticker_compact_summary.get("extension_blocks_now") is True:
+        context_bits.append("extension is stretched enough to block")
+    elif ticker_compact_summary.get("extension_state") == "extended":
+        context_bits.append("extension is stretched")
+    elif ticker_compact_summary.get("extension_state") == "caution":
+        context_bits.append("extension is only a caution")
+    if snapshot.get("iv_status") == "unconfirmed":
+        context_bits.append("IV is unconfirmed in this build")
+    elif snapshot.get("iv_status"):
+        context_bits.append(f"IV is {snapshot.get('iv_status')}")
+    if price_vs_ema == "above":
+        context_bits.append("price is above the 1H 50 EMA")
+    elif price_vs_ema == "below":
+        context_bits.append("price is below the 1H 50 EMA")
+    elif price_vs_ema == "at":
+        context_bits.append("price is sitting on the 1H 50 EMA")
+    context_summary_line = f"Context: {'; '.join(context_bits)}." if context_bits else None
 
     if good_idea_now == "YES":
         what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
@@ -9042,22 +9079,14 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     if market_closed_context_only:
         response_lines = [
             headline,
-            f"Ticker: {ticker}",
-            status_line,
-            setup_line,
-            trend_line,
-            room_line,
-            next_level_line,
-            extension_line,
-            iv_line,
-            price_vs_ema_line,
+            overview_line,
+            context_summary_line,
             f"Action: {action}",
             f"Why: {summary_note}",
         ]
         response_lines = [line for line in response_lines if line]
-        response_lines = [line for line in response_lines if line]
         if summary_context_line:
-            response_lines.append(f"Context: {summary_context_line}")
+            response_lines.append(f"Underneath: {summary_context_line}")
         if confirmation_line:
             response_lines.append(confirmation_line)
         if blocker_line:
@@ -9072,27 +9101,19 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines.append(f"Trap: {trap_line}")
         if next_condition_line:
             response_lines.append(next_condition_line)
-        if next_session_line:
-            response_lines.append(next_session_line)
         if snapshot.get("invalidation"):
             response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
     else:
         response_lines = [
             headline,
-            f"Ticker: {ticker}",
-            status_line,
-            setup_line,
-            trend_line,
-            room_line,
-            next_level_line,
-            extension_line,
-            iv_line,
-            price_vs_ema_line,
+            overview_line,
+            context_summary_line,
             f"What changed: {what_changed}",
             f"Why: {summary_note}",
         ]
+        response_lines = [line for line in response_lines if line]
         if summary_context_line:
-            response_lines.append(f"Context: {summary_context_line}")
+            response_lines.append(f"Underneath: {summary_context_line}")
         if confirmation_line:
             response_lines.append(confirmation_line)
         if blocker_line:
@@ -9105,7 +9126,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             response_lines.append(f"Trap: {trap_line}")
         if next_condition_line:
             response_lines.append(next_condition_line)
-        if what_matters_line:
+        elif what_matters_line:
             response_lines.append(what_matters_line)
 
     return {
@@ -9121,6 +9142,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "extension_line": extension_line,
         "iv_line": iv_line,
         "price_vs_ema_line": price_vs_ema_line,
+        "overview_line": overview_line,
+        "context_summary_line": context_summary_line,
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
