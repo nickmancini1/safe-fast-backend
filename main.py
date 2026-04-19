@@ -9070,6 +9070,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             next_session_line = None
             what_matters_line = None
     blocker_line = f"Blocker: {_humanize_blocker_key(effective_primary_blocker)}." if effective_primary_blocker else None
+    invalidation_line = f"Invalidation: {snapshot.get('invalidation')}" if snapshot.get("invalidation") else None
     alert_reason_line = f"Alert reason: {snapshot.get('alert_reason')}" if snapshot.get("alert_reason") else None
     if market_closed_context_only:
         if market_closed_tester.get("would_be_trade_if_open") is True:
@@ -9200,6 +9201,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 response_lines.append(next_condition_line)
             elif what_matters_line:
                 response_lines.append(what_matters_line)
+            if invalidation_line:
+                response_lines.append(invalidation_line)
 
     return {
         "ticker": ticker,
