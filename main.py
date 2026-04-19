@@ -8989,32 +8989,18 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     if market_closed_context_only:
         action = "wait for next session"
     acceptable_condition = summary.get("what_would_make_it_acceptable")
-    would_be_trade_if_open = market_closed_tester.get("would_be_trade_if_open")
     alert_reason = snapshot.get("alert_reason")
 
-    if snapshot.get("invalidation_hit"):
-        what_changed = "Invalidation hit, so the setup is no longer valid."
-    elif good_idea_now == "YES":
-        what_changed = "Trigger is live and the required approval gates are passing."
-    elif market_open is False:
-        what_changed = "Market is closed, so no live entry can be taken."
-    elif next_flip_needed:
-        what_changed = f"The next missing condition is {_humanize_blocker_key(next_flip_needed)}."
-    elif effective_primary_blocker:
-        what_changed = f"The main blocker right now is {_humanize_blocker_key(effective_primary_blocker)}."
-    else:
-        what_changed = "No material state change."
-
     if good_idea_now == "YES":
-        what_matters_now = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
+        next_step_text = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
     elif acceptable_condition:
-        what_matters_now = acceptable_condition
+        next_step_text = acceptable_condition
     elif next_flip_needed:
-        what_matters_now = _humanize_next_step(next_flip_needed)
+        next_step_text = _humanize_next_step(next_flip_needed)
     elif effective_primary_blocker:
-        what_matters_now = _humanize_next_step(effective_primary_blocker)
+        next_step_text = _humanize_next_step(effective_primary_blocker)
     else:
-        what_matters_now = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
+        next_step_text = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
 
     also_failing = _derive_also_failing_line(
         failed_reasons,
@@ -9027,7 +9013,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         action=action,
         good_idea_now=good_idea_now,
         reason=summary_note,
-        next_step=what_matters_now,
+        next_step=next_step_text,
         invalidation=snapshot.get("invalidation"),
         market_closed_context_only=market_closed_context_only,
         also_failing=also_failing,
@@ -9061,15 +9047,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "would_alert_now": snapshot.get("would_alert_now"),
         "should_alert_now": snapshot.get("should_alert_now"),
         "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
-        "why_now": summary_note,
-        "what_would_make_it_acceptable": acceptable_condition,
         "headline": surface.get("headline"),
-        "what_changed": what_changed,
-        "what_matters_now": what_matters_now,
-        "also_failing": also_failing,
-        "trap_line": trap_line,
         "watchouts": surface.get("watchouts"),
-        "next_step": surface.get("next_step") or what_matters_now,
+        "next_step": surface.get("next_step") or next_step_text,
         "response_lines": surface.get("response_lines") or [],
         "response_text": surface.get("response_text") or "",
         "macro_brief": snapshot.get("macro_brief"),
