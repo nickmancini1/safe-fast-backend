@@ -8907,8 +8907,6 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     return {
         "build_tag": on_demand_payload.get("build_tag"),
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
-        "simple_output": on_demand_payload.get("simple_output"),
-        "user_facing": on_demand_payload.get("user_facing"),
         "decision_context": {
             "primary_blocker": decision_context.get("primary_blocker"),
             "blockers": decision_context.get("blockers"),
