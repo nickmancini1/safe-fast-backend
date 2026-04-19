@@ -8936,6 +8936,15 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     }
 
 
+def _strip_continuous_response_snapshot(snapshot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(snapshot, dict):
+        return snapshot
+
+    cleaned_snapshot = dict(snapshot)
+    cleaned_snapshot.pop("readable_summary", None)
+    return cleaned_snapshot
+
+
 
 def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     current_state = snapshot.get("current_state")
@@ -9144,8 +9153,8 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "profile_key": profile_key,
         "base_profile_key": base_profile_key,
         "replay_profile_active": replay_profile_active,
-        "current_snapshot": current_snapshot,
-        "previous_snapshot": previous_snapshot,
+        "current_snapshot": _strip_continuous_response_snapshot(current_snapshot),
+        "previous_snapshot": _strip_continuous_response_snapshot(previous_snapshot),
         "transition_summary": {
             **transition_summary,
             "should_alert": should_alert,
