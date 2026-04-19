@@ -8935,7 +8935,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     meaningful_transition = bool(true_transition_context.get("meaningful_transition") or transition_summary.get("meaningful_transition"))
     transition_type = true_transition_context.get("transition_type") or transition_summary.get("transition_type")
     if transition_type == "INITIAL_SNAPSHOT":
-        update_line = "Update: first continuous snapshot created."
+        update_line = None
     elif previous_snapshot is not None and not meaningful_transition:
         update_line = "Update: no meaningful change since the last check."
     elif transition_label:
