@@ -9059,6 +9059,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         decision_line = "Decision: trade is live now."
     elif market_closed_context_only and market_closed_tester.get("would_be_trade_if_open") is True:
         decision_line = "Decision: not live now only because the market is closed."
+    elif market_closed_context_only and market_closed_tester.get("would_be_trade_if_open") is False:
+        decision_line = "Decision: still not a trade, even if the market were open."
     elif next_flip_needed:
         decision_line = f"Decision: not a trade yet. Still waiting for {_humanize_blocker_key(next_flip_needed)}."
     elif effective_primary_blocker:
@@ -9086,7 +9088,22 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             next_session_line = None
             what_matters_line = None
     blocker_line = f"Blocker: {_humanize_blocker_key(effective_primary_blocker)}." if effective_primary_blocker else None
+    show_blocker_line = bool(
+        blocker_line
+        and (
+            effective_primary_blocker is None
+            or next_flip_needed is None
+            or effective_primary_blocker != next_flip_needed
+        )
+    )
     alert_reason_line = f"Alert reason: {snapshot.get('alert_reason')}" if snapshot.get("alert_reason") else None
+    show_alert_reason_line = bool(
+        alert_reason_line
+        and (
+            not market_closed_context_only
+            or str(snapshot.get("alert_reason") or "").strip() != "Entry window is closed."
+        )
+    )
     if market_closed_context_only:
         if market_closed_tester.get("would_be_trade_if_open") is True:
             open_if_open_line = "If market were open: this would be a trade."
@@ -9134,13 +9151,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 update_line,
                 decision_line,
                 short_overview_line,
-                concise_open_check_line,
                 reason_line,
             ]
             response_lines = [line for line in response_lines if line]
-            if blocker_line:
+            if show_blocker_line:
                 response_lines.append(blocker_line)
-            if alert_reason_line:
+            if show_alert_reason_line:
                 response_lines.append(alert_reason_line)
             if next_condition_line:
                 response_lines.append(next_condition_line)
@@ -9167,9 +9183,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 response_lines.append(f"Underneath: {summary_context_line}")
             if confirmation_line:
                 response_lines.append(confirmation_line)
-            if blocker_line:
+            if show_blocker_line:
                 response_lines.append(blocker_line)
-            if alert_reason_line:
+            if show_alert_reason_line:
                 response_lines.append(alert_reason_line)
             if open_if_open_line:
                 response_lines.append(open_if_open_line)
@@ -9192,9 +9208,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 reason_line,
             ]
             response_lines = [line for line in response_lines if line]
-            if blocker_line:
+            if show_blocker_line:
                 response_lines.append(blocker_line)
-            if alert_reason_line:
+            if show_alert_reason_line:
                 response_lines.append(alert_reason_line)
             if next_condition_line:
                 response_lines.append(next_condition_line)
