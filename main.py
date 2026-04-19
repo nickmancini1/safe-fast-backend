@@ -9092,27 +9092,38 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     )
     trap_line = _derive_trap_line(snapshot.get("trap_check_context"))
 
+    is_repeat_no_change = previous_snapshot is not None and not meaningful_transition
+
     if market_closed_context_only:
-        response_lines = [
-            headline,
-            update_line,
-            overview_line,
-            context_summary_line,
-            f"Action: {action}",
-            f"Why: {summary_note}",
-        ]
+        if is_repeat_no_change:
+            response_lines = [
+                headline,
+                update_line,
+                overview_line,
+                f"Action: {action}",
+                f"Why: {summary_note}",
+            ]
+        else:
+            response_lines = [
+                headline,
+                update_line,
+                overview_line,
+                context_summary_line,
+                f"Action: {action}",
+                f"Why: {summary_note}",
+            ]
         response_lines = [line for line in response_lines if line]
-        if summary_context_line:
+        if summary_context_line and not is_repeat_no_change:
             response_lines.append(f"Underneath: {summary_context_line}")
-        if confirmation_line:
+        if confirmation_line and not is_repeat_no_change:
             response_lines.append(confirmation_line)
         if blocker_line:
             response_lines.append(blocker_line)
         if alert_reason_line:
             response_lines.append(alert_reason_line)
-        if open_if_open_line:
+        if open_if_open_line and not is_repeat_no_change:
             response_lines.append(open_if_open_line)
-        if also_failing:
+        if also_failing and not is_repeat_no_change:
             response_lines.append(f"Also failing: {also_failing}")
         if trap_line:
             response_lines.append(f"Trap: {trap_line}")
@@ -9121,25 +9132,33 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         if snapshot.get("invalidation"):
             response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
     else:
-        what_changed_line = None if (previous_snapshot is not None and not meaningful_transition) else f"What changed: {what_changed}"
-        response_lines = [
-            headline,
-            update_line,
-            overview_line,
-            context_summary_line,
-            what_changed_line,
-            f"Why: {summary_note}",
-        ]
+        what_changed_line = None if is_repeat_no_change else f"What changed: {what_changed}"
+        if is_repeat_no_change:
+            response_lines = [
+                headline,
+                update_line,
+                overview_line,
+                f"Why: {summary_note}",
+            ]
+        else:
+            response_lines = [
+                headline,
+                update_line,
+                overview_line,
+                context_summary_line,
+                what_changed_line,
+                f"Why: {summary_note}",
+            ]
         response_lines = [line for line in response_lines if line]
-        if summary_context_line:
+        if summary_context_line and not is_repeat_no_change:
             response_lines.append(f"Underneath: {summary_context_line}")
-        if confirmation_line:
+        if confirmation_line and not is_repeat_no_change:
             response_lines.append(confirmation_line)
         if blocker_line:
             response_lines.append(blocker_line)
         if alert_reason_line:
             response_lines.append(alert_reason_line)
-        if also_failing:
+        if also_failing and not is_repeat_no_change:
             response_lines.append(f"Also failing: {also_failing}")
         if trap_line:
             response_lines.append(f"Trap: {trap_line}")
