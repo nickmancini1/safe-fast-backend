@@ -8935,7 +8935,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     meaningful_transition = bool(true_transition_context.get("meaningful_transition") or transition_summary.get("meaningful_transition"))
     transition_type = true_transition_context.get("transition_type") or transition_summary.get("transition_type")
     if transition_type == "INITIAL_SNAPSHOT":
-        update_line = "Update: first continuous snapshot created."
+        update_line = None
     elif previous_snapshot is not None and not meaningful_transition:
         update_line = "Update: no meaningful change since the last check."
     elif transition_label:
@@ -9064,6 +9064,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     next_condition_line = f"Next condition: {next_step_text}" if next_step_text else None
     next_session_line = f"What matters next session: {what_matters_now}"
     what_matters_line = f"What matters now: {what_matters_now}"
+    reason_line = f"Why: {summary_note}"
+    action_line = f"Action: {action}"
+    invalidation_line = f"Invalidation: {snapshot.get('invalidation')}" if snapshot.get("invalidation") else None
     if next_condition_line:
         next_condition_value = next_condition_line.removeprefix("Next condition: ").strip()
         if next_condition_value == what_matters_now.strip():
@@ -9118,8 +9121,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 update_line,
                 short_overview_line,
                 concise_open_check_line,
-                f"Action: {action}",
-                f"Why: {summary_note}",
+                reason_line,
             ]
             response_lines = [line for line in response_lines if line]
             if blocker_line:
@@ -9128,6 +9130,10 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 response_lines.append(next_condition_line)
             elif next_session_line:
                 response_lines.append(next_session_line)
+            if trap_line:
+                response_lines.append(f"Trap: {trap_line}")
+            elif also_failing:
+                response_lines.append(f"Also failing: {also_failing}")
             if invalidation_line:
                 response_lines.append(invalidation_line)
         else:
@@ -9136,8 +9142,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 update_line,
                 overview_line,
                 context_summary_line,
-                f"Action: {action}",
-                f"Why: {summary_note}",
+                action_line,
+                reason_line,
             ]
             response_lines = [line for line in response_lines if line]
             if summary_context_line:
@@ -9156,8 +9162,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 response_lines.append(f"Trap: {trap_line}")
             if next_condition_line:
                 response_lines.append(next_condition_line)
-            if snapshot.get("invalidation"):
-                response_lines.append(f"Invalidation: {snapshot.get('invalidation')}")
+            if invalidation_line:
+                response_lines.append(invalidation_line)
     else:
         what_changed_line = None if use_short_continuous_format else f"What changed: {what_changed}"
         if use_short_continuous_format:
@@ -9165,7 +9171,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 headline,
                 update_line,
                 short_overview_line,
-                f"Why: {summary_note}",
+                reason_line,
             ]
             response_lines = [line for line in response_lines if line]
             if blocker_line:
@@ -9174,6 +9180,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 response_lines.append(next_condition_line)
             elif what_matters_line:
                 response_lines.append(what_matters_line)
+            if trap_line:
+                response_lines.append(f"Trap: {trap_line}")
+            elif also_failing:
+                response_lines.append(f"Also failing: {also_failing}")
+            if invalidation_line:
+                response_lines.append(invalidation_line)
         else:
             response_lines = [
                 headline,
@@ -9181,7 +9193,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 overview_line,
                 context_summary_line,
                 what_changed_line,
-                f"Why: {summary_note}",
+                reason_line,
             ]
             response_lines = [line for line in response_lines if line]
             if summary_context_line:
@@ -9200,6 +9212,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 response_lines.append(next_condition_line)
             elif what_matters_line:
                 response_lines.append(what_matters_line)
+            if invalidation_line:
+                response_lines.append(invalidation_line)
 
     return {
         "ticker": ticker,
