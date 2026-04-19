@@ -9117,6 +9117,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
                 f"Why: {summary_note}",
             ]
             response_lines = [line for line in response_lines if line]
+            if open_if_open_line:
+                response_lines.append(open_if_open_line)
             if blocker_line:
                 response_lines.append(blocker_line)
             if next_condition_line:
