@@ -9247,6 +9247,9 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     )
     should_alert = bool(alert_decision_context.get("should_alert"))
 
+    current_snapshot["transition_summary"] = transition_summary
+    current_snapshot["true_transition_context"] = true_transition_context
+    current_snapshot["previous_snapshot"] = previous_snapshot
     current_snapshot["alert_dispatch_state"] = alert_decision_context.get("dispatch_state")
     current_snapshot["would_alert_now"] = alert_decision_context.get("would_alert_now")
     current_snapshot["should_alert_now"] = should_alert
