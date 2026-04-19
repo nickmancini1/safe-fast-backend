@@ -8941,7 +8941,18 @@ def _strip_continuous_response_snapshot(snapshot: Optional[Dict[str, Any]]) -> O
         return snapshot
 
     cleaned_snapshot = dict(snapshot)
-    cleaned_snapshot.pop("readable_summary", None)
+    for key in [
+        "readable_summary",
+        "alert_candidate_context",
+        "market_closed_tester",
+        "replay_test_context",
+        "compact_ticker_summaries",
+        "alert_dispatch_state",
+        "would_alert_now",
+        "should_alert_now",
+        "alert_suppressed_reasons",
+    ]:
+        cleaned_snapshot.pop(key, None)
     return cleaned_snapshot
 
 
