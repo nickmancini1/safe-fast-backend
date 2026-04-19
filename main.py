@@ -8911,9 +8911,15 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
         "decision_context": {
             "primary_blocker": decision_context.get("primary_blocker"),
             "blockers": decision_context.get("blockers"),
+            "failed_reasons": decision_context.get("failed_reasons"),
         },
         "approval_context": {
+            "primary_blocker": approval_context.get("primary_blocker"),
             "next_flip_needed": approval_context.get("next_flip_needed"),
+            "approval_ready_now": approval_context.get("approval_ready_now"),
+            "approval_ready_on_completed_candle": approval_context.get(
+                "approval_ready_on_completed_candle"
+            ),
             "approval_status": approval_context.get("approval_status"),
         },
         "trigger_context": {
@@ -8921,10 +8927,13 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
             "trigger_reason": trigger_context.get("trigger_reason"),
             "structure_ready": trigger_context.get("structure_ready"),
         },
+        "winner_shift_context": on_demand_payload.get("winner_shift_context"),
+        "iv_context": on_demand_payload.get("iv_context"),
+        "market_context": on_demand_payload.get("market_context"),
+        "time_day_gate": on_demand_payload.get("time_day_gate"),
         "market_closed_tester": _build_market_closed_tester_block(on_demand_payload),
         "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
     }
-
 
 
 
@@ -9243,8 +9252,7 @@ async def safe_fast_on_demand_default_simple() -> Any:
         "simple_output": payload.get("simple_output"),
         "screened_best_context": payload.get("screened_best_context"),
         "failed_reasons": payload.get("failed_reasons"),
-
-        
+    }
 
 
 @app.post(
