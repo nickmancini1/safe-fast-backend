@@ -8904,10 +8904,14 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     decision_context = on_demand_payload.get("decision_context") or {}
     approval_context = on_demand_payload.get("approval_context") or {}
     trigger_context = on_demand_payload.get("trigger_context") or {}
+    winner_shift_context = on_demand_payload.get("winner_shift_context") or {}
+    iv_context = on_demand_payload.get("iv_context") or {}
+    market_context = on_demand_payload.get("market_context") or {}
+    time_day_gate = on_demand_payload.get("time_day_gate") or {}
+    market_closed_tester = _build_market_closed_tester_block(on_demand_payload) or {}
 
     return {
         "build_tag": on_demand_payload.get("build_tag"),
-        "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "decision_context": {
             "primary_blocker": decision_context.get("primary_blocker"),
             "blockers": decision_context.get("blockers"),
@@ -8927,12 +8931,32 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
             "trigger_reason": trigger_context.get("trigger_reason"),
             "structure_ready": trigger_context.get("structure_ready"),
         },
-        "winner_shift_context": on_demand_payload.get("winner_shift_context"),
-        "iv_context": on_demand_payload.get("iv_context"),
-        "market_context": on_demand_payload.get("market_context"),
-        "time_day_gate": on_demand_payload.get("time_day_gate"),
-        "market_closed_tester": _build_market_closed_tester_block(on_demand_payload),
-        "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
+        "winner_shift_context": {
+            "shift_path": winner_shift_context.get("shift_path"),
+            "any_shift": winner_shift_context.get("any_shift"),
+            "screened_reason": winner_shift_context.get("screened_reason"),
+        },
+        "iv_context": {
+            "status": iv_context.get("status"),
+            "why": iv_context.get("why"),
+        },
+        "market_context": {
+            "is_open": market_context.get("is_open"),
+            "as_of_et": market_context.get("as_of_et"),
+            "session": market_context.get("session"),
+        },
+        "time_day_gate": {
+            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+            "reason": time_day_gate.get("reason"),
+            "policy": time_day_gate.get("policy"),
+        },
+        "market_closed_tester": {
+            "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
+            "underlying_structural_verdict": market_closed_tester.get(
+                "underlying_structural_verdict"
+            ),
+            "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
+        },
     }
 
 
