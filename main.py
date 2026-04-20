@@ -7811,9 +7811,28 @@ def _sanitize_continuous_profile_name(profile_name: Optional[str]) -> str:
 
 
 def _continuous_state_dir() -> Path:
-    state_dir = Path(os.getenv("SAFE_FAST_CONTINUOUS_STATE_DIR", "/tmp/safe_fast_continuous"))
-    state_dir.mkdir(parents=True, exist_ok=True)
-    return state_dir
+    explicit_dir = os.getenv("SAFE_FAST_CONTINUOUS_STATE_DIR")
+    if explicit_dir:
+        state_dir = Path(explicit_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir
+
+    persistent_dir = (Path.cwd() / ".safe_fast_continuous").resolve()
+    legacy_dir = Path("/tmp/safe_fast_continuous")
+
+    if not persistent_dir.exists() and legacy_dir.exists():
+        try:
+            persistent_dir.mkdir(parents=True, exist_ok=True)
+            for legacy_file in legacy_dir.glob("*.json"):
+                target_file = persistent_dir / legacy_file.name
+                if not target_file.exists():
+                    target_file.write_text(legacy_file.read_text())
+        except Exception:
+            legacy_dir.mkdir(parents=True, exist_ok=True)
+            return legacy_dir
+
+    persistent_dir.mkdir(parents=True, exist_ok=True)
+    return persistent_dir
 
 
 def _continuous_shadow_to_on_demand_request(request: ContinuousShadowRequest) -> OnDemandRequest:
