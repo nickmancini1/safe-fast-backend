@@ -8599,6 +8599,21 @@ def _build_contracts_bundle(
         "alert": alert_contract or {},
     }
 
+
+
+def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = payload or {}
+    state_contract = payload.get("state_contract")
+    transition_contract = payload.get("transition_contract")
+    alert_contract = payload.get("alert_contract")
+    if state_contract or transition_contract or alert_contract:
+        payload["contracts"] = _build_contracts_bundle(
+            state_contract=state_contract,
+            transition_contract=transition_contract,
+            alert_contract=alert_contract,
+        )
+    return payload
+
 def _continuous_meaningful_changed_fields(
     previous: Dict[str, Any],
     current: Dict[str, Any],
@@ -9570,7 +9585,8 @@ async def safe_fast_continuous(
     )
 ) -> Any:
     try:
-        return await _build_continuous_shadow_payload(request)
+        payload = await _build_continuous_shadow_payload(request)
+        return _ensure_contracts_surface(payload)
     except Exception as e:
         return _json_safe_for_response(
             {
@@ -9640,4 +9656,5 @@ async def safe_fast_on_demand(
         },
     )
 ) -> Any:
-    return await _build_on_demand_payload(request)
+    payload = await _build_on_demand_payload(request)
+    return _ensure_contracts_surface(payload)
