@@ -7717,6 +7717,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         time_day_gate=time_day_gate,
         iv_context=iv_context,
     )
+    response_payload["response_contract_marker"] = "safe_fast_state_contract_surface_v2"
     return response_payload
 
 
@@ -8052,6 +8053,7 @@ def _build_state_contract_from_snapshot(snapshot: Dict[str, Any], *, mode: str) 
     summary = snapshot.get("summary") or {}
     return {
         "contract_version": "safe_fast_state_v1",
+        "contract_marker": "safe_fast_state_contract_surface_v2",
         "mode": mode,
         "ticker": summary.get("ticker") or snapshot.get("best_ticker"),
         "good_idea_now": summary.get("good_idea_now"),
@@ -8419,6 +8421,7 @@ def _build_continuous_snapshot(
     snapshot["replay_market_open"] = replay_test_context.get("replay_market_open")
     snapshot["replay_fresh_entry_allowed"] = replay_test_context.get("replay_fresh_entry_allowed")
     snapshot["state_contract"] = _build_state_contract_from_snapshot(snapshot, mode="continuous")
+    snapshot["response_contract_marker"] = "safe_fast_state_contract_surface_v2"
     snapshot["alert_candidate_context"] = _derive_continuous_alert_candidate_context(snapshot)
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
@@ -9383,6 +9386,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         },
         "readable_summary": current_snapshot.get("readable_summary"),
         "state_contract": current_snapshot.get("state_contract"),
+        "response_contract_marker": current_snapshot.get("response_contract_marker") or "safe_fast_state_contract_surface_v2",
         "alert_candidate_context": _build_continuous_alert_candidate_excerpt(
             current_snapshot.get("alert_candidate_context")
         ),
