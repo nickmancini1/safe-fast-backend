@@ -9393,9 +9393,16 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     market_context = on_demand_payload.get("market_context") or {}
     time_day_gate = on_demand_payload.get("time_day_gate") or {}
 
+    primary_blocker = decision_context.get("primary_blocker")
+    next_flip_needed = approval_context.get("next_flip_needed")
+    human_primary_blocker = _humanize_blocker_key(primary_blocker) if primary_blocker else None
+    human_next_flip_needed = _humanize_blocker_key(next_flip_needed) if next_flip_needed else None
+
     return {
-        "primary_blocker": decision_context.get("primary_blocker"),
-        "next_flip_needed": approval_context.get("next_flip_needed"),
+        "primary_blocker": human_primary_blocker or primary_blocker,
+        "next_flip_needed": human_next_flip_needed or next_flip_needed,
+        "primary_blocker_key": primary_blocker if human_primary_blocker and human_primary_blocker != primary_blocker else None,
+        "next_flip_needed_key": next_flip_needed if human_next_flip_needed and human_next_flip_needed != next_flip_needed else None,
         "trigger_present": trigger_context.get("trigger_present"),
         "trigger_reason": trigger_context.get("trigger_reason"),
         "structure_ready": trigger_context.get("structure_ready"),
@@ -9410,10 +9417,15 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
 def _build_continuous_alert_candidate_excerpt(alert_candidate_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not isinstance(alert_candidate_context, dict):
         return alert_candidate_context
+
+    next_flip_needed = alert_candidate_context.get("next_flip_needed")
+    human_next_flip_needed = _humanize_blocker_key(next_flip_needed) if next_flip_needed else None
+
     return {
         "alert_stage": alert_candidate_context.get("alert_stage"),
         "should_alert_candidate": alert_candidate_context.get("should_alert_candidate"),
-        "next_flip_needed": alert_candidate_context.get("next_flip_needed"),
+        "next_flip_needed": human_next_flip_needed or next_flip_needed,
+        "next_flip_needed_key": next_flip_needed if human_next_flip_needed and human_next_flip_needed != next_flip_needed else None,
         "final_verdict": alert_candidate_context.get("final_verdict"),
     }
 
