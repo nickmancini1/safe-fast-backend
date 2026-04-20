@@ -8644,6 +8644,54 @@ def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _canonicalize_continuous_snapshot_contracts(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(snapshot, dict) or not snapshot:
+        return snapshot or {}
+
+    normalized = _ensure_contracts_surface(dict(snapshot))
+    state_contract, transition_contract, alert_contract = _contract_bundle_views(normalized)
+    watch = _transition_watch_payload(normalized)
+
+    for field, value in watch.items():
+        if value is not None:
+            normalized[field] = value
+
+    for field in [
+        "ticker",
+        "good_idea_now",
+        "action",
+        "setup_state",
+        "state_family",
+        "state_source",
+        "state_reason",
+        "trigger_present",
+        "trigger_reason",
+        "structure_ready",
+        "approval_status",
+        "market_open",
+        "fresh_entry_allowed",
+        "time_gate_reason",
+        "invalidation",
+    ]:
+        value = state_contract.get(field)
+        if value is not None:
+            normalized[field] = value
+
+    if state_contract:
+        normalized["state_contract"] = state_contract
+    if transition_contract:
+        normalized["transition_contract"] = transition_contract
+    if alert_contract:
+        normalized["alert_contract"] = alert_contract
+
+    normalized["contracts"] = _build_contracts_bundle(
+        state_contract=state_contract or normalized.get("state_contract"),
+        transition_contract=transition_contract or normalized.get("transition_contract"),
+        alert_contract=alert_contract or normalized.get("alert_contract"),
+    )
+    return normalized
+
+
 def _contract_bundle_views(payload: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     contracts = _contracts_bundle_from_payload(payload)
     return (
@@ -9471,7 +9519,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     profile_key = f"{base_profile_key}__replay" if replay_profile_active else base_profile_key
 
     stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
-    previous_snapshot = stored_state.get("latest_snapshot")
+    previous_snapshot = _canonicalize_continuous_snapshot_contracts(stored_state.get("latest_snapshot"))
 
     on_demand_payload = await _build_on_demand_payload(on_demand_request)
     current_snapshot = _build_continuous_snapshot(
@@ -9524,6 +9572,8 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         transition_contract=transition_contract,
         alert_contract=alert_contract,
     )
+    current_snapshot = _canonicalize_continuous_snapshot_contracts(current_snapshot)
+    previous_snapshot = _canonicalize_continuous_snapshot_contracts(previous_snapshot)
 
     alert_payload = _build_continuous_alert_payload(
         previous_snapshot=previous_snapshot,
