@@ -8913,13 +8913,11 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
             "failed_reasons": decision_context.get("failed_reasons"),
         },
         "approval_context": {
-            "primary_blocker": approval_context.get("primary_blocker"),
             "next_flip_needed": approval_context.get("next_flip_needed"),
             "approval_ready_now": approval_context.get("approval_ready_now"),
             "approval_ready_on_completed_candle": approval_context.get(
                 "approval_ready_on_completed_candle"
             ),
-            "approval_status": approval_context.get("approval_status"),
         },
         "trigger_context": {
             "trigger_present": trigger_context.get("trigger_present"),
@@ -8929,21 +8927,17 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
         "winner_shift_context": {
             "shift_path": winner_shift_context.get("shift_path"),
             "any_shift": winner_shift_context.get("any_shift"),
-            "screened_reason": winner_shift_context.get("screened_reason"),
         },
         "iv_context": {
             "status": iv_context.get("status"),
-            "why": iv_context.get("why"),
         },
         "market_context": {
             "is_open": market_context.get("is_open"),
             "as_of_et": market_context.get("as_of_et"),
-            "session": market_context.get("session"),
         },
         "time_day_gate": {
             "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
             "reason": time_day_gate.get("reason"),
-            "policy": time_day_gate.get("policy"),
         },
     }
 
@@ -8954,12 +8948,9 @@ def _build_continuous_alert_candidate_excerpt(alert_candidate_context: Optional[
         return alert_candidate_context
     return {
         "alert_stage": alert_candidate_context.get("alert_stage"),
-        "alert_reason": alert_candidate_context.get("alert_reason"),
-        "alert_severity": alert_candidate_context.get("alert_severity"),
         "should_alert_candidate": alert_candidate_context.get("should_alert_candidate"),
         "next_flip_needed": alert_candidate_context.get("next_flip_needed"),
         "final_verdict": alert_candidate_context.get("final_verdict"),
-        "breakout_hold_pending": alert_candidate_context.get("breakout_hold_pending"),
     }
 
 
@@ -8969,10 +8960,7 @@ def _build_continuous_market_closed_tester_excerpt(market_closed_tester: Optiona
     return {
         "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
         "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
-        "underlying_structural_primary_blocker": market_closed_tester.get("underlying_structural_primary_blocker"),
         "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
-        "trigger_present_live": market_closed_tester.get("trigger_present_live"),
-        "trigger_reason_live": market_closed_tester.get("trigger_reason_live"),
         "testing_takeaway": market_closed_tester.get("testing_takeaway"),
     }
 
@@ -8980,10 +8968,16 @@ def _build_continuous_market_closed_tester_excerpt(market_closed_tester: Optiona
 def _build_continuous_replay_test_excerpt(replay_test_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not isinstance(replay_test_context, dict):
         return replay_test_context
+    enabled = replay_test_context.get("enabled")
+    status = replay_test_context.get("status")
+    if enabled is False or status == "disabled":
+        return {
+            "enabled": False,
+            "status": status or "disabled",
+        }
     return {
-        "ok": replay_test_context.get("ok"),
-        "enabled": replay_test_context.get("enabled"),
-        "status": replay_test_context.get("status"),
+        "enabled": enabled,
+        "status": status,
         "scope": replay_test_context.get("scope"),
         "why": replay_test_context.get("why"),
     }
