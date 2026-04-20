@@ -57,6 +57,8 @@ def _build_session_basis_context() -> Dict[str, Any]:
         "note": "SAFE-FAST structure uses RTH session-anchored 1H candles. Time of day is context only; no hard late-entry cutoff is enforced in code.",
     }
 
+    return response_payload
+
 
 def _is_allowed_setup_type_name(setup_type: Optional[str]) -> bool:
     return isinstance(setup_type, str) and setup_type in ALLOWED_SETUP_TYPES
@@ -9143,6 +9145,8 @@ def _strip_continuous_response_snapshot(snapshot: Optional[Dict[str, Any]]) -> O
         "would_alert_now",
         "should_alert_now",
         "alert_suppressed_reasons",
+        "state_contract",
+        "response_contract_marker",
     ]:
         cleaned_snapshot.pop(key, None)
     return cleaned_snapshot
