@@ -8078,7 +8078,7 @@ def _build_state_contract_from_snapshot(snapshot: Dict[str, Any], *, mode: str) 
         "ticker": summary.get("ticker") or snapshot.get("best_ticker"),
         "good_idea_now": summary.get("good_idea_now"),
         "action": summary.get("action"),
-        "setup_state": summary.get("setup_state"),
+        "setup_state": summary.get("setup_state") or state_contract.get("setup_state"),
         "final_verdict": snapshot.get("final_verdict"),
         "current_state": current_state,
         "state_family": state_family,
@@ -8088,9 +8088,9 @@ def _build_state_contract_from_snapshot(snapshot: Dict[str, Any], *, mode: str) 
         "decision_blockers": _ordered_unique_strings(snapshot.get("decision_blockers") or []),
         "failed_reasons": _ordered_unique_strings(snapshot.get("failed_reasons") or []),
         "next_flip_needed": snapshot.get("next_flip_needed"),
-        "trigger_present": snapshot.get("trigger_present"),
-        "trigger_reason": snapshot.get("trigger_reason"),
-        "structure_ready": snapshot.get("structure_ready"),
+        "trigger_present": _bundle_first_value(state_contract, snapshot, "trigger_present"),
+        "trigger_reason": _bundle_first_value(state_contract, snapshot, "trigger_reason"),
+        "structure_ready": _bundle_first_value(state_contract, snapshot, "structure_ready"),
         "approval_ready_now": snapshot.get("approval_ready_now"),
         "approval_ready_on_completed_candle": snapshot.get("approval_ready_on_completed_candle"),
         "approval_status": snapshot.get("approval_status"),
@@ -8452,20 +8452,26 @@ def _build_continuous_snapshot(
 
 
 def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    decision_blockers = [str(item) for item in (snapshot.get("decision_blockers") or [])]
+    state_contract, _, _ = _contract_bundle_views(snapshot)
+    decision_blockers = [
+        str(item)
+        for item in (_bundle_first_value(state_contract, snapshot, "decision_blockers", []) or [])
+    ]
     global_gate_failures = _ordered_unique_strings(snapshot.get("global_gate_failures") or [])
     setup_type = snapshot.get("setup_type")
     setup_allowed = _is_allowed_setup_type_name(setup_type)
-    trigger_present = bool(snapshot.get("trigger_present"))
-    approval_ready_now = bool(snapshot.get("approval_ready_now"))
-    approval_ready_on_completed_candle = bool(snapshot.get("approval_ready_on_completed_candle"))
-    invalidation_hit = bool(snapshot.get("invalidation_hit"))
-    market_open = bool(snapshot.get("market_open"))
-    fresh_entry_allowed = bool(snapshot.get("fresh_entry_allowed"))
-    next_flip_needed = snapshot.get("next_flip_needed")
-    final_verdict = str(snapshot.get("final_verdict") or "").upper()
-    breakout_hold_pending = bool(snapshot.get("breakout_hold_pending"))
-    thesis_gate_pending = bool(snapshot.get("thesis_gate_pending"))
+    trigger_present = bool(_bundle_first_value(state_contract, snapshot, "trigger_present", False))
+    approval_ready_now = bool(_bundle_first_value(state_contract, snapshot, "approval_ready_now", False))
+    approval_ready_on_completed_candle = bool(
+        _bundle_first_value(state_contract, snapshot, "approval_ready_on_completed_candle", False)
+    )
+    invalidation_hit = bool(_bundle_first_value(state_contract, snapshot, "invalidation_hit", False))
+    market_open = bool(_bundle_first_value(state_contract, snapshot, "market_open", False))
+    fresh_entry_allowed = bool(_bundle_first_value(state_contract, snapshot, "fresh_entry_allowed", False))
+    next_flip_needed = _bundle_first_value(state_contract, snapshot, "next_flip_needed")
+    final_verdict = str(_bundle_first_value(state_contract, snapshot, "final_verdict", "") or "").upper()
+    breakout_hold_pending = bool(_bundle_first_value(state_contract, snapshot, "breakout_hold_pending", False))
+    thesis_gate_pending = bool(_bundle_first_value(state_contract, snapshot, "thesis_gate_pending", False))
 
     hard_blockers = {"allowed_setup_type", "clear_room", "early_enough", "one_hour_clean_around_ema"}
     hard_blockers_active = [item for item in decision_blockers if item in hard_blockers]
@@ -8636,6 +8642,24 @@ def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
         if contracts.get("alert") and not payload.get("alert_contract"):
             payload["alert_contract"] = contracts.get("alert")
     return payload
+
+
+def _contract_bundle_views(payload: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    contracts = _contracts_bundle_from_payload(payload)
+    return (
+        contracts.get("state") or {},
+        contracts.get("transition") or {},
+        contracts.get("alert") or {},
+    )
+
+
+def _bundle_first_value(contract: Dict[str, Any], payload: Dict[str, Any], key: str, default: Any = None) -> Any:
+    if isinstance(contract, dict) and key in contract:
+        value = contract.get(key)
+        if value is not None:
+            return value
+    value = (payload or {}).get(key)
+    return default if value is None else value
 
 def _continuous_meaningful_changed_fields(
     previous: Dict[str, Any],
@@ -9312,15 +9336,20 @@ def _strip_continuous_response_snapshot(snapshot: Optional[Dict[str, Any]]) -> O
 
 
 def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    current_state = snapshot.get("current_state")
+    state_contract, _, alert_contract = _contract_bundle_views(snapshot)
+    current_state = _bundle_first_value(state_contract, snapshot, "current_state")
     latent_structure_state = snapshot.get("latent_structure_state")
-    primary_blocker = snapshot.get("primary_blocker")
-    next_flip_needed = snapshot.get("next_flip_needed")
+    primary_blocker = _bundle_first_value(state_contract, snapshot, "primary_blocker")
+    next_flip_needed = _bundle_first_value(state_contract, snapshot, "next_flip_needed")
     summary = snapshot.get("summary") or {}
-    time_gate_reason = snapshot.get("time_gate_reason")
-    market_open = snapshot.get("market_open")
-    decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
-    failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
+    time_gate_reason = _bundle_first_value(state_contract, snapshot, "time_gate_reason")
+    market_open = _bundle_first_value(state_contract, snapshot, "market_open")
+    decision_blockers = _ordered_unique_strings(
+        _bundle_first_value(state_contract, snapshot, "decision_blockers", []) or []
+    )
+    failed_reasons = _ordered_unique_strings(
+        _bundle_first_value(state_contract, snapshot, "failed_reasons", []) or []
+    )
     market_closed_tester = snapshot.get("market_closed_tester") or {}
     replay_test_context = snapshot.get("replay_test_context") or {}
 
@@ -9351,22 +9380,22 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     elif market_open is False and underlying_state != current_state and underlying_state is not None:
         summary_note = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
 
-    good_idea_now = summary.get("good_idea_now")
-    ticker = summary.get("ticker")
+    good_idea_now = summary.get("good_idea_now") or state_contract.get("good_idea_now")
+    ticker = summary.get("ticker") or state_contract.get("ticker")
     action = _normalize_trade_day_action(
-        summary.get("action"),
-        summary.get("setup_state"),
+        summary.get("action") or state_contract.get("action"),
+        summary.get("setup_state") or state_contract.get("setup_state"),
         good_idea_now,
     )
     market_closed_context_only = bool(market_closed_tester.get("market_closed_context_only"))
     if market_closed_context_only:
         action = "wait for next session"
     acceptable_condition = summary.get("what_would_make_it_acceptable")
-    alert_reason = (snapshot.get("alert_candidate_context") or {}).get("alert_reason")
-    alert_stage = (snapshot.get("alert_candidate_context") or {}).get("alert_stage")
+    alert_reason = alert_contract.get("alert_reason") or (snapshot.get("alert_candidate_context") or {}).get("alert_reason")
+    alert_stage = alert_contract.get("alert_stage") or (snapshot.get("alert_candidate_context") or {}).get("alert_stage")
 
     if good_idea_now == "YES":
-        next_step_text = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
+        next_step_text = _bundle_first_value(state_contract, snapshot, "invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
     elif acceptable_condition:
         next_step_text = acceptable_condition
     elif next_flip_needed:
@@ -9374,7 +9403,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     elif effective_primary_blocker:
         next_step_text = _humanize_next_step(effective_primary_blocker)
     else:
-        next_step_text = snapshot.get("invalidation") or "Wait for a cleaner SAFE-FAST state."
+        next_step_text = _bundle_first_value(state_contract, snapshot, "invalidation") or "Wait for a cleaner SAFE-FAST state."
 
     also_failing = _derive_also_failing_line(
         failed_reasons,
@@ -9388,7 +9417,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         good_idea_now=good_idea_now,
         reason=summary_note,
         next_step=next_step_text,
-        invalidation=snapshot.get("invalidation"),
+        invalidation=_bundle_first_value(state_contract, snapshot, "invalidation"),
         market_closed_context_only=market_closed_context_only,
         also_failing=also_failing,
         trap_line=trap_line,
@@ -9398,15 +9427,15 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "ticker": ticker,
         "good_idea_now": good_idea_now,
         "action": action,
-        "setup_state": summary.get("setup_state"),
+        "setup_state": summary.get("setup_state") or state_contract.get("setup_state"),
         "now_state": current_state,
         "underlying_state": underlying_state,
         "primary_blocker": primary_blocker,
         "next_flip_needed": next_flip_needed,
         "top_blockers": top_blockers,
-        "trigger_present": snapshot.get("trigger_present"),
-        "trigger_reason": snapshot.get("trigger_reason"),
-        "structure_ready": snapshot.get("structure_ready"),
+        "trigger_present": _bundle_first_value(state_contract, snapshot, "trigger_present"),
+        "trigger_reason": _bundle_first_value(state_contract, snapshot, "trigger_reason"),
+        "structure_ready": _bundle_first_value(state_contract, snapshot, "structure_ready"),
         "market_open": market_open,
         "time_gate_reason": time_gate_reason,
         "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
@@ -9417,10 +9446,10 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
         "alert_stage": alert_stage,
         "alert_reason": alert_reason,
-        "alert_dispatch_state": snapshot.get("alert_dispatch_state"),
-        "would_alert_now": snapshot.get("would_alert_now"),
-        "should_alert_now": snapshot.get("should_alert_now"),
-        "alert_suppressed_reasons": snapshot.get("alert_suppressed_reasons"),
+        "alert_dispatch_state": alert_contract.get("dispatch_state") or snapshot.get("alert_dispatch_state"),
+        "would_alert_now": alert_contract.get("would_alert_now") if "would_alert_now" in alert_contract else snapshot.get("would_alert_now"),
+        "should_alert_now": alert_contract.get("should_alert") if "should_alert" in alert_contract else snapshot.get("should_alert_now"),
+        "alert_suppressed_reasons": alert_contract.get("suppressed_reasons") or snapshot.get("alert_suppressed_reasons"),
         "headline": surface.get("headline"),
         "watchouts": surface.get("watchouts"),
         "next_step": surface.get("next_step") or next_step_text,
@@ -9428,9 +9457,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "response_text": surface.get("response_text") or "",
         "macro_brief": snapshot.get("macro_brief"),
         "first_failed_reason": failed_reasons[0] if failed_reasons else None,
-        "breakout_hold_pending": snapshot.get("breakout_hold_pending"),
-        "thesis_gate_pending": snapshot.get("thesis_gate_pending"),
-        "invalidation": snapshot.get("invalidation"),
+        "breakout_hold_pending": _bundle_first_value(state_contract, snapshot, "breakout_hold_pending"),
+        "thesis_gate_pending": _bundle_first_value(state_contract, snapshot, "thesis_gate_pending"),
+        "invalidation": _bundle_first_value(state_contract, snapshot, "invalidation"),
     }
 
 
