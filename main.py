@@ -9592,13 +9592,6 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
 
     stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
     previous_snapshot = _resolve_previous_continuous_snapshot(stored_state)
-    stored_state_sources = {
-        "latest_snapshot": bool((stored_state or {}).get("latest_snapshot")),
-        "latest_snapshot_compact": bool((stored_state or {}).get("latest_snapshot_compact")),
-        "previous_snapshot": bool((stored_state or {}).get("previous_snapshot")),
-        "previous_snapshot_compact": bool((stored_state or {}).get("previous_snapshot_compact")),
-        "contracts": bool((stored_state or {}).get("contracts")),
-    }
 
     on_demand_payload = await _build_on_demand_payload(on_demand_request)
     current_snapshot = _build_continuous_snapshot(
@@ -9665,8 +9658,6 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     state_file = None
     compact_previous_snapshot = _compact_continuous_persistence_snapshot(previous_snapshot)
     compact_current_snapshot = _compact_continuous_persistence_snapshot(current_snapshot)
-    state_file_exists_after_save = False
-    state_file_size_bytes = 0
     if request.persist_state:
         persisted = True
         state_file_path = _continuous_state_path(profile_key)
@@ -9689,12 +9680,6 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
                 "last_alert_timestamp": current_snapshot.get("timestamp_et") if should_alert else stored_state.get("last_alert_timestamp"),
             },
         )
-        try:
-            state_file_exists_after_save = state_file_path.exists()
-            state_file_size_bytes = state_file_path.stat().st_size if state_file_exists_after_save else 0
-        except Exception:
-            state_file_exists_after_save = False
-            state_file_size_bytes = 0
 
     response_payload = {
         "ok": bool(on_demand_payload.get("ok")),
@@ -9728,15 +9713,6 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "persisted": persisted,
             "state_file": state_file,
             "previous_snapshot_found": bool(previous_snapshot),
-        },
-        "persistence_debug": {
-            "stored_state_loaded": bool(stored_state),
-            "stored_state_keys": sorted(list((stored_state or {}).keys())),
-            "stored_state_sources": stored_state_sources,
-            "resolved_previous_snapshot_nonempty": bool(previous_snapshot),
-            "resolved_previous_snapshot_keys": sorted(list((previous_snapshot or {}).keys())),
-            "state_file_exists_after_save": state_file_exists_after_save,
-            "state_file_size_bytes": state_file_size_bytes,
         },
         "read_this_first": "readable_summary",
         "api_surface": {
