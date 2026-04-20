@@ -9487,6 +9487,9 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and latent_structure_state:
         underlying_state = latent_structure_state
 
+    human_primary_blocker = _humanize_blocker_key(primary_blocker) if primary_blocker else None
+    human_next_flip_needed = _humanize_blocker_key(next_flip_needed) if next_flip_needed else None
+
     filtered_blockers = [
         blocker for blocker in decision_blockers
         if not (blocker == "time_day_gate" and underlying_state != current_state)
@@ -9503,6 +9506,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
             top_blockers.append(blocker)
         if len(top_blockers) >= 3:
             break
+
+    human_top_blockers: List[str] = []
+    for blocker in top_blockers:
+        human_blocker = _humanize_blocker_key(blocker)
+        if human_blocker and human_blocker not in human_top_blockers:
+            human_top_blockers.append(human_blocker)
 
     summary_note = snapshot.get("reason_display") or summary.get("why")
     if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
@@ -9560,9 +9569,12 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "setup_state": summary.get("setup_state") or state_contract.get("setup_state"),
         "now_state": current_state,
         "underlying_state": underlying_state,
-        "primary_blocker": primary_blocker,
-        "next_flip_needed": next_flip_needed,
-        "top_blockers": top_blockers,
+        "primary_blocker": human_primary_blocker,
+        "next_flip_needed": human_next_flip_needed,
+        "top_blockers": human_top_blockers,
+        "primary_blocker_key": primary_blocker,
+        "next_flip_needed_key": next_flip_needed,
+        "top_blocker_keys": top_blockers,
         "trigger_present": _bundle_first_value(state_contract, snapshot, "trigger_present"),
         "trigger_reason": _bundle_first_value(state_contract, snapshot, "trigger_reason"),
         "structure_ready": _bundle_first_value(state_contract, snapshot, "structure_ready"),
