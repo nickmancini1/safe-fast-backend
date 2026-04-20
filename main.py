@@ -8905,10 +8905,8 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     iv_context = on_demand_payload.get("iv_context") or {}
     market_context = on_demand_payload.get("market_context") or {}
     time_day_gate = on_demand_payload.get("time_day_gate") or {}
-    market_closed_tester = _build_market_closed_tester_block(on_demand_payload) or {}
 
     return {
-        "build_tag": on_demand_payload.get("build_tag"),
         "decision_context": {
             "primary_blocker": decision_context.get("primary_blocker"),
             "blockers": decision_context.get("blockers"),
@@ -8946,13 +8944,6 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
             "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
             "reason": time_day_gate.get("reason"),
             "policy": time_day_gate.get("policy"),
-        },
-        "market_closed_tester": {
-            "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
-            "underlying_structural_verdict": market_closed_tester.get(
-                "underlying_structural_verdict"
-            ),
-            "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
         },
     }
 
@@ -9220,10 +9211,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "market_closed_tester": current_snapshot.get("market_closed_tester"),
         "replay_test_context": current_snapshot.get("replay_test_context"),
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
-        "on_demand_excerpt": {
-            **_build_continuous_on_demand_excerpt(on_demand_payload),
-            "replay_test_context": current_snapshot.get("replay_test_context"),
-        },
+        "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
     }
     return _json_safe_for_response(response_payload)
 
