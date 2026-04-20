@@ -8524,6 +8524,49 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
         "breakout_hold_pending": breakout_hold_pending,
     }
 
+
+
+def _transition_watch_payload(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    snapshot = snapshot or {}
+    state_contract = snapshot.get("state_contract") or {}
+    return {
+        "final_verdict": state_contract.get("final_verdict", snapshot.get("final_verdict")),
+        "best_ticker": snapshot.get("best_ticker"),
+        "primary_blocker": state_contract.get("primary_blocker", snapshot.get("primary_blocker")),
+        "next_flip_needed": state_contract.get("next_flip_needed", snapshot.get("next_flip_needed")),
+        "approval_ready_now": state_contract.get("approval_ready_now", snapshot.get("approval_ready_now")),
+        "approval_ready_on_completed_candle": state_contract.get(
+            "approval_ready_on_completed_candle",
+            snapshot.get("approval_ready_on_completed_candle"),
+        ),
+        "breakout_hold_pending": state_contract.get("breakout_hold_pending", snapshot.get("breakout_hold_pending")),
+        "thesis_gate_pending": state_contract.get("thesis_gate_pending", snapshot.get("thesis_gate_pending")),
+        "current_state": state_contract.get("current_state", snapshot.get("current_state")),
+        "global_gate_failures": snapshot.get("global_gate_failures"),
+        "invalidation_hit": state_contract.get("invalidation_hit", snapshot.get("invalidation_hit")),
+        "open_positions": snapshot.get("open_positions"),
+        "weekly_trade_count": snapshot.get("weekly_trade_count"),
+    }
+
+
+def _build_transition_contract(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+    transition_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "contract_version": "safe_fast_transition_v1",
+        "contract_marker": "safe_fast_transition_contract_surface_v1",
+        "transition_type": transition_summary.get("transition_type"),
+        "meaningful_transition": bool(transition_summary.get("meaningful_transition")),
+        "should_alert_candidate": bool(transition_summary.get("should_alert_candidate")),
+        "summary": transition_summary.get("summary"),
+        "primary_event": transition_summary.get("primary_event"),
+        "changed_fields": transition_summary.get("changed_fields") or {},
+        "previous_state": _transition_watch_payload(previous),
+        "current_state": _transition_watch_payload(current),
+    }
+
 def _continuous_meaningful_changed_fields(
     previous: Dict[str, Any],
     current: Dict[str, Any],
@@ -8533,61 +8576,63 @@ def _continuous_meaningful_changed_fields(
     def _add(field: str, previous_value: Any, current_value: Any) -> None:
         changes[field] = {"previous": previous_value, "current": current_value}
 
-    prev_verdict = str(previous.get("final_verdict") or "").upper()
-    curr_verdict = str(current.get("final_verdict") or "").upper()
+    previous_watch = _transition_watch_payload(previous)
+    current_watch = _transition_watch_payload(current)
+    prev_verdict = str(previous_watch.get("final_verdict") or "").upper()
+    curr_verdict = str(current_watch.get("final_verdict") or "").upper()
 
     if prev_verdict != curr_verdict:
         _add("final_verdict", prev_verdict, curr_verdict)
 
-    if previous.get("current_state") != current.get("current_state"):
-        _add("current_state", previous.get("current_state"), current.get("current_state"))
+    if previous_watch.get("current_state") != current_watch.get("current_state"):
+        _add("current_state", previous_watch.get("current_state"), current_watch.get("current_state"))
 
-    if previous.get("primary_blocker") != current.get("primary_blocker"):
-        _add("primary_blocker", previous.get("primary_blocker"), current.get("primary_blocker"))
+    if previous_watch.get("primary_blocker") != current_watch.get("primary_blocker"):
+        _add("primary_blocker", previous_watch.get("primary_blocker"), current_watch.get("primary_blocker"))
 
-    if previous.get("next_flip_needed") != current.get("next_flip_needed") and curr_verdict == "PENDING":
-        _add("next_flip_needed", previous.get("next_flip_needed"), current.get("next_flip_needed"))
+    if previous_watch.get("next_flip_needed") != current_watch.get("next_flip_needed") and curr_verdict == "PENDING":
+        _add("next_flip_needed", previous_watch.get("next_flip_needed"), current_watch.get("next_flip_needed"))
 
-    if previous.get("approval_ready_now") != current.get("approval_ready_now"):
-        _add("approval_ready_now", previous.get("approval_ready_now"), current.get("approval_ready_now"))
+    if previous_watch.get("approval_ready_now") != current_watch.get("approval_ready_now"):
+        _add("approval_ready_now", previous_watch.get("approval_ready_now"), current_watch.get("approval_ready_now"))
 
-    if previous.get("approval_ready_on_completed_candle") != current.get("approval_ready_on_completed_candle"):
+    if previous_watch.get("approval_ready_on_completed_candle") != current_watch.get("approval_ready_on_completed_candle"):
         _add(
             "approval_ready_on_completed_candle",
-            previous.get("approval_ready_on_completed_candle"),
-            current.get("approval_ready_on_completed_candle"),
+            previous_watch.get("approval_ready_on_completed_candle"),
+            current_watch.get("approval_ready_on_completed_candle"),
         )
 
-    if previous.get("breakout_hold_pending") != current.get("breakout_hold_pending"):
-        _add("breakout_hold_pending", previous.get("breakout_hold_pending"), current.get("breakout_hold_pending"))
+    if previous_watch.get("breakout_hold_pending") != current_watch.get("breakout_hold_pending"):
+        _add("breakout_hold_pending", previous_watch.get("breakout_hold_pending"), current_watch.get("breakout_hold_pending"))
 
-    if previous.get("thesis_gate_pending") != current.get("thesis_gate_pending"):
-        _add("thesis_gate_pending", previous.get("thesis_gate_pending"), current.get("thesis_gate_pending"))
+    if previous_watch.get("thesis_gate_pending") != current_watch.get("thesis_gate_pending"):
+        _add("thesis_gate_pending", previous_watch.get("thesis_gate_pending"), current_watch.get("thesis_gate_pending"))
 
-    if previous.get("invalidation_hit") != current.get("invalidation_hit"):
-        _add("invalidation_hit", previous.get("invalidation_hit"), current.get("invalidation_hit"))
+    if previous_watch.get("invalidation_hit") != current_watch.get("invalidation_hit"):
+        _add("invalidation_hit", previous_watch.get("invalidation_hit"), current_watch.get("invalidation_hit"))
 
-    prev_global = _ordered_unique_strings(previous.get("global_gate_failures") or [])
-    curr_global = _ordered_unique_strings(current.get("global_gate_failures") or [])
+    prev_global = _ordered_unique_strings(previous_watch.get("global_gate_failures") or [])
+    curr_global = _ordered_unique_strings(current_watch.get("global_gate_failures") or [])
     if prev_global != curr_global:
         _add("global_gate_failures", prev_global, curr_global)
 
-    if previous.get("best_ticker") != current.get("best_ticker") and prev_verdict != curr_verdict:
-        _add("best_ticker", previous.get("best_ticker"), current.get("best_ticker"))
+    if previous_watch.get("best_ticker") != current_watch.get("best_ticker") and prev_verdict != curr_verdict:
+        _add("best_ticker", previous_watch.get("best_ticker"), current_watch.get("best_ticker"))
 
     if (
-        previous.get("open_positions") != current.get("open_positions")
-        or previous.get("weekly_trade_count") != current.get("weekly_trade_count")
+        previous_watch.get("open_positions") != current_watch.get("open_positions")
+        or previous_watch.get("weekly_trade_count") != current_watch.get("weekly_trade_count")
     ):
         _add(
             "account_state",
             {
-                "open_positions": previous.get("open_positions"),
-                "weekly_trade_count": previous.get("weekly_trade_count"),
+                "open_positions": previous_watch.get("open_positions"),
+                "weekly_trade_count": previous_watch.get("weekly_trade_count"),
             },
             {
-                "open_positions": current.get("open_positions"),
-                "weekly_trade_count": current.get("weekly_trade_count"),
+                "open_positions": current_watch.get("open_positions"),
+                "weekly_trade_count": current_watch.get("weekly_trade_count"),
             },
         )
 
@@ -8603,8 +8648,11 @@ def _continuous_context_changed_fields(
     def _add(field: str, previous_value: Any, current_value: Any) -> None:
         changes[field] = {"previous": previous_value, "current": current_value}
 
-    if previous.get("best_ticker") != current.get("best_ticker"):
-        _add("best_ticker", previous.get("best_ticker"), current.get("best_ticker"))
+    previous_watch = _transition_watch_payload(previous)
+    current_watch = _transition_watch_payload(current)
+
+    if previous_watch.get("best_ticker") != current_watch.get("best_ticker"):
+        _add("best_ticker", previous_watch.get("best_ticker"), current_watch.get("best_ticker"))
 
     return changes
 
@@ -9390,6 +9438,11 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         },
         "readable_summary": current_snapshot.get("readable_summary"),
         "state_contract": current_snapshot.get("state_contract"),
+        "transition_contract": _build_transition_contract(
+            previous_snapshot,
+            current_snapshot,
+            true_transition_context,
+        ),
         "response_contract_marker": current_snapshot.get("response_contract_marker") or "safe_fast_state_contract_surface_v2",
         "alert_candidate_context": _build_continuous_alert_candidate_excerpt(
             current_snapshot.get("alert_candidate_context")
