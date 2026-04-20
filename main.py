@@ -7566,7 +7566,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         if item not in (checklist_block.get("failed_items") or [])
     ]
 
-    return {
+    response_payload = {
         "ok": True,
         "mode": "on_demand",
         "build_tag": BUILD_TAG,
