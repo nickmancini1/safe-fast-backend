@@ -8968,6 +8968,8 @@ def _strip_continuous_response_snapshot(snapshot: Optional[Dict[str, Any]]) -> O
         "market_closed_tester",
         "replay_test_context",
         "compact_ticker_summaries",
+        "summary",
+        "reason_display",
         "alert_dispatch_state",
         "would_alert_now",
         "should_alert_now",
