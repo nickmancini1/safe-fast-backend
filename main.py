@@ -9988,3 +9988,5 @@ async def safe_fast_on_demand(
 ) -> Any:
     payload = await _build_on_demand_payload(request)
     return _ensure_contracts_surface(payload)
+
+# repackaged deploy artifact to force a distinct commit handle
