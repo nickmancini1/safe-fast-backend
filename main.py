@@ -4977,6 +4977,30 @@ def _humanize_next_step(blocker: Any) -> str:
     return "Wait for a cleaner SAFE-FAST state."
 
 
+def _humanize_surface_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    mapping = {
+        "one_hour_clean_around_ema": "clean 1H structure around the 50 EMA",
+        "clear_room": "clear room to the next level",
+        "early_enough": "early entry quality",
+        "clear_trigger": "a valid trigger",
+        "wall_thesis_fit": "wall-thesis fit",
+        "time_day_gate": "market open / live-entry window",
+        "time_gate_context": "market open / live-entry window",
+        "failed_breakout_hold": "a confirmed breakout hold",
+        "next_bar_hold_failed": "a confirmed breakout hold",
+        "ath_open_air": "rebuilt 1H structure near all-time highs",
+    }
+
+    for raw_key, human_text in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+        text = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(raw_key)}(?![A-Za-z0-9_])", human_text, text)
+
+    return text
+
+
 def _derive_also_failing_line(
     failed_reasons: Optional[List[Any]],
     primary_reason: Any,
@@ -5167,6 +5191,8 @@ def _build_simple_output_block(
     failed_reasons: Optional[List[Any]] = None,
     trap_check_context: Optional[Dict[str, Any]] = None,
     next_flip_needed: Optional[str] = None,
+    primary_blocker: Optional[str] = None,
+    decision_blockers: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     signal_present = bool(trigger_state.get("trigger_present") is True)
     macro_brief = user_facing.get("macro_brief")
@@ -5192,6 +5218,25 @@ def _build_simple_output_block(
     trap_line = _derive_trap_line(trap_check_context)
     next_step = acceptable_condition or _humanize_next_step(next_flip_needed)
 
+    blocker_keys = _ordered_unique_strings(decision_blockers or [])
+    top_blocker_keys: List[str] = []
+    effective_primary_blocker = str(primary_blocker or next_flip_needed or "").strip() or None
+    if effective_primary_blocker:
+        top_blocker_keys.append(effective_primary_blocker)
+    for blocker in blocker_keys:
+        if blocker not in top_blocker_keys:
+            top_blocker_keys.append(blocker)
+        if len(top_blocker_keys) >= 3:
+            break
+
+    human_primary_blocker = _humanize_blocker_key(effective_primary_blocker) if effective_primary_blocker else None
+    human_next_flip_needed = _humanize_blocker_key(next_flip_needed) if next_flip_needed else None
+    human_top_blockers: List[str] = []
+    for blocker in top_blocker_keys:
+        human_blocker = _humanize_blocker_key(blocker)
+        if human_blocker and human_blocker not in human_top_blockers:
+            human_top_blockers.append(human_blocker)
+
     surface = _build_decisive_response_surface(
         ticker=user_facing.get("ticker"),
         action=normalized_action,
@@ -5215,6 +5260,12 @@ def _build_simple_output_block(
         "what_would_make_it_acceptable": acceptable_condition,
         "macro_brief": macro_brief,
         "signal_present": signal_present,
+        "primary_blocker": human_primary_blocker,
+        "next_flip_needed": human_next_flip_needed,
+        "top_blockers": human_top_blockers,
+        "primary_blocker_key": effective_primary_blocker,
+        "next_flip_needed_key": next_flip_needed,
+        "top_blocker_keys": top_blocker_keys,
         "also_failing": also_failing,
         "trap_line": trap_line,
         "watchouts": surface.get("watchouts"),
@@ -7641,6 +7692,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             failed_reasons=failed_reasons_block,
             trap_check_context=trap_check_context_block,
             next_flip_needed=approval_context_block.get("next_flip_needed"),
+            primary_blocker=approval_context_block.get("primary_blocker"),
+            decision_blockers=approval_context_block.get("blockers"),
         ),
         "screened_best_context": screened_best_context_block,
         "market_context": market_context,
@@ -8985,6 +9038,7 @@ def _build_alert_contract(
             "deduped": bool(ctx.get("deduped")),
             "suppressed_reasons": ctx.get("suppressed_reasons") or [],
             "alert_reason": ctx.get("alert_reason"),
+            "alert_reason_key": ctx.get("alert_reason_key"),
             "alert_severity": ctx.get("alert_severity"),
         }
     return {
@@ -9264,6 +9318,9 @@ def _build_continuous_alert_decision_context(
     else:
         dispatch_state = "TRACK_ONLY"
 
+    raw_alert_reason = alert_candidate_context.get("alert_reason")
+    human_alert_reason = _humanize_surface_text(raw_alert_reason)
+
     return {
         "ok": True,
         "dispatch_state": dispatch_state,
@@ -9277,7 +9334,8 @@ def _build_continuous_alert_decision_context(
         "deduped": deduped,
         "suppressed_reasons": suppressed_reasons,
         "alert_stage": alert_candidate_context.get("alert_stage"),
-        "alert_reason": alert_candidate_context.get("alert_reason"),
+        "alert_reason": human_alert_reason,
+        "alert_reason_key": raw_alert_reason if human_alert_reason and human_alert_reason != raw_alert_reason else None,
         "alert_severity": alert_candidate_context.get("alert_severity"),
     }
 
@@ -9531,6 +9589,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         action = "wait for next session"
     acceptable_condition = summary.get("what_would_make_it_acceptable")
     alert_reason = alert_contract.get("alert_reason") or (snapshot.get("alert_candidate_context") or {}).get("alert_reason")
+    human_alert_reason = _humanize_surface_text(alert_reason)
     alert_stage = alert_contract.get("alert_stage") or (snapshot.get("alert_candidate_context") or {}).get("alert_stage")
 
     if good_idea_now == "YES":
@@ -9587,7 +9646,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_trade_allowed": replay_test_context.get("replay_trade_allowed"),
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
         "alert_stage": alert_stage,
-        "alert_reason": alert_reason,
+        "alert_reason": human_alert_reason,
+        "alert_reason_key": alert_reason if human_alert_reason and human_alert_reason != alert_reason else None,
         "alert_dispatch_state": alert_contract.get("dispatch_state") or snapshot.get("alert_dispatch_state"),
         "would_alert_now": alert_contract.get("would_alert_now") if "would_alert_now" in alert_contract else snapshot.get("would_alert_now"),
         "should_alert_now": alert_contract.get("should_alert") if "should_alert" in alert_contract else snapshot.get("should_alert_now"),
