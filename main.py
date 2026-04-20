@@ -7719,6 +7719,18 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         time_day_gate=time_day_gate,
         iv_context=iv_context,
     )
+    response_payload["transition_contract"] = _build_transition_contract(
+        None,
+        response_payload,
+        {
+            "transition_type": "ON_DEMAND_EVALUATION",
+            "meaningful_transition": False,
+            "should_alert_candidate": False,
+            "summary": "On-demand evaluation snapshot created.",
+            "primary_event": None,
+            "changed_fields": {},
+        },
+    )
     response_payload["response_contract_marker"] = "safe_fast_state_contract_surface_v2"
     return response_payload
 
