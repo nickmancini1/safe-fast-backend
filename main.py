@@ -8297,9 +8297,6 @@ def _build_continuous_snapshot(
     snapshot["replay_market_open"] = replay_test_context.get("replay_market_open")
     snapshot["replay_fresh_entry_allowed"] = replay_test_context.get("replay_fresh_entry_allowed")
     snapshot["alert_candidate_context"] = _derive_continuous_alert_candidate_context(snapshot)
-    snapshot["alert_stage"] = snapshot["alert_candidate_context"].get("alert_stage")
-    snapshot["alert_reason"] = snapshot["alert_candidate_context"].get("alert_reason")
-    snapshot["alert_severity"] = snapshot["alert_candidate_context"].get("alert_severity")
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
 
@@ -8849,9 +8846,9 @@ def _build_continuous_alert_decision_context(
         "replay_profile_active": replay_profile_active,
         "deduped": deduped,
         "suppressed_reasons": suppressed_reasons,
-        "alert_stage": current_snapshot.get("alert_stage"),
-        "alert_reason": current_snapshot.get("alert_reason"),
-        "alert_severity": current_snapshot.get("alert_severity"),
+        "alert_stage": alert_candidate_context.get("alert_stage"),
+        "alert_reason": alert_candidate_context.get("alert_reason"),
+        "alert_severity": alert_candidate_context.get("alert_severity"),
     }
 
 
@@ -9032,7 +9029,8 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
     if market_closed_context_only:
         action = "wait for next session"
     acceptable_condition = summary.get("what_would_make_it_acceptable")
-    alert_reason = snapshot.get("alert_reason")
+    alert_reason = (snapshot.get("alert_candidate_context") or {}).get("alert_reason")
+    alert_stage = (snapshot.get("alert_candidate_context") or {}).get("alert_stage")
 
     if good_idea_now == "YES":
         next_step_text = snapshot.get("invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
@@ -9084,7 +9082,7 @@ def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, An
         "replay_test_enabled": replay_test_context.get("enabled"),
         "replay_trade_allowed": replay_test_context.get("replay_trade_allowed"),
         "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
-        "alert_stage": snapshot.get("alert_stage"),
+        "alert_stage": alert_stage,
         "alert_reason": alert_reason,
         "alert_dispatch_state": snapshot.get("alert_dispatch_state"),
         "would_alert_now": snapshot.get("would_alert_now"),
