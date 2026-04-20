@@ -9124,6 +9124,7 @@ def _build_true_transition_context(
             "should_alert_candidate": False,
             "transition_detected": False,
             "summary": "Initial shadow snapshot created.",
+            "summary_key": None,
             "primary_event": None,
             "events": [],
             "watched_fields": watched_fields,
@@ -9135,7 +9136,14 @@ def _build_true_transition_context(
     changed_fields = _continuous_meaningful_changed_fields(previous, current)
     context_changed_fields = _continuous_context_changed_fields(previous, current)
 
-    def _add_event(event: str, previous_value: Any, current_value: Any, severity: str, summary: str) -> None:
+    def _add_event(
+        event: str,
+        previous_value: Any,
+        current_value: Any,
+        severity: str,
+        summary: str,
+        summary_key: Optional[str] = None,
+    ) -> None:
         events.append(
             {
                 "event": event,
@@ -9143,6 +9151,7 @@ def _build_true_transition_context(
                 "current": current_value,
                 "severity": severity,
                 "summary": summary,
+                "summary_key": summary_key,
             }
         )
 
@@ -9153,6 +9162,7 @@ def _build_true_transition_context(
             current.get("invalidation_hit"),
             "high",
             "Invalidation hit. Exit now.",
+            None,
         )
 
     if "final_verdict" in changed_fields:
@@ -9164,15 +9174,21 @@ def _build_true_transition_context(
             current.get("final_verdict"),
             severity,
             f"Final verdict changed from {previous.get('final_verdict')} to {current.get('final_verdict')}.",
+            None,
         )
 
     if "primary_blocker" in changed_fields:
+        prev_blocker_key = previous.get("primary_blocker")
+        curr_blocker_key = current.get("primary_blocker")
+        prev_blocker = _humanize_blocker_key(prev_blocker_key)
+        curr_blocker = _humanize_blocker_key(curr_blocker_key)
         _add_event(
             "PRIMARY_BLOCKER_CHANGED",
             previous.get("primary_blocker"),
             current.get("primary_blocker"),
             "medium",
-            f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}.",
+            f"Primary blocker changed from {prev_blocker} to {curr_blocker}.",
+            f"Primary blocker changed from {prev_blocker_key} to {curr_blocker_key}.",
         )
 
     if "approval_ready_on_completed_candle" in changed_fields:
@@ -9182,6 +9198,7 @@ def _build_true_transition_context(
             current.get("approval_ready_on_completed_candle"),
             "high" if current.get("approval_ready_on_completed_candle") else "medium",
             "Completed-candle approval state changed.",
+            None,
         )
 
     if "approval_ready_now" in changed_fields:
@@ -9191,6 +9208,7 @@ def _build_true_transition_context(
             current.get("approval_ready_now"),
             "high" if current.get("approval_ready_now") else "medium",
             "Intrabar approval state changed.",
+            None,
         )
 
     if "breakout_hold_pending" in changed_fields:
@@ -9200,6 +9218,7 @@ def _build_true_transition_context(
             current.get("breakout_hold_pending"),
             "medium",
             "Breakout hold confirmation state changed.",
+            None,
         )
 
     if "global_gate_failures" in changed_fields:
@@ -9209,6 +9228,7 @@ def _build_true_transition_context(
             changed_fields["global_gate_failures"]["current"],
             "medium",
             "Final gate blocker state changed.",
+            None,
         )
 
     if "best_ticker" in changed_fields:
@@ -9218,6 +9238,7 @@ def _build_true_transition_context(
             current.get("best_ticker"),
             "medium",
             f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')} with a state change.",
+            None,
         )
 
     if "account_state" in changed_fields:
@@ -9227,18 +9248,25 @@ def _build_true_transition_context(
             changed_fields["account_state"]["current"],
             "medium",
             "Account state changed.",
+            None,
         )
 
     if "next_flip_needed" in changed_fields:
+        prev_flip_key = previous.get("next_flip_needed")
+        curr_flip_key = current.get("next_flip_needed")
+        prev_flip = _humanize_blocker_key(prev_flip_key)
+        curr_flip = _humanize_blocker_key(curr_flip_key)
         _add_event(
             "NEXT_FLIP_CHANGED",
             previous.get("next_flip_needed"),
             current.get("next_flip_needed"),
             "medium",
-            f"Next flip needed changed from {previous.get('next_flip_needed')} to {current.get('next_flip_needed')}.",
+            f"Next flip needed changed from {prev_flip} to {curr_flip}.",
+            f"Next flip needed changed from {prev_flip_key} to {curr_flip_key}.",
         )
 
     transition_detected = bool(events)
+    summary_key = None
     if not transition_detected:
         transition_type = "NO_TRUE_TRANSITION"
         severity = "info"
@@ -9253,12 +9281,15 @@ def _build_true_transition_context(
         transition_type = events[0]["event"]
         severity = events[0]["severity"]
         summary = events[0]["summary"]
+        summary_key = events[0].get("summary_key")
         primary_event = events[0]["event"]
     else:
         highest = {"info": 0, "medium": 1, "high": 2}
         transition_type = "MULTIPLE_TRUE_TRANSITIONS"
         severity = max((event["severity"] for event in events), key=lambda x: highest.get(x, 0))
         summary = " | ".join(event["summary"] for event in events)
+        raw_parts = [event.get("summary_key") or event.get("summary") for event in events]
+        summary_key = " | ".join(part for part in raw_parts if part)
         primary_event = events[0]["event"]
 
     return {
@@ -9272,6 +9303,7 @@ def _build_true_transition_context(
         ),
         "transition_detected": transition_detected,
         "summary": summary,
+        "summary_key": summary_key,
         "primary_event": primary_event,
         "events": events,
         "watched_fields": watched_fields,
