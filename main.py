@@ -9448,6 +9448,9 @@ def _strip_continuous_response_snapshot(snapshot: Optional[Dict[str, Any]]) -> O
         "should_alert_now",
         "alert_suppressed_reasons",
         "state_contract",
+        "transition_contract",
+        "alert_contract",
+        "contracts",
         "response_contract_marker",
     ]:
         cleaned_snapshot.pop(key, None)
