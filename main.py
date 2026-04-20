@@ -8441,6 +8441,9 @@ def _build_continuous_snapshot(
     snapshot["replay_market_open"] = replay_test_context.get("replay_market_open")
     snapshot["replay_fresh_entry_allowed"] = replay_test_context.get("replay_fresh_entry_allowed")
     snapshot["state_contract"] = _build_state_contract_from_snapshot(snapshot, mode="continuous")
+    snapshot["contracts"] = _build_contracts_bundle(
+        state_contract=snapshot.get("state_contract"),
+    )
     snapshot["response_contract_marker"] = "safe_fast_state_contract_surface_v2"
     snapshot["alert_candidate_context"] = _derive_continuous_alert_candidate_context(snapshot)
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
@@ -8546,10 +8549,13 @@ def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict
 
 def _transition_watch_payload(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     snapshot = snapshot or {}
-    state_contract = snapshot.get("state_contract") or {}
+    contracts = _contracts_bundle_from_payload(snapshot)
+    state_contract = contracts.get("state") or snapshot.get("state_contract") or {}
+    transition_contract = contracts.get("transition") or snapshot.get("transition_contract") or {}
+    transition_current_state = transition_contract.get("current_state") or {}
     return {
         "final_verdict": state_contract.get("final_verdict", snapshot.get("final_verdict")),
-        "best_ticker": snapshot.get("best_ticker"),
+        "best_ticker": transition_current_state.get("best_ticker", snapshot.get("best_ticker")),
         "primary_blocker": state_contract.get("primary_blocker", snapshot.get("primary_blocker")),
         "next_flip_needed": state_contract.get("next_flip_needed", snapshot.get("next_flip_needed")),
         "approval_ready_now": state_contract.get("approval_ready_now", snapshot.get("approval_ready_now")),
@@ -8560,10 +8566,10 @@ def _transition_watch_payload(snapshot: Optional[Dict[str, Any]]) -> Dict[str, A
         "breakout_hold_pending": state_contract.get("breakout_hold_pending", snapshot.get("breakout_hold_pending")),
         "thesis_gate_pending": state_contract.get("thesis_gate_pending", snapshot.get("thesis_gate_pending")),
         "current_state": state_contract.get("current_state", snapshot.get("current_state")),
-        "global_gate_failures": snapshot.get("global_gate_failures"),
+        "global_gate_failures": transition_current_state.get("global_gate_failures", snapshot.get("global_gate_failures")),
         "invalidation_hit": state_contract.get("invalidation_hit", snapshot.get("invalidation_hit")),
-        "open_positions": snapshot.get("open_positions"),
-        "weekly_trade_count": snapshot.get("weekly_trade_count"),
+        "open_positions": transition_current_state.get("open_positions", snapshot.get("open_positions")),
+        "weekly_trade_count": transition_current_state.get("weekly_trade_count", snapshot.get("weekly_trade_count")),
     }
 
 
@@ -8600,18 +8606,35 @@ def _build_contracts_bundle(
     }
 
 
+def _contracts_bundle_from_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    payload = payload or {}
+    contracts = payload.get("contracts") or {}
+    if isinstance(contracts, dict) and (
+        contracts.get("state") or contracts.get("transition") or contracts.get("alert")
+    ):
+        return {
+            "state": contracts.get("state") or {},
+            "transition": contracts.get("transition") or {},
+            "alert": contracts.get("alert") or {},
+        }
+    return _build_contracts_bundle(
+        state_contract=payload.get("state_contract"),
+        transition_contract=payload.get("transition_contract"),
+        alert_contract=payload.get("alert_contract"),
+    )
+
 
 def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = payload or {}
-    state_contract = payload.get("state_contract")
-    transition_contract = payload.get("transition_contract")
-    alert_contract = payload.get("alert_contract")
-    if state_contract or transition_contract or alert_contract:
-        payload["contracts"] = _build_contracts_bundle(
-            state_contract=state_contract,
-            transition_contract=transition_contract,
-            alert_contract=alert_contract,
-        )
+    contracts = _contracts_bundle_from_payload(payload)
+    if contracts.get("state") or contracts.get("transition") or contracts.get("alert"):
+        payload["contracts"] = contracts
+        if contracts.get("state") and not payload.get("state_contract"):
+            payload["state_contract"] = contracts.get("state")
+        if contracts.get("transition") and not payload.get("transition_contract"):
+            payload["transition_contract"] = contracts.get("transition")
+        if contracts.get("alert") and not payload.get("alert_contract"):
+            payload["alert_contract"] = contracts.get("alert")
     return payload
 
 def _continuous_meaningful_changed_fields(
@@ -9456,6 +9479,22 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     current_snapshot["should_alert_now"] = should_alert
     current_snapshot["alert_suppressed_reasons"] = alert_decision_context.get("suppressed_reasons") or []
     current_snapshot["readable_summary"] = _build_continuous_readable_summary(current_snapshot)
+    transition_contract = _build_transition_contract(
+        previous_snapshot,
+        current_snapshot,
+        true_transition_context,
+    )
+    alert_contract = _build_alert_contract(
+        mode="continuous",
+        alert_decision_context=alert_decision_context,
+    )
+    current_snapshot["transition_contract"] = transition_contract
+    current_snapshot["alert_contract"] = alert_contract
+    current_snapshot["contracts"] = _build_contracts_bundle(
+        state_contract=current_snapshot.get("state_contract"),
+        transition_contract=transition_contract,
+        alert_contract=alert_contract,
+    )
 
     alert_payload = _build_continuous_alert_payload(
         previous_snapshot=previous_snapshot,
@@ -9525,26 +9564,12 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         },
         "readable_summary": current_snapshot.get("readable_summary"),
         "state_contract": current_snapshot.get("state_contract"),
-        "transition_contract": _build_transition_contract(
-            previous_snapshot,
-            current_snapshot,
-            true_transition_context,
-        ),
-        "alert_contract": _build_alert_contract(
-            mode="continuous",
-            alert_decision_context=alert_decision_context,
-        ),
-        "contracts": _build_contracts_bundle(
+        "transition_contract": transition_contract,
+        "alert_contract": alert_contract,
+        "contracts": current_snapshot.get("contracts") or _build_contracts_bundle(
             state_contract=current_snapshot.get("state_contract"),
-            transition_contract=_build_transition_contract(
-                previous_snapshot,
-                current_snapshot,
-                true_transition_context,
-            ),
-            alert_contract=_build_alert_contract(
-                mode="continuous",
-                alert_decision_context=alert_decision_context,
-            ),
+            transition_contract=transition_contract,
+            alert_contract=alert_contract,
         ),
         "response_contract_marker": current_snapshot.get("response_contract_marker") or "safe_fast_state_contract_surface_v2",
         "alert_candidate_context": _build_continuous_alert_candidate_excerpt(
