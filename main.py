@@ -44,7 +44,7 @@ ALLOWED_SETUP_TYPES = {"Ideal", "Clean Fast Break", "Continuation"}
 
 
 def _build_session_basis_context() -> Dict[str, Any]:
-    return {
+    response_payload = {
         "ok": True,
         "chart_provider": "dxfeed_via_dxlink",
         "structure_basis": "RTH_ONLY",
@@ -7705,6 +7705,19 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         ),
         "two_path": two_path_block,
     }
+    response_payload["state_contract"] = _build_on_demand_state_contract(
+        final_verdict=final_verdict,
+        best_ticker=best_ticker,
+        user_facing=user_facing_block,
+        simple_output=response_payload.get("simple_output") or {},
+        decision_context=response_payload.get("decision_context") or {},
+        trigger_context=response_payload.get("trigger_context") or {},
+        approval_context=response_payload.get("approval_context") or {},
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        iv_context=iv_context,
+    )
+    return response_payload
 
 
 @app.get("/")
@@ -8022,6 +8035,115 @@ def _derive_continuous_state_reason(
     return None
 
 
+def _build_state_contract_from_snapshot(snapshot: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
+    current_state = snapshot.get("current_state")
+    latent_structure_state = snapshot.get("latent_structure_state")
+    state_family = snapshot.get("state_family") or _continuous_state_family(current_state)
+    state_source = snapshot.get("state_source") or _derive_continuous_state_source(
+        snapshot,
+        current_state,
+        latent_structure_state,
+    )
+    state_reason = snapshot.get("state_reason") or _derive_continuous_state_reason(
+        snapshot,
+        current_state,
+        latent_structure_state,
+    )
+    summary = snapshot.get("summary") or {}
+    return {
+        "contract_version": "safe_fast_state_v1",
+        "mode": mode,
+        "ticker": summary.get("ticker") or snapshot.get("best_ticker"),
+        "good_idea_now": summary.get("good_idea_now"),
+        "action": summary.get("action"),
+        "setup_state": summary.get("setup_state"),
+        "final_verdict": snapshot.get("final_verdict"),
+        "current_state": current_state,
+        "state_family": state_family,
+        "state_source": state_source,
+        "state_reason": state_reason,
+        "primary_blocker": snapshot.get("primary_blocker"),
+        "decision_blockers": _ordered_unique_strings(snapshot.get("decision_blockers") or []),
+        "failed_reasons": _ordered_unique_strings(snapshot.get("failed_reasons") or []),
+        "next_flip_needed": snapshot.get("next_flip_needed"),
+        "trigger_present": snapshot.get("trigger_present"),
+        "trigger_reason": snapshot.get("trigger_reason"),
+        "structure_ready": snapshot.get("structure_ready"),
+        "approval_ready_now": snapshot.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": snapshot.get("approval_ready_on_completed_candle"),
+        "approval_status": snapshot.get("approval_status"),
+        "breakout_hold_pending": snapshot.get("breakout_hold_pending"),
+        "thesis_gate_pending": snapshot.get("thesis_gate_pending"),
+        "market_open": snapshot.get("market_open"),
+        "fresh_entry_allowed": snapshot.get("fresh_entry_allowed"),
+        "time_gate_reason": snapshot.get("time_gate_reason"),
+        "invalidation_hit": snapshot.get("invalidation_hit"),
+        "invalidation": snapshot.get("invalidation"),
+    }
+
+
+def _build_on_demand_state_contract(
+    *,
+    final_verdict: Any,
+    best_ticker: Any,
+    user_facing: Dict[str, Any],
+    simple_output: Dict[str, Any],
+    decision_context: Dict[str, Any],
+    trigger_context: Dict[str, Any],
+    approval_context: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    iv_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {
+        "on_demand_ok": True,
+        "best_ticker": best_ticker,
+        "final_verdict": final_verdict,
+        "primary_blocker": decision_context.get("primary_blocker"),
+        "decision_blockers": _ordered_unique_strings(decision_context.get("blockers") or []),
+        "failed_reasons": _ordered_unique_strings(decision_context.get("failed_reasons") or []),
+        "next_flip_needed": approval_context.get("next_flip_needed"),
+        "trigger_present": trigger_context.get("trigger_present"),
+        "trigger_reason": trigger_context.get("trigger_reason"),
+        "structure_ready": trigger_context.get("structure_ready"),
+        "approval_ready_now": approval_context.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
+        "approval_status": approval_context.get("approval_status"),
+        "breakout_hold_pending": bool(
+            str(trigger_context.get("why") or "").strip().lower() == "breakout_hold_not_confirmed"
+        ),
+        "thesis_gate_pending": bool(
+            str(approval_context.get("next_flip_needed") or "").strip().lower() == "through_the_wall_next_pocket_not_clear"
+        ),
+        "iv_status": iv_context.get("status"),
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "time_gate_reason": time_day_gate.get("reason"),
+        "summary": {
+            "ticker": simple_output.get("ticker") or user_facing.get("ticker"),
+            "action": simple_output.get("action") or user_facing.get("action"),
+            "setup_state": simple_output.get("setup_state") or user_facing.get("setup_state"),
+            "good_idea_now": simple_output.get("good_idea_now") or user_facing.get("good_idea_now"),
+        },
+        "invalidation": simple_output.get("invalidation") or user_facing.get("invalidation"),
+    }
+    snapshot["latent_structure_state"] = _derive_continuous_structure_state(snapshot)
+    snapshot["current_state"] = _derive_continuous_state_from_snapshot(snapshot)
+    snapshot["state_family"] = _continuous_state_family(snapshot.get("current_state"))
+    snapshot["state_source"] = _derive_continuous_state_source(
+        snapshot,
+        snapshot.get("current_state"),
+        snapshot.get("latent_structure_state"),
+    )
+    snapshot["state_reason"] = _derive_continuous_state_reason(
+        snapshot,
+        snapshot.get("current_state"),
+        snapshot.get("latent_structure_state"),
+    )
+    snapshot["invalidation_hit"] = snapshot.get("current_state") == "EXIT_NOW"
+    return _build_state_contract_from_snapshot(snapshot, mode="on_demand")
+
+
 
 def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
     if not snapshot.get("on_demand_ok", False):
@@ -8296,6 +8418,7 @@ def _build_continuous_snapshot(
     snapshot["replay_timestamp_et"] = replay_test_context.get("resolved_replay_timestamp_et")
     snapshot["replay_market_open"] = replay_test_context.get("replay_market_open")
     snapshot["replay_fresh_entry_allowed"] = replay_test_context.get("replay_fresh_entry_allowed")
+    snapshot["state_contract"] = _build_state_contract_from_snapshot(snapshot, mode="continuous")
     snapshot["alert_candidate_context"] = _derive_continuous_alert_candidate_context(snapshot)
     snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
     return snapshot
@@ -9259,6 +9382,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "canonical_on_demand_post": "/safe-fast/on-demand",
         },
         "readable_summary": current_snapshot.get("readable_summary"),
+        "state_contract": current_snapshot.get("state_contract"),
         "alert_candidate_context": _build_continuous_alert_candidate_excerpt(
             current_snapshot.get("alert_candidate_context")
         ),
