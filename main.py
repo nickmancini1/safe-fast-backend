@@ -7731,6 +7731,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             "changed_fields": {},
         },
     )
+    response_payload["alert_contract"] = _build_alert_contract(mode="on_demand")
     response_payload["response_contract_marker"] = "safe_fast_state_contract_surface_v2"
     return response_payload
 
@@ -8761,6 +8762,46 @@ def _compare_continuous_snapshots(
         "summary": summary,
     }
 
+
+
+def _build_alert_contract(
+    *,
+    mode: str,
+    alert_decision_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    ctx = alert_decision_context or {}
+    if mode == "continuous":
+        return {
+            "contract_version": "safe_fast_alert_v1",
+            "contract_marker": "safe_fast_alert_contract_surface_v1",
+            "mode": "continuous",
+            "dispatch_state": ctx.get("dispatch_state"),
+            "alert_stage": ctx.get("alert_stage"),
+            "should_alert": bool(ctx.get("should_alert")),
+            "would_alert_now": bool(ctx.get("would_alert_now")),
+            "current_alert_candidate": bool(ctx.get("current_alert_candidate")),
+            "meaningful_transition": bool(ctx.get("meaningful_transition")),
+            "deduped": bool(ctx.get("deduped")),
+            "suppressed_reasons": ctx.get("suppressed_reasons") or [],
+            "alert_reason": ctx.get("alert_reason"),
+            "alert_severity": ctx.get("alert_severity"),
+        }
+    return {
+        "contract_version": "safe_fast_alert_v1",
+        "contract_marker": "safe_fast_alert_contract_surface_v1",
+        "mode": "on_demand",
+        "dispatch_state": "NOT_APPLICABLE",
+        "alert_stage": "ON_DEMAND_ONLY",
+        "should_alert": False,
+        "would_alert_now": False,
+        "current_alert_candidate": False,
+        "meaningful_transition": False,
+        "deduped": False,
+        "suppressed_reasons": ["on_demand_mode"],
+        "alert_reason": "On-demand evaluations do not dispatch continuous alerts.",
+        "alert_severity": "info",
+    }
+
 def _continuous_transition_fingerprint(
     *,
     current_snapshot: Dict[str, Any],
@@ -9454,6 +9495,10 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             previous_snapshot,
             current_snapshot,
             true_transition_context,
+        ),
+        "alert_contract": _build_alert_contract(
+            mode="continuous",
+            alert_decision_context=alert_decision_context,
         ),
         "response_contract_marker": current_snapshot.get("response_contract_marker") or "safe_fast_state_contract_surface_v2",
         "alert_candidate_context": _build_continuous_alert_candidate_excerpt(
