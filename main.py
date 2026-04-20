@@ -9835,7 +9835,61 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
         "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
     }
+    response_payload = _humanize_continuous_helper_surfaces(response_payload)
     return _json_safe_for_response(response_payload)
+
+
+def _humanize_continuous_helper_surfaces(response_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(response_payload, dict):
+        return response_payload
+
+    def _humanize_value(value: Any) -> Any:
+        if isinstance(value, str):
+            return _humanize_surface_text(value) or value
+        if isinstance(value, list):
+            out: List[Any] = []
+            for item in value:
+                if isinstance(item, str):
+                    out.append(_humanize_surface_text(item) or item)
+                else:
+                    out.append(item)
+            return out
+        return value
+
+    def _apply_fields(container: Any, fields: List[str]) -> None:
+        if not isinstance(container, dict):
+            return
+        for field in fields:
+            raw_value = container.get(field)
+            human_value = _humanize_value(raw_value)
+            if human_value != raw_value:
+                container[field] = human_value
+                key_field = f"{field}_key"
+                if key_field not in container:
+                    container[key_field] = raw_value
+
+    _apply_fields(
+        response_payload.get("on_demand_excerpt"),
+        ["primary_blocker", "next_flip_needed", "top_blockers"],
+    )
+    _apply_fields(
+        response_payload.get("alert_candidate_context"),
+        ["next_flip_needed", "primary_blocker", "top_blockers", "message", "summary"],
+    )
+    _apply_fields(
+        response_payload.get("alert_payload"),
+        ["primary_blocker", "next_flip_needed", "message", "alert_reason", "summary"],
+    )
+    _apply_fields(
+        response_payload.get("transition_summary"),
+        ["summary"],
+    )
+    _apply_fields(
+        response_payload.get("true_transition_context"),
+        ["summary"],
+    )
+    return response_payload
+
 
 
 @app.post(
