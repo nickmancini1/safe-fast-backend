@@ -8669,6 +8669,7 @@ def _build_transition_contract(
         "meaningful_transition": bool(transition_summary.get("meaningful_transition")),
         "should_alert_candidate": bool(transition_summary.get("should_alert_candidate")),
         "summary": transition_summary.get("summary"),
+        "summary_key": transition_summary.get("summary_key"),
         "primary_event": transition_summary.get("primary_event"),
         "changed_fields": transition_summary.get("changed_fields") or {},
         "previous_state": _transition_watch_payload(previous),
@@ -8942,11 +8943,13 @@ def _compare_continuous_snapshots(
             "changed_fields": {},
             "context_changed_fields": {},
             "summary": "Initial shadow snapshot created.",
+            "summary_key": None,
         }
 
     changed_fields = _continuous_changed_fields(previous, current)
     context_changed_fields = _continuous_context_changed_fields(previous, current)
     meaningful_transition = bool(changed_fields)
+    summary_key = None
 
     if not meaningful_transition:
         transition_type = "NO_MEANINGFUL_CHANGE"
@@ -8968,7 +8971,12 @@ def _compare_continuous_snapshots(
     elif "primary_blocker" in changed_fields:
         transition_type = "PRIMARY_BLOCKER_CHANGED"
         severity = "medium"
-        summary = f"Primary blocker changed from {previous.get('primary_blocker')} to {current.get('primary_blocker')}."
+        prev_blocker_key = previous.get("primary_blocker")
+        curr_blocker_key = current.get("primary_blocker")
+        prev_blocker = _humanize_blocker_key(prev_blocker_key)
+        curr_blocker = _humanize_blocker_key(curr_blocker_key)
+        summary = f"Primary blocker changed from {prev_blocker} to {curr_blocker}."
+        summary_key = f"Primary blocker changed from {prev_blocker_key} to {curr_blocker_key}."
     elif "approval_ready_on_completed_candle" in changed_fields:
         transition_type = "COMPLETED_CANDLE_APPROVAL_CHANGED"
         severity = "high" if current.get("approval_ready_on_completed_candle") else "medium"
@@ -9000,7 +9008,12 @@ def _compare_continuous_snapshots(
     elif "next_flip_needed" in changed_fields:
         transition_type = "NEXT_FLIP_CHANGED"
         severity = "medium"
-        summary = f"Next flip needed changed from {previous.get('next_flip_needed')} to {current.get('next_flip_needed')}."
+        prev_flip_key = previous.get("next_flip_needed")
+        curr_flip_key = current.get("next_flip_needed")
+        prev_flip = _humanize_blocker_key(prev_flip_key)
+        curr_flip = _humanize_blocker_key(curr_flip_key)
+        summary = f"Next flip needed changed from {prev_flip} to {curr_flip}."
+        summary_key = f"Next flip needed changed from {prev_flip_key} to {curr_flip_key}."
     else:
         transition_type = "DETAIL_CHANGED"
         severity = "info"
@@ -9014,6 +9027,7 @@ def _compare_continuous_snapshots(
         "changed_fields": changed_fields,
         "context_changed_fields": context_changed_fields,
         "summary": summary,
+        "summary_key": summary_key,
     }
 
 
@@ -9355,6 +9369,10 @@ def _build_continuous_alert_payload(
         return None
 
     summary = current_snapshot.get("summary") or {}
+    primary_blocker_key = current_snapshot.get("primary_blocker")
+    next_flip_needed_key = current_snapshot.get("next_flip_needed")
+    primary_blocker = _humanize_blocker_key(primary_blocker_key) if primary_blocker_key else None
+    next_flip_needed = _humanize_blocker_key(next_flip_needed_key) if next_flip_needed_key else None
     return {
         "should_alert": should_alert,
         "would_alert_now": alert_decision_context.get("would_alert_now"),
@@ -9367,13 +9385,16 @@ def _build_continuous_alert_payload(
         "transition_type": transition_summary.get("transition_type"),
         "severity": transition_summary.get("severity"),
         "message": transition_summary.get("summary"),
+        "message_key": transition_summary.get("summary_key"),
         "ticker": summary.get("ticker"),
         "state": current_snapshot.get("current_state"),
         "alert_stage": current_snapshot.get("alert_stage"),
         "alert_reason": current_snapshot.get("alert_reason"),
         "alert_severity": current_snapshot.get("alert_severity"),
-        "primary_blocker": current_snapshot.get("primary_blocker"),
-        "next_flip_needed": current_snapshot.get("next_flip_needed"),
+        "primary_blocker": primary_blocker,
+        "primary_blocker_key": primary_blocker_key,
+        "next_flip_needed": next_flip_needed,
+        "next_flip_needed_key": next_flip_needed_key,
         "good_idea_now": summary.get("good_idea_now"),
         "action": summary.get("action"),
         "market_open": current_snapshot.get("market_open"),
