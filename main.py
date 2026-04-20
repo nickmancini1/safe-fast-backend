@@ -9331,44 +9331,20 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     decision_context = on_demand_payload.get("decision_context") or {}
     approval_context = on_demand_payload.get("approval_context") or {}
     trigger_context = on_demand_payload.get("trigger_context") or {}
-    winner_shift_context = on_demand_payload.get("winner_shift_context") or {}
     iv_context = on_demand_payload.get("iv_context") or {}
     market_context = on_demand_payload.get("market_context") or {}
     time_day_gate = on_demand_payload.get("time_day_gate") or {}
 
     return {
-        "decision_context": {
-            "primary_blocker": decision_context.get("primary_blocker"),
-            "blockers": decision_context.get("blockers"),
-            "failed_reasons": decision_context.get("failed_reasons"),
-        },
-        "approval_context": {
-            "next_flip_needed": approval_context.get("next_flip_needed"),
-            "approval_ready_now": approval_context.get("approval_ready_now"),
-            "approval_ready_on_completed_candle": approval_context.get(
-                "approval_ready_on_completed_candle"
-            ),
-        },
-        "trigger_context": {
-            "trigger_present": trigger_context.get("trigger_present"),
-            "trigger_reason": trigger_context.get("trigger_reason"),
-            "structure_ready": trigger_context.get("structure_ready"),
-        },
-        "winner_shift_context": {
-            "shift_path": winner_shift_context.get("shift_path"),
-            "any_shift": winner_shift_context.get("any_shift"),
-        },
-        "iv_context": {
-            "status": iv_context.get("status"),
-        },
-        "market_context": {
-            "is_open": market_context.get("is_open"),
-            "as_of_et": market_context.get("as_of_et"),
-        },
-        "time_day_gate": {
-            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
-            "reason": time_day_gate.get("reason"),
-        },
+        "primary_blocker": decision_context.get("primary_blocker"),
+        "next_flip_needed": approval_context.get("next_flip_needed"),
+        "trigger_present": trigger_context.get("trigger_present"),
+        "trigger_reason": trigger_context.get("trigger_reason"),
+        "structure_ready": trigger_context.get("structure_ready"),
+        "iv_status": iv_context.get("status"),
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "time_gate_reason": time_day_gate.get("reason"),
     }
 
 
