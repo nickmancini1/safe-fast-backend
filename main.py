@@ -7732,6 +7732,11 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         },
     )
     response_payload["alert_contract"] = _build_alert_contract(mode="on_demand")
+    response_payload["contracts"] = _build_contracts_bundle(
+        state_contract=response_payload.get("state_contract"),
+        transition_contract=response_payload.get("transition_contract"),
+        alert_contract=response_payload.get("alert_contract"),
+    )
     response_payload["response_contract_marker"] = "safe_fast_state_contract_surface_v2"
     return response_payload
 
@@ -8578,6 +8583,20 @@ def _build_transition_contract(
         "changed_fields": transition_summary.get("changed_fields") or {},
         "previous_state": _transition_watch_payload(previous),
         "current_state": _transition_watch_payload(current),
+    }
+
+
+
+def _build_contracts_bundle(
+    *,
+    state_contract: Optional[Dict[str, Any]] = None,
+    transition_contract: Optional[Dict[str, Any]] = None,
+    alert_contract: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "state": state_contract or {},
+        "transition": transition_contract or {},
+        "alert": alert_contract or {},
     }
 
 def _continuous_meaningful_changed_fields(
@@ -9499,6 +9518,18 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "alert_contract": _build_alert_contract(
             mode="continuous",
             alert_decision_context=alert_decision_context,
+        ),
+        "contracts": _build_contracts_bundle(
+            state_contract=current_snapshot.get("state_contract"),
+            transition_contract=_build_transition_contract(
+                previous_snapshot,
+                current_snapshot,
+                true_transition_context,
+            ),
+            alert_contract=_build_alert_contract(
+                mode="continuous",
+                alert_decision_context=alert_decision_context,
+            ),
         ),
         "response_contract_marker": current_snapshot.get("response_contract_marker") or "safe_fast_state_contract_surface_v2",
         "alert_candidate_context": _build_continuous_alert_candidate_excerpt(
