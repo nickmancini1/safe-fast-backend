@@ -8698,6 +8698,53 @@ def _canonicalize_continuous_snapshot_contracts(snapshot: Optional[Dict[str, Any
     return normalized
 
 
+def _compact_continuous_persistence_snapshot(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = _canonicalize_continuous_snapshot_contracts(snapshot)
+    if not isinstance(normalized, dict) or not normalized:
+        return {}
+
+    state_contract, transition_contract, alert_contract = _contract_bundle_views(normalized)
+    compact = _transition_watch_payload(normalized)
+    compact["timestamp_et"] = normalized.get("timestamp_et")
+    compact["ticker"] = state_contract.get("ticker") or normalized.get("ticker")
+    compact["good_idea_now"] = state_contract.get("good_idea_now") or normalized.get("good_idea_now")
+    compact["action"] = state_contract.get("action") or normalized.get("action")
+    compact["setup_state"] = state_contract.get("setup_state") or normalized.get("setup_state")
+    compact["contracts"] = _build_contracts_bundle(
+        state_contract=state_contract or normalized.get("state_contract"),
+        transition_contract=transition_contract or normalized.get("transition_contract"),
+        alert_contract=alert_contract or normalized.get("alert_contract"),
+    )
+    if state_contract:
+        compact["state_contract"] = state_contract
+    if transition_contract:
+        compact["transition_contract"] = transition_contract
+    if alert_contract:
+        compact["alert_contract"] = alert_contract
+    return compact
+
+
+def _resolve_previous_continuous_snapshot(stored_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    stored_state = stored_state or {}
+    candidates = [
+        stored_state.get("latest_snapshot"),
+        stored_state.get("latest_snapshot_compact"),
+        stored_state.get("previous_snapshot"),
+        stored_state.get("previous_snapshot_compact"),
+    ]
+    for candidate in candidates:
+        normalized = _canonicalize_continuous_snapshot_contracts(candidate)
+        if isinstance(normalized, dict) and normalized:
+            return normalized
+
+    contracts = stored_state.get("contracts")
+    if isinstance(contracts, dict) and contracts:
+        normalized = _canonicalize_continuous_snapshot_contracts({"contracts": contracts})
+        if isinstance(normalized, dict) and normalized:
+            return normalized
+    return {}
+
+
 def _contract_bundle_views(payload: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     contracts = _contracts_bundle_from_payload(payload)
     return (
@@ -9525,7 +9572,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
     profile_key = f"{base_profile_key}__replay" if replay_profile_active else base_profile_key
 
     stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
-    previous_snapshot = _canonicalize_continuous_snapshot_contracts(stored_state.get("latest_snapshot"))
+    previous_snapshot = _resolve_previous_continuous_snapshot(stored_state)
 
     on_demand_payload = await _build_on_demand_payload(on_demand_request)
     current_snapshot = _build_continuous_snapshot(
@@ -9590,6 +9637,8 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
 
     persisted = False
     state_file = None
+    compact_previous_snapshot = _compact_continuous_persistence_snapshot(previous_snapshot)
+    compact_current_snapshot = _compact_continuous_persistence_snapshot(current_snapshot)
     if request.persist_state:
         persisted = True
         state_file = str(_continuous_state_path(profile_key))
@@ -9600,7 +9649,10 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
                 "profile_key": profile_key,
                 "updated_at": current_snapshot.get("timestamp_et"),
                 "latest_snapshot": current_snapshot,
+                "latest_snapshot_compact": compact_current_snapshot,
                 "previous_snapshot": previous_snapshot,
+                "previous_snapshot_compact": compact_previous_snapshot,
+                "contracts": compact_current_snapshot.get("contracts") or current_snapshot.get("contracts") or {},
                 "last_transition": transition_summary,
                 "last_true_transition": true_transition_context,
                 "last_transition_fingerprint": transition_fingerprint,
@@ -9640,7 +9692,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "enabled": request.persist_state,
             "persisted": persisted,
             "state_file": state_file,
-            "previous_snapshot_found": bool(previous_snapshot),
+            "previous_snapshot_found": bool(previous_snapshot or compact_previous_snapshot),
         },
         "read_this_first": "readable_summary",
         "api_surface": {
