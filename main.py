@@ -8071,6 +8071,12 @@ def _build_state_contract_from_snapshot(snapshot: Dict[str, Any], *, mode: str) 
         latent_structure_state,
     )
     summary = snapshot.get("summary") or {}
+    contracts = snapshot.get("contracts") if isinstance(snapshot.get("contracts"), dict) else {}
+    state_contract = (
+        contracts.get("state")
+        if isinstance(contracts.get("state"), dict)
+        else snapshot.get("state_contract")
+    ) or {}
     return {
         "contract_version": "safe_fast_state_v1",
         "contract_marker": "safe_fast_state_contract_surface_v2",
