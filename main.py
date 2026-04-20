@@ -8948,6 +8948,47 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
     }
 
 
+
+def _build_continuous_alert_candidate_excerpt(alert_candidate_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(alert_candidate_context, dict):
+        return alert_candidate_context
+    return {
+        "alert_stage": alert_candidate_context.get("alert_stage"),
+        "alert_reason": alert_candidate_context.get("alert_reason"),
+        "alert_severity": alert_candidate_context.get("alert_severity"),
+        "should_alert_candidate": alert_candidate_context.get("should_alert_candidate"),
+        "next_flip_needed": alert_candidate_context.get("next_flip_needed"),
+        "final_verdict": alert_candidate_context.get("final_verdict"),
+        "breakout_hold_pending": alert_candidate_context.get("breakout_hold_pending"),
+    }
+
+
+def _build_continuous_market_closed_tester_excerpt(market_closed_tester: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(market_closed_tester, dict):
+        return market_closed_tester
+    return {
+        "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
+        "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
+        "underlying_structural_primary_blocker": market_closed_tester.get("underlying_structural_primary_blocker"),
+        "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
+        "trigger_present_live": market_closed_tester.get("trigger_present_live"),
+        "trigger_reason_live": market_closed_tester.get("trigger_reason_live"),
+        "testing_takeaway": market_closed_tester.get("testing_takeaway"),
+    }
+
+
+def _build_continuous_replay_test_excerpt(replay_test_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(replay_test_context, dict):
+        return replay_test_context
+    return {
+        "ok": replay_test_context.get("ok"),
+        "enabled": replay_test_context.get("enabled"),
+        "status": replay_test_context.get("status"),
+        "scope": replay_test_context.get("scope"),
+        "why": replay_test_context.get("why"),
+    }
+
+
 def _strip_continuous_response_snapshot(snapshot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not isinstance(snapshot, dict):
         return snapshot
@@ -9224,9 +9265,15 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
             "canonical_on_demand_post": "/safe-fast/on-demand",
         },
         "readable_summary": current_snapshot.get("readable_summary"),
-        "alert_candidate_context": current_snapshot.get("alert_candidate_context"),
-        "market_closed_tester": current_snapshot.get("market_closed_tester"),
-        "replay_test_context": current_snapshot.get("replay_test_context"),
+        "alert_candidate_context": _build_continuous_alert_candidate_excerpt(
+            current_snapshot.get("alert_candidate_context")
+        ),
+        "market_closed_tester": _build_continuous_market_closed_tester_excerpt(
+            current_snapshot.get("market_closed_tester")
+        ),
+        "replay_test_context": _build_continuous_replay_test_excerpt(
+            current_snapshot.get("replay_test_context")
+        ),
         "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
         "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
     }
