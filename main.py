@@ -9433,6 +9433,21 @@ def _strip_continuous_response_snapshot(snapshot: Optional[Dict[str, Any]]) -> O
     return cleaned_snapshot
 
 
+def _build_continuous_previous_snapshot_excerpt(snapshot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    compact_snapshot = _compact_continuous_persistence_snapshot(snapshot)
+    if not isinstance(compact_snapshot, dict) or not compact_snapshot:
+        return compact_snapshot
+
+    for key in [
+        "state_contract",
+        "transition_contract",
+        "alert_contract",
+        "contracts",
+        "response_contract_marker",
+    ]:
+        compact_snapshot.pop(key, None)
+    return compact_snapshot
+
 
 def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     state_contract, _, alert_contract = _contract_bundle_views(snapshot)
@@ -9672,7 +9687,7 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "base_profile_key": base_profile_key,
         "replay_profile_active": replay_profile_active,
         "current_snapshot": _strip_continuous_response_snapshot(current_snapshot),
-        "previous_snapshot": _strip_continuous_response_snapshot(previous_snapshot),
+        "previous_snapshot": _build_continuous_previous_snapshot_excerpt(previous_snapshot),
         "transition_summary": {
             **transition_summary,
             "should_alert": should_alert,
