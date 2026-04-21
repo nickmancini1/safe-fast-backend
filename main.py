@@ -4769,12 +4769,23 @@ def _compact_ticker_summary_entry(
         screened_reason=screened_reason,
     )
 
+    human_primary_blocker = _humanize_blocker_key(effective_primary_blocker) if effective_primary_blocker else None
+    blocker_keys = effective_blockers[:4]
+    human_blockers = [
+        _humanize_blocker_key(blocker) if blocker else blocker
+        for blocker in blocker_keys
+    ]
+    raw_trigger_reason = trigger_state.get("why")
+    human_trigger_reason = _humanize_trigger_reason_key(raw_trigger_reason)
+
     return {
         "ticker": item.get("symbol"),
         "engine_verdict": item.get("engine_verdict"),
         "final_verdict": item.get("final_verdict"),
-        "primary_blocker": effective_primary_blocker,
-        "blockers": effective_blockers[:4],
+        "primary_blocker": human_primary_blocker or effective_primary_blocker,
+        "primary_blocker_key": effective_primary_blocker if human_primary_blocker and human_primary_blocker != effective_primary_blocker else None,
+        "blockers": human_blockers,
+        "blocker_keys": blocker_keys if human_blockers != blocker_keys else None,
         "reason": screened_reason,
         "setup_type": structure_context.get("setup_type"),
         "trend_label": structure_context.get("trend_label"),
@@ -4784,7 +4795,8 @@ def _compact_ticker_summary_entry(
         "extension_state": structure_context.get("extension_state"),
         "extension_blocks_now": structure_context.get("extension_blocks_now"),
         "trigger_present": trigger_state.get("trigger_present"),
-        "trigger_reason": trigger_state.get("why"),
+        "trigger_reason": human_trigger_reason or raw_trigger_reason,
+        "trigger_reason_key": raw_trigger_reason if human_trigger_reason and human_trigger_reason != raw_trigger_reason else None,
         "ema50_1h": chart_check.get("ema50_1h"),
         "latest_close": chart_check.get("latest_close"),
         "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h"),
@@ -5000,6 +5012,21 @@ def _humanize_surface_text(value: Any) -> Optional[str]:
 
     return text
 
+
+
+
+def _humanize_trigger_reason_key(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    mapping = {
+        "structure_not_ready": "structure not ready",
+        "chart_unavailable": "chart unavailable",
+        "market_closed": "market closed",
+        "not_present": "not present",
+        "not_applicable": "not applicable",
+    }
+    return mapping.get(text, text.replace("_", " "))
 
 def _derive_also_failing_line(
     failed_reasons: Optional[List[Any]],
