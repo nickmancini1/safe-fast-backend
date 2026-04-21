@@ -4775,6 +4775,8 @@ def _compact_ticker_summary_entry(
         _humanize_blocker_key(blocker) if blocker else blocker
         for blocker in blocker_keys
     ]
+    raw_reason = screened_reason
+    human_reason = _humanize_reason_text(raw_reason)
     raw_trigger_reason = trigger_state.get("why")
     human_trigger_reason = _humanize_trigger_reason_key(raw_trigger_reason)
 
@@ -4786,7 +4788,8 @@ def _compact_ticker_summary_entry(
         "primary_blocker_key": effective_primary_blocker if human_primary_blocker and human_primary_blocker != effective_primary_blocker else None,
         "blockers": human_blockers,
         "blocker_keys": blocker_keys if human_blockers != blocker_keys else None,
-        "reason": screened_reason,
+        "reason": human_reason or raw_reason,
+        "reason_key": raw_reason if human_reason and human_reason != raw_reason else None,
         "setup_type": structure_context.get("setup_type"),
         "trend_label": structure_context.get("trend_label"),
         "room_to_first_wall": structure_context.get("room_to_first_wall"),
@@ -5027,6 +5030,78 @@ def _humanize_trigger_reason_key(value: Any) -> Optional[str]:
         "not_applicable": "not applicable",
     }
     return mapping.get(text, text.replace("_", " "))
+
+
+def _humanize_state_reason_key(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    blocker_keys = {
+        "one_hour_clean_around_ema",
+        "clear_room",
+        "early_enough",
+        "clear_trigger",
+        "wall_thesis_fit",
+        "time_day_gate",
+        "time_gate_context",
+        "failed_breakout_hold",
+        "next_bar_hold_failed",
+        "ath_open_air",
+    }
+    if text in blocker_keys:
+        return _humanize_blocker_key(text)
+
+    mapping = {
+        "market_closed": "market closed",
+        "market_open_no_hard_time_cutoff": "market open / no hard cutoff",
+        "exit_now": "exit now",
+        "trade": "trade ready",
+        "high": "high IV",
+        "through_the_wall_next_pocket_not_clear": "through-the-wall next pocket not clear",
+        "no_candidate_available": "no candidate available",
+        "approval_ready": "approval ready",
+        "approval_ready_now": "approval ready now",
+        "pending_completed_candle_approval": "pending completed-candle approval",
+        "pending_trigger_confirmation": "pending trigger confirmation",
+        "chart_unavailable": "chart unavailable",
+    }
+    if text in mapping:
+        return mapping[text]
+
+    trigger_reason = _humanize_trigger_reason_key(text)
+    if trigger_reason and trigger_reason != text:
+        return trigger_reason
+
+    surface_text = _humanize_surface_text(text)
+    if surface_text and surface_text != text:
+        return surface_text
+
+    return text.replace("_", " ")
+
+
+def _humanize_reason_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    mapping = {
+        "chart_unavailable": "chart unavailable",
+        "no_candidate_available": "no candidate available",
+    }
+    if text in mapping:
+        return mapping[text]
+
+    trigger_reason = _humanize_trigger_reason_key(text)
+    if trigger_reason and trigger_reason != text:
+        return trigger_reason
+
+    surface_text = _humanize_surface_text(text)
+    if surface_text and surface_text != text:
+        return surface_text
+
+    return text
+
 
 def _derive_also_failing_line(
     failed_reasons: Optional[List[Any]],
@@ -7818,6 +7893,12 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         alert_contract=response_payload.get("alert_contract"),
     )
     response_payload["response_contract_marker"] = "safe_fast_state_contract_surface_v2"
+    response_payload["trader_chat_payload"] = _build_trader_chat_payload(
+        mode="on_demand",
+        summary=response_payload.get("simple_output") or {},
+        state_contract=response_payload.get("state_contract") or {},
+        targets=response_payload.get("targets") or {},
+    )
     return response_payload
 
 
@@ -8176,6 +8257,14 @@ def _build_state_contract_from_snapshot(snapshot: Dict[str, Any], *, mode: str) 
         if isinstance(contracts.get("state"), dict)
         else snapshot.get("state_contract")
     ) or {}
+    decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
+    human_decision_blockers = [
+        _humanize_blocker_key(blocker) if blocker else blocker
+        for blocker in decision_blockers
+    ]
+    trigger_reason = _bundle_first_value(state_contract, snapshot, "trigger_reason")
+    human_trigger_reason = _humanize_trigger_reason_key(trigger_reason) if trigger_reason else None
+    human_state_reason = _humanize_state_reason_key(state_reason) if state_reason else None
     return {
         "contract_version": "safe_fast_state_v1",
         "contract_marker": "safe_fast_state_contract_surface_v2",
@@ -8189,12 +8278,18 @@ def _build_state_contract_from_snapshot(snapshot: Dict[str, Any], *, mode: str) 
         "state_family": state_family,
         "state_source": state_source,
         "state_reason": state_reason,
+        "state_reason_human": human_state_reason or state_reason,
+        "state_reason_key": state_reason if human_state_reason and human_state_reason != state_reason else None,
         "primary_blocker": snapshot.get("primary_blocker"),
-        "decision_blockers": _ordered_unique_strings(snapshot.get("decision_blockers") or []),
+        "decision_blockers": decision_blockers,
+        "decision_blockers_human": human_decision_blockers,
+        "decision_blocker_keys": decision_blockers if human_decision_blockers != decision_blockers else None,
         "failed_reasons": _ordered_unique_strings(snapshot.get("failed_reasons") or []),
         "next_flip_needed": snapshot.get("next_flip_needed"),
         "trigger_present": _bundle_first_value(state_contract, snapshot, "trigger_present"),
-        "trigger_reason": _bundle_first_value(state_contract, snapshot, "trigger_reason"),
+        "trigger_reason": trigger_reason,
+        "trigger_reason_human": human_trigger_reason or trigger_reason,
+        "trigger_reason_key": trigger_reason if human_trigger_reason and human_trigger_reason != trigger_reason else None,
         "structure_ready": _bundle_first_value(state_contract, snapshot, "structure_ready"),
         "approval_ready_now": snapshot.get("approval_ready_now"),
         "approval_ready_on_completed_candle": snapshot.get("approval_ready_on_completed_candle"),
@@ -9475,8 +9570,10 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
 
     primary_blocker = decision_context.get("primary_blocker")
     next_flip_needed = approval_context.get("next_flip_needed")
+    raw_trigger_reason = trigger_context.get("trigger_reason")
     human_primary_blocker = _humanize_blocker_key(primary_blocker) if primary_blocker else None
     human_next_flip_needed = _humanize_blocker_key(next_flip_needed) if next_flip_needed else None
+    human_trigger_reason = _humanize_trigger_reason_key(raw_trigger_reason) if raw_trigger_reason else None
 
     return {
         "primary_blocker": human_primary_blocker or primary_blocker,
@@ -9484,7 +9581,9 @@ def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Di
         "primary_blocker_key": primary_blocker if human_primary_blocker and human_primary_blocker != primary_blocker else None,
         "next_flip_needed_key": next_flip_needed if human_next_flip_needed and human_next_flip_needed != next_flip_needed else None,
         "trigger_present": trigger_context.get("trigger_present"),
-        "trigger_reason": trigger_context.get("trigger_reason"),
+        "trigger_reason": raw_trigger_reason,
+        "trigger_reason_human": human_trigger_reason or raw_trigger_reason,
+        "trigger_reason_key": raw_trigger_reason if human_trigger_reason and human_trigger_reason != raw_trigger_reason else None,
         "structure_ready": trigger_context.get("structure_ready"),
         "iv_status": iv_context.get("status"),
         "market_open": market_context.get("is_open"),
@@ -9916,7 +10015,75 @@ async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> 
         "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
     }
     response_payload = _humanize_continuous_helper_surfaces(response_payload)
+    response_payload["trader_chat_payload"] = _build_trader_chat_payload(
+        mode="continuous",
+        summary=response_payload.get("readable_summary") or {},
+        state_contract=response_payload.get("state_contract") or {},
+    )
     return _json_safe_for_response(response_payload)
+
+
+def _build_trader_chat_payload(
+    *,
+    mode: str,
+    summary: Optional[Dict[str, Any]],
+    state_contract: Optional[Dict[str, Any]],
+    targets: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    summary = summary if isinstance(summary, dict) else {}
+    state_contract = state_contract if isinstance(state_contract, dict) else {}
+    targets = targets if isinstance(targets, dict) else {}
+
+    primary_blocker = (
+        summary.get("primary_blocker")
+        or state_contract.get("state_reason_human")
+        or _humanize_blocker_key(state_contract.get("primary_blocker"))
+        or state_contract.get("primary_blocker")
+    )
+    blockers = summary.get("top_blockers") or state_contract.get("decision_blockers_human") or []
+    trigger_reason = (
+        summary.get("trigger_reason")
+        or state_contract.get("trigger_reason_human")
+        or _humanize_trigger_reason_key(state_contract.get("trigger_reason"))
+        or state_contract.get("trigger_reason")
+    )
+    reason = (
+        summary.get("first_failed_reason")
+        or summary.get("why")
+        or summary.get("reason")
+        or summary.get("headline")
+    )
+
+    payload: Dict[str, Any] = {
+        "mode": mode,
+        "ticker": summary.get("ticker") or state_contract.get("ticker"),
+        "verdict": state_contract.get("final_verdict"),
+        "action": summary.get("action") or state_contract.get("action"),
+        "setup_state": summary.get("setup_state") or state_contract.get("setup_state"),
+        "headline": summary.get("headline"),
+        "reason": reason,
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "next_step": summary.get("next_step"),
+        "invalidation": summary.get("invalidation") or state_contract.get("invalidation"),
+        "trigger_present": summary.get("trigger_present") if "trigger_present" in summary else state_contract.get("trigger_present"),
+        "trigger_reason": trigger_reason,
+        "market_open": summary.get("market_open") if "market_open" in summary else state_contract.get("market_open"),
+        "context_only": summary.get("market_closed_context_only"),
+        "watchouts": summary.get("watchouts"),
+    }
+
+    target_40 = targets.get("target_40_pct_value")
+    target_50 = targets.get("target_50_pct_value")
+    target_60 = targets.get("target_60_pct_value")
+    if target_40 is not None and target_50 is not None and target_60 is not None:
+        payload["targets"] = {
+            "40%": target_40,
+            "50%": target_50,
+            "60%": target_60,
+        }
+
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def _humanize_continuous_helper_surfaces(response_payload: Dict[str, Any]) -> Dict[str, Any]:
