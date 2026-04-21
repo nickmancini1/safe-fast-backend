@@ -10041,11 +10041,14 @@ def _build_trader_chat_payload(
         or state_contract.get("primary_blocker")
     )
     blockers = summary.get("top_blockers") or state_contract.get("decision_blockers_human") or []
-    trigger_reason = (
+    raw_trigger_reason = (
         summary.get("trigger_reason")
-        or state_contract.get("trigger_reason_human")
-        or _humanize_trigger_reason_key(state_contract.get("trigger_reason"))
         or state_contract.get("trigger_reason")
+    )
+    trigger_reason = (
+        state_contract.get("trigger_reason_human")
+        or _humanize_trigger_reason_key(raw_trigger_reason)
+        or raw_trigger_reason
     )
     reason = (
         summary.get("first_failed_reason")
@@ -10068,6 +10071,7 @@ def _build_trader_chat_payload(
         "invalidation": summary.get("invalidation") or state_contract.get("invalidation"),
         "trigger_present": summary.get("trigger_present") if "trigger_present" in summary else state_contract.get("trigger_present"),
         "trigger_reason": trigger_reason,
+        "trigger_reason_key": raw_trigger_reason if trigger_reason and raw_trigger_reason and trigger_reason != raw_trigger_reason else None,
         "market_open": summary.get("market_open") if "market_open" in summary else state_contract.get("market_open"),
         "context_only": summary.get("market_closed_context_only"),
         "watchouts": summary.get("watchouts"),
