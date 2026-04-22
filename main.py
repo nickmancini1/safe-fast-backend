@@ -10642,6 +10642,197 @@ def apply_pending_next_session_patch(
     )
 
     reason_stack = _ensure_dict(result, "reason_stack_context")
+
+
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _locked_trigger_present(result: Dict[str, Any]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    return bool(
+        _nested_get(result, "approval_context", "pending_next_session") is True
+        or _nested_get(result, "carry_forward_context", "valid_completed_trigger_locked") is True
+        or _nested_get(result, "trigger_context", "completed_candle_trigger_present") is True
+    )
+
+
+def _derive_morning_open_state(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Morning carry-forward classifier.
+
+    Returns one of:
+    - VALID_ON_OPEN
+    - VALID_ON_RETEST_ONLY
+    - INVALID_GAP_TOO_EXTENDED
+
+    The state is descriptive when market is closed and actionable when market is open.
+    """
+    trigger_level = _to_float(
+        _nested_get(result, "trigger_context", "trigger_level")
+        or _nested_get(result, "live_map", "continuation", "trigger_level")
+        or _nested_get(result, "live_map", "continuation", "shelf_trigger_level")
+    )
+    current_close = _to_float(
+        _nested_get(result, "trigger_context", "current_close")
+        or _nested_get(result, "structure_context", "latest_close")
+    )
+    atr_1h = _to_float(_nested_get(result, "structure_context", "atr_14_1h") or _nested_get(result, "live_map", "continuation", "atr_14_1h"))
+    pct_from_ema = _to_float(_nested_get(result, "structure_context", "pct_from_ema"))
+    extension_blocks_now = bool(_nested_get(result, "structure_context", "extension_blocks_now") is True)
+    room_pass = bool(_nested_get(result, "structure_context", "room_pass") is True)
+    hard_trap = _has_hard_trap(result)
+    market_open = not _market_closed(result)
+    fresh_entry_allowed = bool(_nested_get(result, "time_day_gate", "fresh_entry_allowed") is True or _nested_get(result, "entry_context", "live_entry_requires_market_open") is False)
+
+    distance = None
+    dist_atr = None
+    if trigger_level is not None and current_close is not None:
+        distance = current_close - trigger_level
+    if distance is not None and atr_1h and atr_1h > 0:
+        dist_atr = distance / atr_1h
+
+    # Conservative state logic.
+    if hard_trap or room_pass is not True:
+        state = "INVALID_GAP_TOO_EXTENDED"
+        note = "Hard trap or room failure blocks any carry-forward."
+    elif extension_blocks_now and ((dist_atr is not None and dist_atr >= 1.0) or (pct_from_ema is not None and pct_from_ema >= 2.75)):
+        state = "INVALID_GAP_TOO_EXTENDED"
+        note = "Carry-forward would be invalid if price remains materially stretched from the trigger / EMA."
+    elif extension_blocks_now or (dist_atr is not None and dist_atr > 0.35):
+        state = "VALID_ON_RETEST_ONLY"
+        note = "Carry-forward can stay valid, but only on a controlled hold/retest near the locked trigger."
+    else:
+        state = "VALID_ON_OPEN"
+        note = "Carry-forward remains close enough to the locked trigger to be actionable on open."
+
+    actionable_now = bool(market_open and fresh_entry_allowed and state == "VALID_ON_OPEN")
+    return {
+        "ok": True,
+        "state": state,
+        "note": note,
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "trigger_level": trigger_level,
+        "current_close": current_close,
+        "distance_from_trigger": distance,
+        "distance_from_trigger_atr": dist_atr,
+        "pct_from_ema": pct_from_ema,
+        "extension_blocks_now": extension_blocks_now,
+        "room_pass": room_pass,
+        "hard_trap": hard_trap,
+        "actionable_now": actionable_now,
+    }
+
+
+def apply_morning_open_classifier_patch(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Adds next-session open classifier and cleans stale blocker language for
+    carry-forward setups with a locked completed trigger.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("result must be a dict")
+
+    if not _locked_trigger_present(result):
+        return result
+
+    if not _continuation_ok(result):
+        return result
+
+    classification = _derive_morning_open_state(result)
+    result["next_session_open_decision"] = classification
+
+    state = classification.get("state")
+    market_open = classification.get("market_open")
+    trigger_level = classification.get("trigger_level")
+
+    # Closed-market carry-forward messaging
+    if not market_open and bool(_nested_get(result, "approval_context", "pending_next_session") is True):
+        simple = _ensure_dict(result, "simple_output")
+        simple["what_matters_next_session"] = (
+            "If the open is controlled, classify as VALID_ON_OPEN or VALID_ON_RETEST_ONLY; "
+            "if it gaps too far from the locked trigger, classify as INVALID_GAP_TOO_EXTENDED."
+        )
+
+        carry_ctx = _ensure_dict(result, "carry_forward_context")
+        carry_ctx["next_session_open_state_if_unchanged"] = state
+        carry_ctx["next_session_open_note"] = classification.get("note")
+
+        approval_ctx = _ensure_dict(result, "approval_context")
+        approval_ctx["next_session_open_state_if_unchanged"] = state
+
+        return result
+
+    # Live open carry-forward handling
+    if market_open and bool(_locked_trigger_present(result)):
+        decision_ctx = _ensure_dict(result, "decision_context")
+        simple = _ensure_dict(result, "simple_output")
+        approval_ctx = _ensure_dict(result, "approval_context")
+        entry_ctx = _ensure_dict(result, "entry_context")
+        trigger_ctx = _ensure_dict(result, "trigger_context")
+        blocker_ctx = _ensure_dict(result, "blocker_context")
+
+        if state == "VALID_ON_OPEN":
+            decision_ctx["action"] = "entry valid on open"
+            decision_ctx["setup_state"] = "VALID ON OPEN"
+            decision_ctx["primary_blocker"] = "none"
+            simple["headline"] = "Carry-forward valid on open."
+            simple["action"] = "entry valid on open"
+            simple["setup_state"] = "VALID ON OPEN"
+            simple["why"] = f"Completed 1H trigger remains valid above {trigger_level} and the open is not too extended."
+            simple["primary_blocker"] = "none"
+            simple["next_flip_needed"] = None
+            simple["signal_present"] = True
+            approval_ctx["approval_status"] = "VALID_ON_OPEN"
+            approval_ctx["approval_ready_now"] = True
+            approval_ctx["approval_note"] = "Carry-forward trigger remains valid on the session open."
+            entry_ctx["live_entry_available_now"] = True
+            entry_ctx["mid_candle_entry_state"] = "VALID_ON_OPEN"
+            trigger_ctx["trigger_present"] = True
+            blocker_ctx["primary_blocker"] = "none"
+        elif state == "VALID_ON_RETEST_ONLY":
+            decision_ctx["action"] = "valid on retest only"
+            decision_ctx["setup_state"] = "VALID ON RETEST ONLY"
+            decision_ctx["primary_blocker"] = "retest required"
+            simple["headline"] = "Carry-forward needs retest."
+            simple["action"] = "valid on retest only"
+            simple["setup_state"] = "VALID ON RETEST ONLY"
+            simple["why"] = f"Completed 1H trigger is locked above {trigger_level}, but the open is stretched enough to require a controlled retest."
+            simple["primary_blocker"] = "retest required"
+            simple["next_flip_needed"] = "controlled retest"
+            simple["signal_present"] = True
+            approval_ctx["approval_status"] = "VALID_ON_RETEST_ONLY"
+            approval_ctx["approval_note"] = "Carry-forward remains valid only on a controlled retest near the locked trigger."
+            entry_ctx["mid_candle_entry_state"] = "VALID_ON_RETEST_ONLY"
+            trigger_ctx["trigger_present"] = False
+            blocker_ctx["primary_blocker"] = "retest_required"
+        elif state == "INVALID_GAP_TOO_EXTENDED":
+            decision_ctx["action"] = "stand down"
+            decision_ctx["setup_state"] = "INVALID GAP TOO EXTENDED"
+            decision_ctx["primary_blocker"] = "gap_too_extended"
+            simple["headline"] = "Carry-forward invalidated by extension."
+            simple["action"] = "stand down"
+            simple["setup_state"] = "INVALID GAP TOO EXTENDED"
+            simple["why"] = f"Completed 1H trigger was locked above {trigger_level}, but the open is now too extended for SAFE-FAST."
+            simple["primary_blocker"] = "gap too extended"
+            simple["next_flip_needed"] = None
+            simple["signal_present"] = False
+            approval_ctx["approval_status"] = "INVALID_GAP_TOO_EXTENDED"
+            approval_ctx["approval_note"] = "Carry-forward is invalid because the open is too extended."
+            entry_ctx["live_entry_available_now"] = False
+            entry_ctx["mid_candle_entry_state"] = "INVALID_GAP_TOO_EXTENDED"
+            trigger_ctx["trigger_present"] = False
+            blocker_ctx["primary_blocker"] = "gap_too_extended"
+
+    return result
+
+
     reason_stack["top_line_reason"] = final_reason_ctx["final_reason"]
 
     return result
@@ -10697,6 +10888,7 @@ def demo() -> None:
 def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = payload or {}
     payload = apply_pending_next_session_patch(payload)
+    payload = apply_morning_open_classifier_patch(payload)
     contracts = _contracts_bundle_from_payload(payload)
     if contracts.get("state") or contracts.get("transition") or contracts.get("alert"):
         payload["contracts"] = contracts
