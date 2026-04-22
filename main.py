@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_reclaim_shelf_patch3"
+BUILD_TAG = "macro_surface_v26_2026_04_21_pending_window_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4842,8 +4842,12 @@ def _final_verdict(
         return "NO_TRADE"
     if (wall_thesis_fit_context or {}).get("wall_thesis_fit_status") == "fail":
         return "NO_TRADE"
-    if engine_status == "NO_TRADE":
-        return "NO_TRADE"
+
+    pending_completed_candle_approval = bool(
+        trigger_state.get("pending_completed_candle_approval") is True
+        or str(trigger_state.get("why") or "").strip().lower() == "pending_completed_candle_approval"
+    )
+
     if chart_alignment is False:
         return "NO_TRADE"
     if structure_context.get("ok"):
@@ -4853,16 +4857,24 @@ def _final_verdict(
             return "NO_TRADE"
         if structure_context.get("wall_pass") is False:
             return "NO_TRADE"
-        if structure_context.get("ath_open_air_blocks_now") is True:
+        if structure_context.get("ath_open_air_blocks_now") is True and not pending_completed_candle_approval:
             return "NO_TRADE"
         if structure_context.get("continuation_window_late") is True:
             return "NO_TRADE"
-        if structure_context.get("extension_state") == "extended":
+        if structure_context.get("extension_state") == "extended" and not (
+            pending_completed_candle_approval and structure_context.get("extension_soft_flag") is True
+        ):
             return "NO_TRADE"
         if structure_context.get("chop_risk") is True:
             return "NO_TRADE"
 
     if str(trigger_state.get("why") or "").strip().lower() == "next_bar_hold_failed":
+        return "NO_TRADE"
+
+    if pending_completed_candle_approval:
+        return "PENDING"
+
+    if engine_status == "NO_TRADE":
         return "NO_TRADE"
 
     if not market_context["is_open"]:
@@ -5090,7 +5102,12 @@ def _build_user_facing_block(
             ),
         }
 
-    if engine_status == "NO_TRADE" or not best_ticker:
+    pending_completed_candle_approval = bool(
+        trigger_state.get("pending_completed_candle_approval") is True
+        or str(trigger_state.get("why") or "").strip().lower() == "pending_completed_candle_approval"
+    )
+
+    if (engine_status == "NO_TRADE" or not best_ticker) and not pending_completed_candle_approval:
         why = engine_reason
         if chart_check_error:
             why = "Chart check failed in this run."
@@ -5244,10 +5261,14 @@ def _build_user_facing_block(
             "why": why,
         }
 
-    pending_why = continuation_message if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message else "Structure is acceptable, but trigger/entry timing still needs confirmation."
-    pending_action = "wait for live trigger"
-    if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_context.get("shelf_proven") is not True:
-        pending_action = "wait for hold to prove"
+    if str(trigger_state.get("why") or "").strip().lower() == "pending_completed_candle_approval":
+        pending_why = "Intrabar shelf break is visible. SAFE-FAST is pending the completed 1H close for approval."
+        pending_action = "wait for completed 1H close"
+    else:
+        pending_why = continuation_message if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message else "Structure is acceptable, but trigger/entry timing still needs confirmation."
+        pending_action = "wait for live trigger"
+        if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_context.get("shelf_proven") is not True:
+            pending_action = "wait for hold to prove"
     return {
         "good_idea_now": "NO",
         "ticker": ticker,
@@ -5425,15 +5446,46 @@ def _build_trigger_state(
             current_crossed = bool(trigger_level is not None and current_close is not None and current_close < trigger_level)
             completed_crossed = bool(trigger_level is not None and completed_close is not None and completed_close < trigger_level)
 
+        soft_extension_only = bool(
+            structure_context.get("extension_blocks_now") is True
+            and structure_context.get("extension_soft_flag") is True
+            and structure_context.get("hidden_left_cluster_found") is not True
+            and structure_context.get("chop_risk") is False
+            and structure_context.get("noisy_chop_explicit") is not True
+        )
+
         structure_ok = bool(
             structure_context.get("allowed_setup") is True
             and structure_context.get("wall_pass") is True
             and structure_context.get("room_hard_fail") is not True
-            and structure_context.get("extension_blocks_now") is not True
+            and structure_context.get("room_pass") is not False
             and structure_context.get("chop_risk") is False
             and structure_context.get("noisy_chop_explicit") is not True
             and continuation_context.get("shelf_proven") is True
             and continuation_context.get("exact_reason") != "late"
+            and (
+                structure_context.get("extension_blocks_now") is not True
+                or soft_extension_only
+            )
+        )
+
+        pending_completed_candle_approval = bool(
+            current_crossed
+            and current_side_ok
+            and not completed_crossed
+            and structure_context.get("allowed_setup") is True
+            and structure_context.get("wall_pass") is True
+            and structure_context.get("room_hard_fail") is not True
+            and structure_context.get("room_pass") is not False
+            and structure_context.get("chop_risk") is False
+            and structure_context.get("noisy_chop_explicit") is not True
+            and continuation_context.get("exact_reason") != "late"
+            and (
+                continuation_context.get("reclaim_hold_proven") is True
+                or continuation_context.get("breakout_completed") is True
+                or continuation_context.get("current_breakout_without_completed_confirmation") is True
+            )
+            and soft_extension_only
         )
 
         completed_candle_structural_trigger_present = bool(
@@ -5448,14 +5500,16 @@ def _build_trigger_state(
 
         if continuation_context.get("exact_reason") == "late":
             why = "too_late_from_hold"
-        elif continuation_context.get("shelf_proven") is not True:
-            why = "too_early_hold_not_proven"
         elif completed_candle_structural_trigger_present and market_open and fresh_entry_allowed:
             why = "completed_candle_trigger_approved"
         elif completed_candle_structural_trigger_present and not market_open:
             why = "completed_candle_trigger_market_closed"
         elif completed_candle_structural_trigger_present and not fresh_entry_allowed:
             why = time_gate_reason
+        elif pending_completed_candle_approval:
+            why = "pending_completed_candle_approval"
+        elif continuation_context.get("shelf_proven") is not True:
+            why = "too_early_hold_not_proven"
         elif current_crossed and current_side_ok and not completed_crossed:
             why = "waiting_for_completed_shelf_break_close"
         elif continuation_context.get("breakout_completed") is not True:
@@ -5471,6 +5525,7 @@ def _build_trigger_state(
             "structural_trigger_present": structural_trigger_present,
             "current_bar_trigger_present": False,
             "completed_candle_trigger_present": bool(completed_candle_structural_trigger_present and market_open and fresh_entry_allowed),
+            "pending_completed_candle_approval": pending_completed_candle_approval,
             "trigger_style": trigger_style,
             "trigger_level": _round_or_none(trigger_level, 4),
             "current_close": _round_or_none(current_close, 4),
@@ -6277,6 +6332,7 @@ def _humanize_trigger_reason_key(value: Any) -> Optional[str]:
         "too_early_hold_not_proven": "too early - hold not proven",
         "no_valid_continuation_trigger": "no valid continuation trigger",
         "waiting_for_completed_shelf_break_close": "waiting for completed shelf break close",
+        "pending_completed_candle_approval": "pending completed-candle approval",
         "too_late_from_hold": "too late from the hold",
     }
     return mapping.get(text, text.replace("_", " "))
@@ -6887,8 +6943,12 @@ def _build_entry_context_block(
     completed_candle_raw_trigger_pass = bool(completed_candle.get("raw_chart_trigger_pass") is True)
     completed_candle_gated_trigger_pass = bool(completed_candle.get("gated_trigger_pass") is True)
 
+    pending_completed_candle_approval = bool(trigger_state.get("pending_completed_candle_approval") is True)
+
     if current_bar_gated_trigger_pass:
         mid_candle_entry_state = "APPROVED_NOW"
+    elif pending_completed_candle_approval and current_bar_raw_trigger_pass:
+        mid_candle_entry_state = "PENDING_ON_COMPLETED_CANDLE"
     elif current_bar_raw_trigger_pass:
         mid_candle_entry_state = "BLOCKED_NOW"
     else:
@@ -6907,6 +6967,7 @@ def _build_entry_context_block(
         "live_entry_requires_market_open": bool(trigger_state.get("live_entry_requires_market_open")),
         "live_entry_waiting_on": trigger_state.get("live_entry_waiting_on"),
         "mid_candle_trade_available_now": current_bar_gated_trigger_pass,
+        "pending_completed_candle_approval": pending_completed_candle_approval,
         "mid_candle_entry_state": mid_candle_entry_state,
         "mid_candle_raw_trigger_detected_now": current_bar_raw_trigger_pass,
         "mid_candle_block_reason": None if current_bar_gated_trigger_pass else trigger_state.get("why"),
@@ -6948,8 +7009,12 @@ def _build_intrabar_signal_context_block(
     completed_trade_available = bool(entry_context.get("completed_candle_trade_available") is True)
     completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
 
+    pending_completed_candle_approval = bool(entry_context.get("pending_completed_candle_approval") is True)
+
     if intrabar_trade_available_now:
         intrabar_signal_status = "APPROVED_NOW"
+    elif pending_completed_candle_approval and intrabar_raw_signal_detected:
+        intrabar_signal_status = "PENDING_COMPLETED_CANDLE_APPROVAL"
     elif intrabar_raw_signal_detected:
         intrabar_signal_status = "RAW_SIGNAL_BLOCKED_NOW"
     else:
@@ -6964,6 +7029,8 @@ def _build_intrabar_signal_context_block(
 
     if intrabar_trade_available_now:
         signal_note = "Intrabar SAFE-FAST entry is approved right now."
+    elif pending_completed_candle_approval and intrabar_raw_signal_detected:
+        signal_note = "Intrabar shelf break is visible. SAFE-FAST is pending the completed 1H close for approval."
     elif intrabar_raw_signal_detected:
         signal_note = "Intrabar signal is visible, but SAFE-FAST approval still blocks entry."
     elif completed_trade_available:
@@ -7022,8 +7089,12 @@ def _build_approval_context_block(
     completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
     completed_trade_available = bool(entry_context.get("completed_candle_trade_available") is True)
 
+    pending_completed_candle_approval = bool(entry_context.get("pending_completed_candle_approval") is True)
+
     if intrabar_trade_available_now:
         approval_status = "APPROVED_NOW"
+    elif pending_completed_candle_approval and intrabar_raw_signal_detected:
+        approval_status = "PENDING_COMPLETED_CANDLE_APPROVAL"
     elif intrabar_raw_signal_detected:
         approval_status = "RAW_SIGNAL_WAITING_FOR_APPROVAL"
     elif completed_trade_available:
@@ -7035,6 +7106,8 @@ def _build_approval_context_block(
 
     if intrabar_trade_available_now:
         approval_note = "All SAFE-FAST approval gates pass right now."
+    elif pending_completed_candle_approval and intrabar_raw_signal_detected:
+        approval_note = "Raw intrabar signal is in range. Pending the completed 1H close for SAFE-FAST approval."
     elif intrabar_raw_signal_detected:
         approval_note = "Raw intrabar signal exists, but SAFE-FAST approval gates still block entry."
     elif completed_trade_available:
@@ -7197,6 +7270,8 @@ def _build_approval_requirements_context_block(
 
     if approval_context.get("approval_ready_now") is True:
         approval_path_status = "APPROVED_NOW"
+    elif approval_context.get("approval_status") == "PENDING_COMPLETED_CANDLE_APPROVAL":
+        approval_path_status = "PENDING_COMPLETED_CANDLE_APPROVAL"
     elif approval_context.get("intrabar_raw_signal_detected") is True:
         approval_path_status = "WAITING_FOR_GATES"
     elif approval_context.get("completed_raw_signal_detected") is True:
