@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_regression_guard_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_structure_ready_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -5515,12 +5515,25 @@ def _build_trigger_state(
             current_crossed = bool(trigger_level is not None and current_close is not None and current_close < trigger_level)
             completed_crossed = bool(trigger_level is not None and completed_close is not None and completed_close < trigger_level)
 
+        effective_chop_block = bool(
+            structure_context.get("noisy_chop_explicit") is True
+            or (
+                structure_context.get("chop_risk") is True
+                and structure_context.get("valid_post_impulse_shelf_not_chop") is not True
+            )
+        )
+
+        hard_trap_block = bool(
+            structure_context.get("hidden_left_cluster_found") is True
+            or structure_context.get("parabolic_exhaustion") is True
+            or structure_context.get("room_hard_fail") is True
+        )
+
         soft_extension_only = bool(
             structure_context.get("extension_blocks_now") is True
             and structure_context.get("extension_soft_flag") is True
-            and structure_context.get("hidden_left_cluster_found") is not True
-            and structure_context.get("chop_risk") is False
-            and structure_context.get("noisy_chop_explicit") is not True
+            and hard_trap_block is False
+            and effective_chop_block is False
         )
 
         structure_ok = bool(
@@ -5528,9 +5541,9 @@ def _build_trigger_state(
             and structure_context.get("wall_pass") is True
             and structure_context.get("room_hard_fail") is not True
             and structure_context.get("room_pass") is not False
-            and structure_context.get("chop_risk") is False
-            and structure_context.get("noisy_chop_explicit") is not True
+            and effective_chop_block is False
             and continuation_context.get("shelf_proven") is True
+            and continuation_context.get("reclaim_hold_proven") is True
             and continuation_context.get("exact_reason") != "late"
             and (
                 structure_context.get("extension_blocks_now") is not True
@@ -5546,8 +5559,7 @@ def _build_trigger_state(
             and structure_context.get("wall_pass") is True
             and structure_context.get("room_hard_fail") is not True
             and structure_context.get("room_pass") is not False
-            and structure_context.get("chop_risk") is False
-            and structure_context.get("noisy_chop_explicit") is not True
+            and effective_chop_block is False
             and continuation_context.get("exact_reason") != "late"
             and (
                 continuation_context.get("reclaim_hold_proven") is True
@@ -5557,11 +5569,17 @@ def _build_trigger_state(
             and soft_extension_only
         )
 
+        completed_candle_window_ready = bool(
+            continuation_context.get("inside_tradeable_window") is True
+            or continuation_context.get("current_break_is_first_completed_break") is True
+            or continuation_context.get("breakout_completed") is True
+        )
+
         completed_candle_structural_trigger_present = bool(
             structure_ok
             and completed_crossed
             and completed_side_ok
-            and continuation_context.get("inside_tradeable_window") is True
+            and completed_candle_window_ready
         )
         current_bar_structural_trigger_present = False
         structural_trigger_present = bool(completed_candle_structural_trigger_present)
