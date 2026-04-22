@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_continuation_window_patch6"
+BUILD_TAG = "macro_surface_v26_2026_04_21_iv_gate_patch2"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -1109,7 +1109,7 @@ def _build_execution_quality_context(
         why = iv_context.get("why") or "IV / pricing proxy is elevated, so execution quality needs extra caution."
     elif iv_status == "unconfirmed":
         execution_quality_status = "caution"
-        why = "IV is still unconfirmed in this build, even though time window and liquidity are acceptable."
+        why = "IV / pricing proxy is still unconfirmed, even though time window and liquidity are acceptable."
     elif liquidity_pass is True:
         execution_quality_status = "pass"
         why = iv_context.get("why") or "Time window and liquidity are acceptable for execution."
@@ -1659,7 +1659,7 @@ def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, A
             "long_leg_width_pct_of_mid": long_leg_width_pct,
             "short_leg_width_pct_of_mid": short_leg_width_pct,
             "flags": caution_flags,
-            "why": "IV / pricing proxy is workable but elevated. Debit spread is still possible, but expect less forgiving execution.",
+            "why": "IV / pricing proxy is elevated, but still potentially tradeable with caution.",
         }
 
     return {
@@ -1673,7 +1673,7 @@ def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, A
         "long_leg_width_pct_of_mid": long_leg_width_pct,
         "short_leg_width_pct_of_mid": short_leg_width_pct,
         "flags": [],
-        "why": "IV / pricing proxy looks acceptable for a defined-risk debit spread.",
+        "why": "IV / pricing proxy looks acceptable for a clean debit spread entry.",
     }
 
 
@@ -4548,7 +4548,7 @@ def _build_structure_context(
         "continuation_window_late": continuation_ctx.get("exact_reason") == "late",
         "continuation_hold_proven": continuation_ctx.get("shelf_proven"),
         "continuation_trigger_level": continuation_ctx.get("trigger_level"),
-        "iv_state": iv_context.get("status"),
+        "iv_state": "unconfirmed",
         "setup_type": setup_ctx.get("setup_type"),
         "trend_label": setup_ctx.get("trend_label"),
         "allowed_setup": setup_ctx.get("allowed_setup"),
@@ -4669,10 +4669,7 @@ def _build_chart_confirmation_block(
             "room_ratio": _status_field(structure_context.get("room_ratio"), structure_confirmed),
             "wall_thesis": _status_field(structure_context.get("wall_thesis"), structure_confirmed),
             "extension_state": _status_field(structure_context.get("extension_state"), structure_confirmed),
-            "iv_state": _status_field(
-                structure_context.get("iv_state"),
-                structure_context.get("iv_state") not in {None, "unconfirmed"},
-            ),
+            "iv_state": _status_field(structure_context.get("iv_state"), False),
             "setup_type": _status_field(structure_context.get("setup_type"), structure_confirmed),
             "trend_label": _status_field(structure_context.get("trend_label"), structure_confirmed),
             "open_positions_state": _status_field(request.open_positions, True),
@@ -7102,6 +7099,7 @@ async def _screen_ticker_candidate(
         "chart_check_error": chart_check_error,
         "structure_context": structure_context,
         "liquidity_context": liquidity_context,
+        "iv_context": iv_context,
         "wall_thesis_fit": wall_thesis_fit,
         "trigger_state": trigger_state,
         "checklist": checklist,
@@ -8467,6 +8465,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
     chart_check_error = selected.get("chart_check_error") if selected else None
     structure_context = selected.get("structure_context") if selected else {"ok": False, "why": "no screened candidates"}
     liquidity_context = selected.get("liquidity_context") if selected else _build_liquidity_block(primary_candidate)
+    iv_context = selected.get("iv_context") if selected else _build_iv_context(primary_candidate)
+    structure_context["iv_state"] = iv_context.get("status")
     wall_thesis_fit_context = selected.get("wall_thesis_fit") if selected else _build_wall_thesis_fit_context(
         option_type=clean_option_type,
         structure_context=structure_context,
@@ -8522,6 +8522,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         structure_context=structure_context,
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
+        iv_context=iv_context,
         trigger_state=trigger_state,
         wall_thesis_fit_context=wall_thesis_fit_context,
     )
