@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_winner_hold_patch2"
+BUILD_TAG = "macro_surface_v26_2026_04_21_reclaim_shelf_patch2"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -3860,12 +3860,26 @@ def _build_continuation_window_snapshot(
         and fallback_atr is not None
         and reclaim_hold_body_range <= (fallback_atr * 1.15)
     )
+    reclaim_hold_range_soft_ok = bool(
+        reclaim_hold_body_range is not None
+        and fallback_atr is not None
+        and reclaim_hold_body_range <= (fallback_atr * 1.50)
+    )
     reclaim_hold_proven = bool(
-        reclaim_hold_count >= 2
-        and ema_side_hold
-        and impulse_present
-        and reclaim_hold_overlap_confirmed
-        and reclaim_hold_range_ok
+        (
+            reclaim_hold_count >= 2
+            and ema_side_hold
+            and impulse_present
+            and reclaim_hold_overlap_confirmed
+            and reclaim_hold_range_ok
+        )
+        or (
+            reclaim_hold_count >= 3
+            and ema_side_hold
+            and impulse_present
+            and reclaim_hold_overlap_confirmed
+            and reclaim_hold_range_soft_ok
+        )
     )
 
     shelf_exists = bool(
@@ -4035,6 +4049,7 @@ def _build_continuation_window_snapshot(
         "atr_14_1h": _round_or_none(fallback_atr, 4),
         "reclaim_hold_body_range": _round_or_none(reclaim_hold_body_range, 4),
         "reclaim_hold_overlap_hits": reclaim_hold_overlap_hits,
+        "reclaim_hold_range_soft_ok": reclaim_hold_range_soft_ok,
         "shelf_candles": [
             {
                 "time_iso": candle.get("time_iso"),
@@ -5653,21 +5668,34 @@ def _build_checklist_block(
             and not continuation_late
         )
 
+    continuation_open_air_room_pass = bool(
+        continuation_mode
+        and structure_context.get("room_pass") is True
+        and structure_context.get("first_wall") is None
+        and structure_context.get("price_vs_ema50_1h", price_side) == "above"
+    )
+    clear_room_yes = bool(
+        structure_context.get("room_hard_fail") is not True
+        and (
+            continuation_open_air_room_pass
+            or (
+                structure_context.get("ath_open_air_blocks_now") is not True
+                and (
+                    structure_context.get("room_pass") is not False
+                    or (
+                        structure_context.get("first_wall") is None
+                        and structure_context.get("price_vs_ema50_1h", price_side) == "above"
+                    )
+                )
+            )
+        )
+    )
+
     items = [
         {"item": "allowed_setup_type", "yes": bool(_is_allowed_setup_type_name(structure_context.get("setup_type")) or continuation_mode)},
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is not False)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False and structure_context.get("noisy_chop_explicit") is not True)},
-        {"item": "clear_room", "yes": bool(
-            structure_context.get("room_hard_fail") is not True
-            and structure_context.get("ath_open_air_blocks_now") is not True
-            and (
-                structure_context.get("room_pass") is not False
-                or (
-                    structure_context.get("first_wall") is None
-                    and structure_context.get("price_vs_ema50_1h", price_side) == "above"
-                )
-            )
-        )},
+        {"item": "clear_room", "yes": clear_room_yes},
         {"item": "early_enough", "yes": early_enough_yes},
         {"item": "clear_trigger", "yes": clear_trigger_yes},
         {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
