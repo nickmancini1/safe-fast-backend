@@ -6944,8 +6944,15 @@ async def _screen_ticker_candidate(
     if "liquidity_ok" in failed_items:
         reason = liquidity_context.get("why") or "Options liquidity is too wide for a clean debit spread entry."
     elif structure_context.get("ok"):
+        continuation_reason = None
+        if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_context.get("status_message"):
+            continuation_reason = continuation_context.get("status_message")
         if structure_context.get("setup_type_allowed") is False:
             reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
+        elif continuation_context.get("main_blocker") in {"no_proven_hold", "no_valid_trigger", "move_too_extended"} and continuation_reason:
+            reason = continuation_reason
+        elif structure_context.get("continuation_window_late") is True and continuation_reason:
+            reason = continuation_reason
         elif structure_context.get("chop_risk") is True:
             reason = "1H structure around the 50 EMA is not clean."
         elif structure_context.get("room_hard_fail") is True or structure_context.get("room_pass") is False:
@@ -6956,14 +6963,12 @@ async def _screen_ticker_candidate(
             reason = wall_thesis_fit.get("why_wall_thesis_fit_passes_or_fails") or "Wall thesis and strike placement do not match."
         elif structure_context.get("ath_open_air_blocks_now") is True:
             reason = "Open-air price discovery near highs still lacks rebuilt 1H structure."
-        elif structure_context.get("continuation_window_late") is True and continuation_context.get("status_message"):
-            reason = continuation_context.get("status_message")
         elif structure_context.get("extension_state") == "extended":
             reason = "Move is too extended from the 1H 50 EMA."
         elif chart_alignment is False:
             reason = "Price is on the wrong side of the 1H 50 EMA."
-        elif _continuation_family_detected(structure_context.get("continuation_context")) and continuation_context.get("status_message"):
-            reason = continuation_context.get("status_message")
+        elif continuation_reason:
+            reason = continuation_reason
         elif "clear_trigger" in failed_items:
             trigger_reason = str(trigger_state.get("why") or "").strip().lower()
             if trigger_reason == "market_closed":
