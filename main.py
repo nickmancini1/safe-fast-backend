@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_pending_window_patch3"
+BUILD_TAG = "macro_surface_v26_2026_04_21_shelf_body_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -3713,8 +3713,9 @@ def _build_continuation_window_snapshot(
 ) -> Dict[str, Any]:
     highs = [_to_float(c.get("high")) for c in shelf_candles]
     lows = [_to_float(c.get("low")) for c in shelf_candles]
+    opens = [_to_float(c.get("open")) for c in shelf_candles]
     closes = [_to_float(c.get("close")) for c in shelf_candles]
-    valid_prices = all(v is not None for v in highs + lows + closes)
+    valid_prices = all(v is not None for v in highs + lows + opens + closes)
 
     fallback_atr = None
     if atr14 not in (None, 0):
@@ -3722,13 +3723,39 @@ def _build_continuation_window_snapshot(
     elif current_price not in (None, 0):
         fallback_atr = max(float(current_price) * 0.0040, 0.50)
 
-    shelf_high = max(highs) if valid_prices and highs else None
-    shelf_low = min(lows) if valid_prices and lows else None
+    body_highs: List[float] = []
+    body_lows: List[float] = []
+    for candle_open, candle_close in zip(opens, closes):
+        if candle_open is None or candle_close is None:
+            continue
+        body_highs.append(max(candle_open, candle_close))
+        body_lows.append(min(candle_open, candle_close))
+
+    shelf_wick_high = max(highs) if valid_prices and highs else None
+    shelf_wick_low = min(lows) if valid_prices and lows else None
+    shelf_body_high = max(body_highs) if body_highs else None
+    shelf_body_low = min(body_lows) if body_lows else None
+
+    # PATCH: define the shelf ceiling/floor from the repeated body/close cluster, not the single wick extreme.
+    # Keep the wick extremes separately for context, but do not use them as the primary continuation trigger.
+    if option_type == "C":
+        shelf_high = shelf_body_high if shelf_body_high is not None else shelf_wick_high
+        shelf_low = shelf_wick_low if shelf_wick_low is not None else shelf_body_low
+    else:
+        shelf_high = shelf_wick_high if shelf_wick_high is not None else shelf_body_high
+        shelf_low = shelf_body_low if shelf_body_low is not None else shelf_wick_low
+
     shelf_range = (shelf_high - shelf_low) if shelf_high is not None and shelf_low is not None else None
+    shelf_body_range = (
+        shelf_body_high - shelf_body_low
+        if shelf_body_high is not None and shelf_body_low is not None
+        else None
+    )
+    effective_range_for_validation = shelf_body_range if shelf_body_range is not None else shelf_range
     range_ok = bool(
-        shelf_range is not None
+        effective_range_for_validation is not None
         and fallback_atr is not None
-        and shelf_range <= fallback_atr
+        and effective_range_for_validation <= fallback_atr
     )
 
     overlap_hits = 0
@@ -3787,8 +3814,15 @@ def _build_continuation_window_snapshot(
                 and max(close for close in closes if close is not None) > prior_anchor
                 and (
                     prior_high is None
-                    or shelf_high >= prior_high
-                    or (fallback_atr is not None and shelf_high >= prior_high - (fallback_atr * 0.15))
+                    or (shelf_wick_high is not None and shelf_wick_high >= prior_high)
+                    or (shelf_high is not None and shelf_high >= prior_high)
+                    or (
+                        fallback_atr is not None
+                        and (
+                            (shelf_wick_high is not None and shelf_wick_high >= prior_high - (fallback_atr * 0.15))
+                            or (shelf_high is not None and shelf_high >= prior_high - (fallback_atr * 0.15))
+                        )
+                    )
                 )
             )
         else:
@@ -3800,8 +3834,15 @@ def _build_continuation_window_snapshot(
                 and min(close for close in closes if close is not None) < prior_anchor
                 and (
                     prior_low is None
-                    or shelf_low <= prior_low
-                    or (fallback_atr is not None and shelf_low <= prior_low + (fallback_atr * 0.15))
+                    or (shelf_wick_low is not None and shelf_wick_low <= prior_low)
+                    or (shelf_low is not None and shelf_low <= prior_low)
+                    or (
+                        fallback_atr is not None
+                        and (
+                            (shelf_wick_low is not None and shelf_wick_low <= prior_low + (fallback_atr * 0.15))
+                            or (shelf_low is not None and shelf_low <= prior_low + (fallback_atr * 0.15))
+                        )
+                    )
                 )
             )
 
@@ -4031,6 +4072,10 @@ def _build_continuation_window_snapshot(
         "hold_area": _build_price_zone(shelf_low, shelf_high, "continuation_hold_area", "continuation_shelf") if shelf_low is not None and shelf_high is not None else None,
         "shelf_low": _round_or_none(shelf_low, 4),
         "shelf_high": _round_or_none(shelf_high, 4),
+        "shelf_body_high": _round_or_none(shelf_body_high, 4),
+        "shelf_body_low": _round_or_none(shelf_body_low, 4),
+        "shelf_wick_high": _round_or_none(shelf_wick_high, 4),
+        "shelf_wick_low": _round_or_none(shelf_wick_low, 4),
         "break_line": _round_or_none(break_reference_level, 4),
         "reclaim_break_line": _round_or_none(break_reference_level, 4),
         "shelf_trigger_level": _round_or_none(trigger_level, 4),
@@ -4065,6 +4110,7 @@ def _build_continuation_window_snapshot(
         "main_blocker": main_blocker,
         "evaluation_mode": "with_break" if break_candle else "hold_only",
         "trigger_level": _round_or_none(trigger_level, 4),
+        "trigger_basis": "body_defined_shelf" if option_type == "C" else "body_defined_shelf",
         "atr_14_1h": _round_or_none(fallback_atr, 4),
         "reclaim_hold_body_range": _round_or_none(reclaim_hold_body_range, 4),
         "reclaim_hold_overlap_hits": reclaim_hold_overlap_hits,
