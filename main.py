@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_room_ath_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_room_ath_patch2"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4506,6 +4506,20 @@ def _build_structure_context(
         extension_ctx["state"] = "extended"
         extension_ctx["late_move"] = True
         extension_ctx["ath_open_air_blocks_now"] = True
+    elif option_type == "C" and ath_context.get("open_air") is True and wall_levels.get("first_wall") is None:
+        room_pass = True
+        room_hard_fail = False
+        room_soft_flag = False
+        if room_quality in {None, "fail"}:
+            room_quality = "pass"
+        if room_ratio is None:
+            room_ratio = 999.0
+        if room_ratio_current is None:
+            room_ratio_current = 999.0
+        wall_ctx["wall_pass"] = True
+        wall_ctx["current_price_beyond_first_wall"] = False
+        wall_ctx["breakout_path_required"] = False
+        wall_ctx["wall_thesis_reason"] = "ath_open_air_path"
 
     continuation_ctx = _build_continuation_window_context(
         option_type=option_type,
@@ -11249,8 +11263,8 @@ async def safe_fast_on_demand_default_simple() -> Any:
         "simple_output": payload.get("simple_output"),
         "screened_best_context": payload.get("screened_best_context"),
         "failed_reasons": payload.get("failed_reasons"),
-    } 
-    
+    }
+
 
 @app.post(
     "/safe-fast/on-demand",
