@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_shelf_body_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_regression_guard_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4025,14 +4025,31 @@ def _build_continuation_window_snapshot(
 
     inside_tradeable_window = bool(strict_tradeable_window or tradeable_window_open)
 
+    preserve_pending_window = bool(
+        reclaim_hold_proven
+        and break_completed
+        and room_pass is not False
+        and current_distance_to_shelf_break is not None
+        and current_distance_to_shelf_break >= 0
+        and (
+            inside_one_atr_from_shelf
+            or (
+                shelf_trigger_basis == "body_defined_shelf"
+                and fallback_atr is not None
+                and current_distance_to_shelf_break <= (fallback_atr * 1.00)
+            )
+        )
+    )
+
     too_late = bool(
         reclaim_hold_proven
         and break_completed
+        and not preserve_pending_window
         and (
             too_far_from_shelf
             or (
                 too_far_from_ema
-                and not inside_half_atr_from_shelf
+                and not inside_one_atr_from_shelf
                 and current_distance_to_shelf_break is not None
                 and current_distance_to_shelf_break > 0
             )
@@ -4103,6 +4120,7 @@ def _build_continuation_window_snapshot(
         ),
         "inside_tradeable_window": inside_tradeable_window,
         "tradeable_now": inside_tradeable_window,
+        "preserve_pending_window": preserve_pending_window,
         "current_break_is_first_completed_break": break_completed,
         "current_breakout_without_completed_confirmation": breakout_live_without_completed,
         "exact_reason": exact_reason,
