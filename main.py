@@ -11249,8 +11249,8 @@ async def safe_fast_on_demand_default_simple() -> Any:
         "simple_output": payload.get("simple_output"),
         "screened_best_context": payload.get("screened_best_context"),
         "failed_reasons": payload.get("failed_reasons"),
-    }
-
+    } 
+    
 
 @app.post(
     "/safe-fast/on-demand",
