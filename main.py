@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_iv_gate_patch2"
+BUILD_TAG = "macro_surface_v26_2026_04_21_iv_gate_patch5"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -1596,6 +1596,25 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            helper = globals().get("_safe_float")
+            if callable(helper):
+                return helper(value)
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return float(value)
+            if isinstance(value, (int, float)):
+                return float(value)
+            text_value = str(value).strip()
+            if not text_value:
+                return None
+            text_value = text_value.replace(",", "")
+            return float(text_value)
+        except (TypeError, ValueError):
+            return None
+
     if not candidate:
         return {
             "ok": False,
@@ -1606,11 +1625,11 @@ def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, A
             "why": "No candidate available, so IV proxy cannot be evaluated.",
         }
 
-    est_debit = _safe_float(candidate.get("est_debit"))
-    spread_market_width = _safe_float(candidate.get("spread_market_width"))
-    entry_slippage_vs_mid = _safe_float(candidate.get("entry_slippage_vs_mid"))
-    long_leg_width_pct = _safe_float(candidate.get("long_leg_width_pct_of_mid"))
-    short_leg_width_pct = _safe_float(candidate.get("short_leg_width_pct_of_mid"))
+    est_debit = _to_float(candidate.get("est_debit"))
+    spread_market_width = _to_float(candidate.get("spread_market_width"))
+    entry_slippage_vs_mid = _to_float(candidate.get("entry_slippage_vs_mid"))
+    long_leg_width_pct = _to_float(candidate.get("long_leg_width_pct_of_mid"))
+    short_leg_width_pct = _to_float(candidate.get("short_leg_width_pct_of_mid"))
 
     if (
         est_debit in (None, 0)
@@ -1660,8 +1679,9 @@ def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, A
             "slippage_pct_of_debit": slippage_pct_of_debit,
             "long_leg_width_pct_of_mid": long_leg_width_pct,
             "short_leg_width_pct_of_mid": short_leg_width_pct,
-            "flags": fail_flags,
-            "why": "IV / pricing proxy looks elevated for a debit spread. Treat as NO TRADE unless you explicitly accept stressed pricing.",
+            "caution_flags": caution_flags,
+            "fail_flags": fail_flags,
+            "why": "IV / pricing proxy is too elevated for a debit spread right now.",
         }
 
     if caution_flags:
@@ -1675,8 +1695,9 @@ def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, A
             "slippage_pct_of_debit": slippage_pct_of_debit,
             "long_leg_width_pct_of_mid": long_leg_width_pct,
             "short_leg_width_pct_of_mid": short_leg_width_pct,
-            "flags": caution_flags,
-            "why": "IV / pricing proxy is elevated, but still potentially tradeable with caution.",
+            "caution_flags": caution_flags,
+            "fail_flags": [],
+            "why": "IV / pricing proxy is elevated. Proceed only with caution.",
         }
 
     return {
@@ -1689,10 +1710,10 @@ def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, A
         "slippage_pct_of_debit": slippage_pct_of_debit,
         "long_leg_width_pct_of_mid": long_leg_width_pct,
         "short_leg_width_pct_of_mid": short_leg_width_pct,
-        "flags": [],
-        "why": "IV / pricing proxy looks acceptable for a clean debit spread entry.",
+        "caution_flags": [],
+        "fail_flags": [],
+        "why": "IV / pricing proxy looks acceptable for a debit spread.",
     }
-
 
 def _market_context_now() -> Dict[str, Any]:
     now_et = datetime.now(NY_TZ)
