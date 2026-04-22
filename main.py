@@ -4789,6 +4789,7 @@ def _build_user_facing_block(
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    iv_context: Optional[Dict[str, Any]],
     trigger_state: Dict[str, Any],
     wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
