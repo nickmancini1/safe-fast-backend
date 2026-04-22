@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_continuation_window_patch5"
+BUILD_TAG = "macro_surface_v26_2026_04_21_continuation_window_patch6"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -8917,6 +8917,7 @@ def _save_continuous_state(profile_key: str, payload: Dict[str, Any]) -> None:
 _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP: Dict[str, str] = {
     "allowed_setup_type": "BLOCKED_SETUP_TYPE",
     "twentyfour_hour_supportive": "BLOCKED_24H_CONTEXT",
+    "no_proven_hold": "BLOCKED_PROVEN_HOLD",
     "one_hour_clean_around_ema": "BLOCKED_1H_STRUCTURE",
     "clear_room": "BLOCKED_ROOM",
     "early_enough": "BLOCKED_EXTENSION",
@@ -8929,6 +8930,8 @@ _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP: Dict[str, str] = {
 _CONTINUOUS_STRUCTURE_FAILED_REASON_STATE_MAP: Dict[str, str] = {
     "setup type is not allowed": "BLOCKED_SETUP_TYPE",
     "24h context is not supportive": "BLOCKED_24H_CONTEXT",
+    "too early: hold is not proven yet.": "BLOCKED_PROVEN_HOLD",
+    "no proven hold": "BLOCKED_PROVEN_HOLD",
     "1h structure around the 50 ema is not clean": "BLOCKED_1H_STRUCTURE",
     "room to the first wall fails": "BLOCKED_ROOM",
     "entry is too late or overextended for safe-fast": "BLOCKED_EXTENSION",
@@ -8953,6 +8956,7 @@ _CONTINUOUS_STATE_FAMILY_MAP: Dict[str, str] = {
     "BLOCKED_TIME_GATE": "TIME",
     "BLOCKED_SETUP_TYPE": "STRUCTURE",
     "BLOCKED_24H_CONTEXT": "STRUCTURE",
+    "BLOCKED_PROVEN_HOLD": "STRUCTURE",
     "BLOCKED_1H_STRUCTURE": "STRUCTURE",
     "BLOCKED_ROOM": "STRUCTURE",
     "BLOCKED_EXTENSION": "STRUCTURE",
