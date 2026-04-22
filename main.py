@@ -3805,31 +3805,101 @@ def _build_continuation_window_snapshot(
                 )
             )
 
-    shelf_exists = bool(
-        len(shelf_candles) >= 2
-        and valid_prices
-        and range_ok
-        and overlap_confirmed
+    completed_hold_sequence = list(shelf_candles)
+    if break_candle:
+        completed_hold_sequence.append(break_candle)
+
+    reclaim_hold_count = 0
+    reclaim_hold_candles: List[Dict[str, Any]] = []
+    if reclaim_area is not None:
+        for candle in reversed(completed_hold_sequence):
+            candle_close = _to_float(candle.get("close"))
+            if candle_close is None:
+                break
+            if option_type == "C":
+                if candle_close > reclaim_area:
+                    reclaim_hold_count += 1
+                    reclaim_hold_candles.insert(0, candle)
+                else:
+                    break
+            else:
+                if candle_close < reclaim_area:
+                    reclaim_hold_count += 1
+                    reclaim_hold_candles.insert(0, candle)
+                else:
+                    break
+
+    reclaim_hold_body_high = None
+    reclaim_hold_body_low = None
+    if reclaim_hold_candles:
+        body_highs = []
+        body_lows = []
+        for candle in reclaim_hold_candles:
+            candle_open = _to_float(candle.get("open"))
+            candle_close = _to_float(candle.get("close"))
+            if candle_open is None or candle_close is None:
+                continue
+            body_highs.append(max(candle_open, candle_close))
+            body_lows.append(min(candle_open, candle_close))
+        if body_highs and body_lows:
+            reclaim_hold_body_high = max(body_highs)
+            reclaim_hold_body_low = min(body_lows)
+
+    reclaim_hold_body_range = (
+        reclaim_hold_body_high - reclaim_hold_body_low
+        if reclaim_hold_body_high is not None and reclaim_hold_body_low is not None
+        else None
     )
-    shelf_proven = bool(
-        shelf_exists
+    reclaim_hold_overlap_hits = 0
+    for left, right in zip(reclaim_hold_candles, reclaim_hold_candles[1:]):
+        if _continuation_pair_overlaps(left, right):
+            reclaim_hold_overlap_hits += 1
+    reclaim_hold_overlap_confirmed = bool(len(reclaim_hold_candles) >= 2 and reclaim_hold_overlap_hits >= 1)
+    reclaim_hold_range_ok = bool(
+        reclaim_hold_body_range is not None
+        and fallback_atr is not None
+        and reclaim_hold_body_range <= (fallback_atr * 1.15)
+    )
+    reclaim_hold_proven = bool(
+        reclaim_hold_count >= 2
         and ema_side_hold
         and impulse_present
-        and shelf_closes_hold_reclaim
-        and shelf_closes_hold_low
+        and reclaim_hold_overlap_confirmed
+        and reclaim_hold_range_ok
+    )
+
+    shelf_exists = bool(
+        (
+            len(shelf_candles) >= 2
+            and valid_prices
+            and range_ok
+            and overlap_confirmed
+        )
+        or reclaim_hold_proven
+    )
+    shelf_proven = bool(
+        (
+            shelf_exists
+            and ema_side_hold
+            and impulse_present
+            and shelf_closes_hold_reclaim
+            and shelf_closes_hold_low
+        )
+        or reclaim_hold_proven
     )
 
     trigger_level = shelf_high if option_type == "C" else shelf_low
+    break_reference_level = reclaim_area if reclaim_area is not None else trigger_level
     break_close = _to_float((break_candle or {}).get("close"))
     break_time_iso = (break_candle or {}).get("time_iso")
     break_completed = False
     break_above_ema = False
-    if trigger_level is not None and break_close is not None:
+    if break_reference_level is not None and break_close is not None:
         if option_type == "C":
-            break_completed = break_close > trigger_level
+            break_completed = break_close > break_reference_level
             break_above_ema = bool(ema50_1h is None or break_close > ema50_1h)
         else:
-            break_completed = break_close < trigger_level
+            break_completed = break_close < break_reference_level
             break_above_ema = bool(ema50_1h is None or break_close < ema50_1h)
 
     current_distance_to_shelf_break = None
@@ -3903,6 +3973,14 @@ def _build_continuation_window_snapshot(
         exact_reason = "late"
         status_message = "Too late: the break already expanded too far from the hold."
         main_blocker = "move_too_extended"
+    elif reclaim_hold_proven:
+        exact_reason = "early"
+        status_message = "Hold above the break area is proven. Waiting for the first completed 1H close above the shelf high."
+        main_blocker = "no_valid_trigger"
+    elif break_completed and reclaim_hold_count == 1:
+        exact_reason = "early"
+        status_message = "One completed 1H candle has held above the break area. SAFE-FAST still needs 1 more completed 1H candle to prove the hold."
+        main_blocker = "no_proven_hold"
     elif not shelf_proven:
         exact_reason = "early"
         status_message = "Too early: hold is not proven yet."
@@ -3915,10 +3993,14 @@ def _build_continuation_window_snapshot(
     return {
         "shelf_exists": shelf_exists,
         "shelf_proven": shelf_proven,
+        "reclaim_hold_proven": reclaim_hold_proven,
+        "hold_closes_above_reclaim_count": reclaim_hold_count,
         "hold_area": _build_price_zone(shelf_low, shelf_high, "continuation_hold_area", "continuation_shelf") if shelf_low is not None and shelf_high is not None else None,
         "shelf_low": _round_or_none(shelf_low, 4),
         "shelf_high": _round_or_none(shelf_high, 4),
-        "break_line": _round_or_none(trigger_level, 4),
+        "break_line": _round_or_none(break_reference_level, 4),
+        "reclaim_break_line": _round_or_none(break_reference_level, 4),
+        "shelf_trigger_level": _round_or_none(trigger_level, 4),
         "shelf_range": _round_or_none(shelf_range, 4),
         "shelf_candle_count": len(shelf_candles),
         "overlap_hits": overlap_hits,
@@ -3951,6 +4033,8 @@ def _build_continuation_window_snapshot(
         "evaluation_mode": "with_break" if break_candle else "hold_only",
         "trigger_level": _round_or_none(trigger_level, 4),
         "atr_14_1h": _round_or_none(fallback_atr, 4),
+        "reclaim_hold_body_range": _round_or_none(reclaim_hold_body_range, 4),
+        "reclaim_hold_overlap_hits": reclaim_hold_overlap_hits,
         "shelf_candles": [
             {
                 "time_iso": candle.get("time_iso"),
@@ -4044,10 +4128,12 @@ def _build_continuation_window_context(
     def _snapshot_sort_key(snapshot: Dict[str, Any]) -> Any:
         return (
             priority_rank.get(snapshot.get("exact_reason"), 9),
+            0 if snapshot.get("reclaim_hold_proven") else 1,
             0 if snapshot.get("shelf_proven") else 1,
+            -(snapshot.get("hold_closes_above_reclaim_count") or 0),
             0 if snapshot.get("breakout_completed") else 1,
-            -(snapshot.get("shelf_candle_count") or 0),
             abs(snapshot.get("distance_current_to_shelf_high") or 999999),
+            -(snapshot.get("shelf_candle_count") or 0),
         )
 
     selected = sorted(snapshots, key=_snapshot_sort_key)[0]
@@ -4533,6 +4619,37 @@ def _build_structure_context(
         room_pass=room_pass,
         extension_blocks_now=extension_ctx.get("extension_blocks_now"),
     )
+
+    if (
+        option_type == "C"
+        and ath_context.get("open_air") is True
+        and continuation_ctx.get("reclaim_hold_proven") is True
+    ):
+        ath_context = {
+            **ath_context,
+            "rebuilt_1h_structure": True,
+            "ath_open_air_blocks_now": False,
+            "why": "ath_open_air_with_reclaim_hold",
+        }
+        room_pass = True
+        room_hard_fail = False
+        room_soft_flag = False
+        if room_quality in {None, "fail", "unconfirmed"}:
+            room_quality = "pass"
+        if room_ratio is None:
+            room_ratio = 999.0
+        if room_ratio_current is None:
+            room_ratio_current = 999.0
+        wall_ctx["wall_pass"] = True
+        wall_ctx["current_price_beyond_first_wall"] = False
+        wall_ctx["breakout_path_required"] = False
+        wall_ctx["wall_thesis_reason"] = "no_first_wall_open_air_path"
+        extension_ctx["ath_open_air_blocks_now"] = False
+        continuation_ctx = {
+            **continuation_ctx,
+            "room_pass": room_pass,
+            "extension_blocks_now": extension_ctx.get("extension_blocks_now"),
+        }
 
     valid_post_impulse_shelf_not_chop = bool(
         continuation_ctx.get("shelf_exists") is True
@@ -5580,7 +5697,7 @@ def _build_checklist_block(
     continuation_blocker_overrides: List[str] = []
     continuation_override_allowed = bool(
         continuation_mode
-        and not any(item in failed_items for item in {"allowed_setup_type", "twentyfour_hour_supportive", "clear_room"})
+        and not any(item in failed_items for item in {"allowed_setup_type", "twentyfour_hour_supportive"})
     )
     if continuation_override_allowed:
         if continuation_context.get("exact_reason") == "late":
@@ -5643,16 +5760,30 @@ def _continuation_one_more_hold_needed(continuation_context: Optional[Dict[str, 
         return False
     if continuation_context.get("breakout_completed") is not True:
         return False
-    return True
+    return int(continuation_context.get("hold_closes_above_reclaim_count") or 0) == 1
 
 
 def _continuation_hold_progress_message(continuation_context: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not _continuation_one_more_hold_needed(continuation_context):
-        return None
-    return (
-        "One completed 1H candle has held above the break area. "
-        "SAFE-FAST still needs 1 more completed 1H candle to prove the hold."
-    )
+    continuation_context = continuation_context or {}
+    hold_count = int(continuation_context.get("hold_closes_above_reclaim_count") or 0)
+    main_blocker = str(continuation_context.get("main_blocker") or "").strip().lower()
+    if _continuation_one_more_hold_needed(continuation_context):
+        return (
+            "One completed 1H candle has held above the break area. "
+            "SAFE-FAST still needs 1 more completed 1H candle to prove the hold."
+        )
+    if main_blocker == "no_valid_trigger" and continuation_context.get("reclaim_hold_proven") is True:
+        trigger_level = _round_or_none(_to_float(continuation_context.get("trigger_level")), 4)
+        if trigger_level is not None:
+            return (
+                f"Hold above the break area is proven with {hold_count} completed 1H closes. "
+                f"SAFE-FAST is now waiting for the first completed 1H close above the shelf high {trigger_level}."
+            )
+        return (
+            f"Hold above the break area is proven with {hold_count} completed 1H closes. "
+            "SAFE-FAST is now waiting for the first completed 1H close above the shelf high."
+        )
+    return None
 
 
 def _failed_reason_messages(
@@ -5692,6 +5823,8 @@ def _failed_reason_messages(
         if item == "twentyfour_hour_supportive" and structure_context.get("twentyfour_hour_supportive") is not False:
             continue
         if item == "clear_trigger" and continuation_family and continuation_context.get("main_blocker") in {"no_proven_hold", "move_too_extended"}:
+            continue
+        if item == "clear_room" and continuation_family and structure_context.get("room_pass") is True and structure_context.get("first_wall") is None:
             continue
         msg = mapping.get(item)
         if msg:
