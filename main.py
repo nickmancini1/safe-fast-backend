@@ -215,7 +215,7 @@ def _derive_entry_zones(
         zone_half_width = 0.10
 
     if (
-        structure_context.get("setup_type") == "Continuation"
+        _continuation_family_detected(structure_context.get("continuation_context"))
         and continuation_context.get("shelf_low") is not None
         and continuation_context.get("shelf_high") is not None
     ):
@@ -334,7 +334,7 @@ def _build_trigger_detail_context(
     current_low = _to_float(current_candle.get("low"))
     continuation_context = (structure_context or {}).get("continuation_context") or {}
 
-    if (structure_context or {}).get("setup_type") == "Continuation" and continuation_context:
+    if _continuation_family_detected((structure_context or {}).get("continuation_context")) and continuation_context:
         continuation_reason = continuation_context.get("exact_reason")
         shelf_high = continuation_context.get("shelf_high")
         shelf_low = continuation_context.get("shelf_low")
@@ -634,7 +634,7 @@ def _build_trigger_scan_context(
     current_bar = recent[-1] if recent else None
     most_recent_completed = recent[-2] if len(recent) >= 2 else None
 
-    if (structure_context or {}).get("setup_type") == "Continuation" and continuation_context:
+    if _continuation_family_detected((structure_context or {}).get("continuation_context")) and continuation_context:
         trigger_level = _to_float(continuation_context.get("trigger_level"))
         current_close = _to_float((current_bar or {}).get("close"))
         completed_close = _to_float((most_recent_completed or {}).get("close"))
@@ -1468,7 +1468,7 @@ def _build_live_map_block(
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
         "backup_entry_zone": backup_entry_zone,
-        "continuation": structure_context.get("continuation_context") if structure_context.get("setup_type") == "Continuation" else None,
+        "continuation": structure_context.get("continuation_context") if _continuation_family_detected(structure_context.get("continuation_context")) else None,
         "trigger_style": trigger_state.get("trigger_style"),
         "trigger_level": trigger_state.get("trigger_level"),
         "trigger_present": trigger_state.get("trigger_present"),
@@ -3908,6 +3908,19 @@ def _build_continuation_window_context(
     return selected
 
 
+
+
+def _continuation_family_detected(continuation_context: Optional[Dict[str, Any]]) -> bool:
+    ctx = continuation_context or {}
+    return bool(
+        ctx.get("shelf_exists") is True
+        or ctx.get("shelf_proven") is True
+        or _to_float(ctx.get("trigger_level")) is not None
+        or (_to_float(ctx.get("shelf_low")) is not None and _to_float(ctx.get("shelf_high")) is not None)
+        or (ctx.get("shelf_candle_count") or 0) >= 2
+        or str(ctx.get("status_message") or "").strip() != ""
+    )
+
 def _setup_classifier(
     option_type: str,
     chart_check: Dict[str, Any],
@@ -3939,17 +3952,18 @@ def _setup_classifier(
     continuation_ctx = continuation_context or {}
     continuation_shelf_proven = bool(continuation_ctx.get("shelf_proven") is True)
     continuation_tradeable_now = bool(continuation_ctx.get("tradeable_now") is True)
-    continuation_detected = bool(continuation_shelf_proven or continuation_ctx.get("shelf_exists") is True)
+    continuation_detected = _continuation_family_detected(continuation_ctx)
+
+    if continuation_detected and trend_supportive is not False:
+        return {
+            "setup_type": "Continuation",
+            "trend_label": trend_label,
+            "allowed_setup": True,
+            "setup_type_allowed": True,
+            "setup_eligible_now": bool(continuation_tradeable_now and not blocked_now and not chop),
+        }
 
     if trend_supportive is True:
-        if continuation_detected:
-            return {
-                "setup_type": "Continuation",
-                "trend_label": trend_label,
-                "allowed_setup": True,
-                "setup_type_allowed": True,
-                "setup_eligible_now": bool(continuation_tradeable_now and not blocked_now and not chop),
-            }
         if not blocked_now:
             if near_ema and (room_ratio or 0) >= 2.5 and not chop:
                 return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
@@ -4848,7 +4862,7 @@ def _build_user_facing_block(
         }
 
     if final_verdict == "TRADE":
-        trade_why = continuation_message if structure_context.get("setup_type") == "Continuation" and continuation_message else "Trigger is live and the current SAFE-FAST gates pass."
+        trade_why = continuation_message if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message else "Trigger is live and the current SAFE-FAST gates pass."
         trade_action = "enter"
         if trigger_state.get("why") == "completed_candle_trigger_approved":
             trade_action = "enter from completed-candle approval"
@@ -4862,7 +4876,7 @@ def _build_user_facing_block(
         }
 
     if final_verdict == "NO_TRADE":
-        why = continuation_message if structure_context.get("setup_type") == "Continuation" and continuation_message else "Best ticker failed the 1H EMA alignment check."
+        why = continuation_message if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message else "Best ticker failed the 1H EMA alignment check."
         if chart_check_error:
             why = "Chart check failed in this run."
         return {
@@ -4874,9 +4888,9 @@ def _build_user_facing_block(
             "why": why,
         }
 
-    pending_why = continuation_message if structure_context.get("setup_type") == "Continuation" and continuation_message else "Structure is acceptable, but trigger/entry timing still needs confirmation."
+    pending_why = continuation_message if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message else "Structure is acceptable, but trigger/entry timing still needs confirmation."
     pending_action = "wait for live trigger"
-    if structure_context.get("setup_type") == "Continuation" and continuation_context.get("shelf_proven") is not True:
+    if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_context.get("shelf_proven") is not True:
         pending_action = "wait for hold to prove"
     return {
         "good_idea_now": "NO",
@@ -4986,7 +5000,7 @@ def _build_trigger_state(
     chart_check: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     continuation_context = structure_context.get("continuation_context") or {}
-    continuation_mode = structure_context.get("setup_type") == "Continuation"
+    continuation_mode = _continuation_family_detected(structure_context.get("continuation_context"))
     trigger_style = "close_above_recent_high" if option_type == "C" else "close_below_recent_low"
     if continuation_mode:
         trigger_style = "first_close_above_shelf_high" if option_type == "C" else "first_close_below_shelf_low"
@@ -5298,7 +5312,7 @@ def _build_checklist_block(
     ema_value = chart_check.get("ema50_1h") if chart_check else None
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
     continuation_context = structure_context.get("continuation_context") or {}
-    continuation_mode = structure_context.get("setup_type") == "Continuation"
+    continuation_mode = _continuation_family_detected(structure_context.get("continuation_context"))
     continuation_late = bool(continuation_context.get("exact_reason") == "late")
 
     clear_trigger_yes = bool(trigger_state.get("trigger_present") is True)
@@ -5313,8 +5327,8 @@ def _build_checklist_block(
         )
 
     items = [
-        {"item": "allowed_setup_type", "yes": _is_allowed_setup_type_name(structure_context.get("setup_type"))},
-        {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
+        {"item": "allowed_setup_type", "yes": bool(_is_allowed_setup_type_name(structure_context.get("setup_type")) or continuation_mode)},
+        {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is not False)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False and structure_context.get("noisy_chop_explicit") is not True)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_hard_fail") is not True and structure_context.get("room_pass") is not False and structure_context.get("ath_open_air_blocks_now") is not True)},
         {"item": "early_enough", "yes": early_enough_yes},
@@ -5427,12 +5441,20 @@ def _failed_reason_messages(
         "move_too_extended": "move too extended",
     }
 
+    continuation_family = _continuation_family_detected(continuation_context)
+
     for item in checklist.get("decision_blockers_priority", checklist.get("failed_items", [])):
+        if item == "allowed_setup_type" and continuation_family:
+            continue
+        if item == "twentyfour_hour_supportive" and structure_context.get("twentyfour_hour_supportive") is not False:
+            continue
+        if item == "clear_trigger" and continuation_family and continuation_context.get("main_blocker") in {"no_proven_hold", "move_too_extended"}:
+            continue
         msg = mapping.get(item)
         if msg:
             reasons.append(msg)
 
-    if structure_context.get("setup_type") == "Continuation" and continuation_context.get("status_message"):
+    if continuation_family and continuation_context.get("status_message"):
         reasons.insert(0, continuation_context.get("status_message"))
     if structure_context.get("extension_state") == "extended":
         reasons.append("move is extended versus the 1H 50 EMA")
@@ -6925,7 +6947,7 @@ async def _screen_ticker_candidate(
             reason = "Move is too extended from the 1H 50 EMA."
         elif chart_alignment is False:
             reason = "Price is on the wrong side of the 1H 50 EMA."
-        elif structure_context.get("setup_type") == "Continuation" and continuation_context.get("status_message"):
+        elif _continuation_family_detected(structure_context.get("continuation_context")) and continuation_context.get("status_message"):
             reason = continuation_context.get("status_message")
         elif "clear_trigger" in failed_items:
             trigger_reason = str(trigger_state.get("why") or "").strip().lower()
@@ -7135,7 +7157,7 @@ def _build_candidate_context(
         "adx_filter": adx_filter if active else None,
         "trap_check_context": trap_check_context if active else None,
         "trigger_scan": trigger_scan if active else None,
-        "continuation": structure_context.get("continuation_context") if active and structure_context.get("setup_type") == "Continuation" else None,
+        "continuation": structure_context.get("continuation_context") if active and _continuation_family_detected(structure_context.get("continuation_context")) else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
