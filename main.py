@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_winner_rank_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_shelf_chop_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -5695,33 +5695,16 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
     liquidity = item.get("liquidity_context") or {}
     trigger_state = item.get("trigger_state") or {}
     checklist = item.get("checklist") or {}
-    chart_check = item.get("chart_check") or {}
     final_verdict = item.get("final_verdict", "NO_TRADE")
 
     verdict_rank = {"TRADE": 0, "PENDING": 1, "NO_TRADE": 2}.get(final_verdict, 3)
     setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
 
     room_quality = structure.get("room_quality")
-    room_pass = structure.get("room_pass")
-    first_wall = _to_float(structure.get("first_wall"))
-    price_vs_ema50_1h = chart_check.get("price_vs_ema50_1h")
-    open_air_long = bool(
-        room_pass is True
-        and first_wall is None
-        and price_vs_ema50_1h == "above"
-    )
     room_rank_map = {"pass": 0, "caution": 1, "fail": 2}
-    if open_air_long:
-        room_rank = 0
-    elif room_pass is True:
-        room_rank = 0
-    elif room_pass is False:
-        room_rank = 2
-    else:
-        room_rank = room_rank_map.get(room_quality, 3)
+    room_rank = room_rank_map.get(room_quality, 3)
 
-    wall_pass = structure.get("wall_pass")
-    wall_rank = 0 if (open_air_long or wall_pass is True or first_wall is None) else 1
+    wall_rank = 0 if structure.get("wall_pass") is True else 1
 
     ext_state = structure.get("extension_state")
     ext_rank_map = {"acceptable": 0, "caution": 1, "extended": 2}
@@ -5730,22 +5713,6 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
     trend_rank = 0 if structure.get("trend_label") == "Trend-aligned" else 1 if structure.get("trend_label") == "Countertrend" else 2
     liquidity_rank = 0 if liquidity.get("liquidity_pass") is True else 1
     trigger_rank = 0 if trigger_state.get("trigger_present") is True else 1
-
-    primary_blocker = (
-        item.get("primary_blocker")
-        or structure.get("primary_blocker")
-        or ((item.get("blockers") or [None])[0])
-    )
-    blocker_rank_map = {
-        "no_proven_hold": 0,
-        "clear_trigger": 1,
-        "one_hour_clean_around_ema": 2,
-        "clear_room": 3,
-        "early_enough": 4,
-        "twentyfour_hour_supportive": 5,
-    }
-    blocker_rank = blocker_rank_map.get(str(primary_blocker), 6)
-
     failed_count = len(checklist.get("failed_items", []))
     room_ratio = -(structure.get("room_ratio") or -999999)
     risk_mid = primary.get("distance_from_target_risk_mid", 999999)
@@ -5755,7 +5722,6 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
         verdict_rank,
         setup_rank,
         room_rank,
-        blocker_rank,
         wall_rank,
         ext_rank,
         liquidity_rank,
@@ -5918,19 +5884,26 @@ def _select_screened_best_candidate(
             if item.get("symbol") == raw_engine_best_ticker:
                 return item
 
-    live_candidates = [
-        item for item in screened_candidates
-        if item.get("final_verdict") in {"TRADE", "PENDING"}
-    ]
-    if live_candidates:
-        with_primary = [item for item in live_candidates if item.get("primary_candidate")]
-        return with_primary[0] if with_primary else live_candidates[0]
+    any_screened_live_candidate = any(
+        item.get("final_verdict") in {"TRADE", "PENDING"}
+        for item in screened_candidates
+    )
+
+    if not any_screened_live_candidate and raw_engine_best_ticker:
+        for item in screened_candidates:
+            if item.get("symbol") == raw_engine_best_ticker:
+                return item
 
     with_primary = [item for item in screened_candidates if item.get("primary_candidate")]
     if with_primary:
         return with_primary[0]
 
-    return screened_candidates[0]
+    if raw_engine_best_ticker:
+        for item in screened_candidates:
+            if item.get("symbol") == raw_engine_best_ticker:
+                return item
+
+    return None
 
 
 
