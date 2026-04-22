@@ -5944,121 +5944,6 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
     )
 
 
-
-def _chart_strength_sort_key(item: Dict[str, Any]) -> Any:
-    structure = item.get("structure_context") or {}
-    checklist = item.get("checklist") or {}
-    trigger_state = item.get("trigger_state") or {}
-    chart_check = item.get("chart_check") or {}
-    continuation_context = structure.get("continuation_context") or {}
-    symbol = str(item.get("symbol") or "")
-    screened_reason = str(item.get("reason") or "").strip().lower()
-    trigger_why = str(trigger_state.get("why") or "").strip().lower()
-
-    allowed_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
-    trend_rank = 0 if structure.get("trend_label") == "Trend-aligned" else 1 if structure.get("trend_label") == "Countertrend" else 2
-    room_rank = 0 if structure.get("room_pass") is True else 1
-    structure_rank = 0 if _checklist_item_ready(checklist, "one_hour_clean_around_ema") else 1
-    ema_rank = 0 if chart_check.get("price_vs_ema50_1h") == "above" else 1
-
-    hold_count = int(continuation_context.get("hold_closes_above_reclaim_count") or 0)
-    breakout_completed = bool(continuation_context.get("breakout_completed") is True)
-    raw_trigger_seen = bool(
-        trigger_state.get("current_bar_raw_trigger_pass") is True
-        or trigger_state.get("completed_candle_raw_trigger_pass") is True
-    )
-    late_from_hold = (
-        trigger_why == "too_late_from_hold"
-        or "too late" in screened_reason
-        or str(item.get("primary_blocker") or "").strip().lower() == "move_too_extended"
-    )
-
-    continuation_progress_rank = 5
-    if late_from_hold:
-        continuation_progress_rank = 0
-    elif breakout_completed:
-        continuation_progress_rank = 1
-    elif raw_trigger_seen:
-        continuation_progress_rank = 2
-    elif hold_count >= 3:
-        continuation_progress_rank = 3
-    elif hold_count >= 1:
-        continuation_progress_rank = 4
-
-    ext_state = str(structure.get("extension_state") or "").strip().lower()
-    ext_rank_map = {"acceptable": 0, "caution": 1, "extended": 2}
-    ext_rank = ext_rank_map.get(ext_state, 3)
-
-    hidden_left_penalty = 0 if not structure.get("hidden_left_cluster_found") else 1
-    trigger_rank = 0 if raw_trigger_seen else 1
-    failed_count = len(checklist.get("failed_items") or [])
-    ticker_rank = SYMBOL_ORDER.index(symbol) if symbol in SYMBOL_ORDER else 999999
-
-    return (
-        allowed_rank,
-        trend_rank,
-        room_rank,
-        structure_rank,
-        ema_rank,
-        continuation_progress_rank,
-        hidden_left_penalty,
-        trigger_rank,
-        ext_rank,
-        failed_count,
-        ticker_rank,
-    )
-
-
-def _select_chart_leader_candidate(
-    screened_candidates: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    if not screened_candidates:
-        return None
-
-    ranked_pool = [item for item in screened_candidates if item.get("primary_candidate")]
-    if not ranked_pool:
-        ranked_pool = list(screened_candidates)
-
-    return sorted(ranked_pool, key=_chart_strength_sort_key)[0] if ranked_pool else None
-
-
-def _build_chart_leader_context(
-    entry_candidate: Optional[Dict[str, Any]],
-    chart_leader: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    if not chart_leader:
-        return {"ok": False, "why": "no chart leader candidate"}
-
-    chart_checklist = chart_leader.get("checklist") or {}
-    chart_reason = chart_leader.get("reason")
-    chart_blockers = _effective_blockers(
-        chart_checklist,
-        screened_reason=chart_reason,
-    )
-    chart_primary_blocker = chart_blockers[0] if chart_blockers else None
-
-    entry_symbol = entry_candidate.get("symbol") if entry_candidate else None
-    chart_symbol = chart_leader.get("symbol")
-
-    note = None
-    if chart_symbol and entry_symbol and chart_symbol != entry_symbol:
-        note = (
-            f"{chart_symbol} is the strongest chart right now, "
-            f"but {entry_symbol} is still the cleaner remaining SAFE-FAST entry candidate from here."
-        )
-
-    return {
-        "ok": True,
-        "best_chart_ticker": chart_symbol,
-        "best_entry_ticker": entry_symbol or chart_symbol,
-        "chart_leader_reason": chart_reason,
-        "chart_leader_primary_blocker": chart_primary_blocker,
-        "chart_leader_blockers": chart_blockers[:4],
-        "differs_from_entry_candidate": bool(chart_symbol and entry_symbol and chart_symbol != entry_symbol),
-        "note": note,
-    }
-
-
 def _screened_other_candidates(
     screened: List[Dict[str, Any]],
     best_ticker: Optional[str],
@@ -6663,7 +6548,6 @@ def _build_simple_output_block(
     next_flip_needed: Optional[str] = None,
     primary_blocker: Optional[str] = None,
     decision_blockers: Optional[List[Any]] = None,
-    chart_leader_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     signal_present = bool(trigger_state.get("trigger_present") is True)
     macro_brief = user_facing.get("macro_brief")
@@ -6720,11 +6604,6 @@ def _build_simple_output_block(
         trap_line=trap_line,
     )
 
-    chart_leader_context = chart_leader_context or {}
-    best_chart_ticker = chart_leader_context.get("best_chart_ticker")
-    best_entry_ticker = chart_leader_context.get("best_entry_ticker") or user_facing.get("ticker")
-    chart_vs_entry_note = chart_leader_context.get("note")
-
     return {
         "design_goal": "complex_inputs_simple_outputs",
         "good_idea_now": user_facing.get("good_idea_now"),
@@ -6750,9 +6629,6 @@ def _build_simple_output_block(
         "what_matters_next_session": (surface.get("next_step") or next_step) if market_closed_context else None,
         "response_lines": surface.get("response_lines") or [],
         "response_text": surface.get("response_text") or "",
-        "best_chart_ticker": best_chart_ticker,
-        "best_entry_ticker": best_entry_ticker,
-        "chart_vs_entry_note": chart_vs_entry_note,
     }
 
 
@@ -8451,12 +8327,9 @@ def _build_on_demand_unavailable_payload(
         "candidate_engine_status": "UNCONFIRMED",
         "final_verdict": "NO_TRADE",
         "best_ticker": None,
-        "best_entry_ticker": None,
-        "best_chart_ticker": None,
         "raw_engine_best_ticker": None,
         "engine_best_ticker": None,
         "winner_context": winner_context,
-        "chart_leader_context": {"ok": False, "why": error_type},
         "engine_context": engine_context,
         "decision_context": decision_context,
         "blocker_context": blocker_context,
@@ -8905,11 +8778,8 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         raw_engine_best_ticker=summary_payload.get("best_ticker"),
         freeze_to_raw_engine=freeze_to_raw_engine,
     )
-    chart_leader = _select_chart_leader_candidate(screened_candidates)
-    chart_leader_context_block = _build_chart_leader_context(selected, chart_leader)
 
     best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
-    best_chart_ticker = chart_leader.get("symbol") if chart_leader else best_ticker
     raw_engine_status = summary_payload.get("verdict", "NO_TRADE")
     final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
     engine_status = _normalize_top_level_status(final_verdict)
@@ -9227,7 +9097,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
             next_flip_needed=approval_context_block.get("next_flip_needed"),
             primary_blocker=approval_context_block.get("primary_blocker"),
             decision_blockers=approval_context_block.get("blockers"),
-            chart_leader_context=chart_leader_context_block,
         ),
         "screened_best_context": screened_best_context_block,
         "market_context": market_context,
@@ -9983,7 +9852,6 @@ def _build_continuous_snapshot(
         "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
         "on_demand_ok": bool(on_demand_payload.get("ok")),
         "best_ticker": on_demand_payload.get("best_ticker"),
-        "best_chart_ticker": on_demand_payload.get("best_chart_ticker"),
         "final_verdict": on_demand_payload.get("final_verdict"),
         "reason_display": reason_display,
         "primary_blocker": decision_context.get("primary_blocker"),
