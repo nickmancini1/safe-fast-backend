@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_room_ath_patch3"
+BUILD_TAG = "macro_surface_v26_2026_04_21_room_ath_patch4"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -7066,6 +7066,23 @@ async def _screen_ticker_candidate(
         chart_check=chart_check,
         primary_candidate=primary_candidate,
     ) if symbol else {"ok": False, "why": "no symbol"}
+
+    if (
+        option_type == "C"
+        and structure_context.get("first_wall") is None
+        and chart_check
+        and chart_check.get("price_vs_ema50_1h") == "above"
+    ):
+        structure_context["room_pass"] = True
+        structure_context["room_hard_fail"] = False
+        if structure_context.get("room_quality") in {None, "fail", "unconfirmed"}:
+            structure_context["room_quality"] = "pass"
+        if structure_context.get("room_ratio") is None:
+            structure_context["room_ratio"] = 999.0
+        if structure_context.get("room_ratio_current") is None:
+            structure_context["room_ratio_current"] = 999.0
+        if structure_context.get("wall_pass") in {None, False}:
+            structure_context["wall_pass"] = True
 
     liquidity_context = _build_liquidity_block(primary_candidate)
     iv_context = _build_iv_context(primary_candidate)
