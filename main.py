@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v25_2026_04_17_fix14_continuous_trap_line"
+BUILD_TAG = "macro_surface_v26_2026_04_21_continuation_window_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -185,6 +185,7 @@ def _build_price_zone(
     }
 
 
+
 def _derive_entry_zones(
     option_type: str,
     chart_check: Optional[Dict[str, Any]],
@@ -203,6 +204,7 @@ def _derive_entry_zones(
     room_to_first_wall = _to_float(structure_context.get("room_to_first_wall"))
     atr_14_1h = _to_float(structure_context.get("atr_14_1h"))
     trigger_level = _to_float(trigger_state.get("trigger_level"))
+    continuation_context = structure_context.get("continuation_context") or {}
 
     zone_half_width = None
     if atr_14_1h is not None and atr_14_1h > 0:
@@ -211,6 +213,30 @@ def _derive_entry_zones(
         zone_half_width = max(latest_close * 0.0015, 0.10)
     else:
         zone_half_width = 0.10
+
+    if (
+        structure_context.get("setup_type") == "Continuation"
+        and continuation_context.get("shelf_low") is not None
+        and continuation_context.get("shelf_high") is not None
+    ):
+        primary_entry_zone = _build_price_zone(
+            continuation_context.get("shelf_low"),
+            continuation_context.get("shelf_high"),
+            "continuation_hold_zone",
+            "continuation_shelf",
+        )
+        backup_entry_zone = None
+        if continuation_context.get("trigger_level") is not None:
+            backup_entry_zone = _build_price_zone(
+                continuation_context.get("trigger_level") - zone_half_width,
+                continuation_context.get("trigger_level") + zone_half_width,
+                "continuation_break_zone",
+                "continuation_break_line",
+            )
+        return {
+            "primary_entry_zone": primary_entry_zone,
+            "backup_entry_zone": backup_entry_zone,
+        }
 
     primary_entry_zone = None
     if ema50_1h is not None:
@@ -270,10 +296,12 @@ def _relation_to_ema(candle: Optional[Dict[str, Any]], ema50_1h: Optional[float]
         return "inside"
     return "at"
 
+
 def _build_trigger_detail_context(
     option_type: str,
     chart_check: Optional[Dict[str, Any]],
     trigger_state: Dict[str, Any],
+    structure_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if not chart_check or not chart_check.get("ok"):
         return {
@@ -304,6 +332,67 @@ def _build_trigger_detail_context(
     current_close = _to_float(current_candle.get("close"))
     current_high = _to_float(current_candle.get("high"))
     current_low = _to_float(current_candle.get("low"))
+    continuation_context = (structure_context or {}).get("continuation_context") or {}
+
+    if (structure_context or {}).get("setup_type") == "Continuation" and continuation_context:
+        continuation_reason = continuation_context.get("exact_reason")
+        shelf_high = continuation_context.get("shelf_high")
+        shelf_low = continuation_context.get("shelf_low")
+        if continuation_reason == "tradeable":
+            behavior_label = "first_shelf_break_completed_in_range"
+        elif continuation_reason == "late":
+            behavior_label = "beyond_shelf_break_too_extended"
+        elif continuation_context.get("shelf_proven"):
+            behavior_label = "shelf_proven_waiting_first_break"
+        else:
+            behavior_label = "hold_not_proven_yet"
+
+        trigger_candle_source = "most_recent_completed_candle"
+        trigger_candle_ref = prior_candle
+        trigger_candle_close = _to_float(trigger_candle_ref.get("close")) if trigger_candle_ref else None
+        qualifies_as_trigger_candle = bool(continuation_context.get("breakout_completed") is True)
+
+        trigger_candle = None
+        if trigger_candle_ref:
+            trigger_candle = {
+                "source": trigger_candle_source,
+                "time_iso": trigger_candle_ref.get("time_iso"),
+                "open": _round_or_none(_to_float(trigger_candle_ref.get("open")), 4),
+                "high": _round_or_none(_to_float(trigger_candle_ref.get("high")), 4),
+                "low": _round_or_none(_to_float(trigger_candle_ref.get("low")), 4),
+                "close": _round_or_none(_to_float(trigger_candle_ref.get("close")), 4),
+                "relation_to_trigger_level": (
+                    "above" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close > trigger_level
+                    else "below" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close < trigger_level
+                    else "at" if trigger_level is not None and trigger_candle_close is not None
+                    else None
+                ),
+                "relation_to_ema50_1h": _relation_to_ema(trigger_candle_ref, ema50_1h),
+                "qualifies_as_trigger_candle": qualifies_as_trigger_candle,
+            }
+
+        current_bar_behavior = {
+            "status": "confirmed",
+            "label": behavior_label,
+            "time_iso": current_candle.get("time_iso"),
+            "open": _round_or_none(_to_float(current_candle.get("open")), 4),
+            "high": _round_or_none(current_high, 4),
+            "low": _round_or_none(current_low, 4),
+            "close": _round_or_none(current_close, 4),
+            "price_vs_ema50_1h": price_side,
+            "trigger_level": _round_or_none(trigger_level, 4),
+            "trigger_present": trigger_present,
+            "structure_ready": structure_ready,
+            "why": trigger_state.get("why"),
+            "shelf_low": shelf_low,
+            "shelf_high": shelf_high,
+            "continuation_exact_reason": continuation_reason,
+        }
+
+        return {
+            "trigger_candle": trigger_candle,
+            "current_bar_behavior": current_bar_behavior,
+        }
 
     if option_type == "C":
         if trigger_level is not None and current_close is not None and current_close > trigger_level and structure_ready:
@@ -377,7 +466,6 @@ def _build_trigger_detail_context(
         "trigger_candle": trigger_candle,
         "current_bar_behavior": current_bar_behavior,
     }
-
 
 
 def _summarize_trigger_scan_candle(
@@ -504,6 +592,7 @@ def _evaluate_trigger_scan_candle(
     }
 
 
+
 def _build_trigger_scan_context(
     option_type: str,
     chart_check: Optional[Dict[str, Any]],
@@ -512,6 +601,8 @@ def _build_trigger_scan_context(
     time_day_gate: Dict[str, Any],
     structure_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    continuation_context = (structure_context or {}).get("continuation_context") or {}
+
     if not chart_check or not chart_check.get("ok"):
         return {
             "scan_basis": "current_bar_plus_last_3_completed_1h_candles",
@@ -539,6 +630,99 @@ def _build_trigger_scan_context(
     fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
     gate_reason = trigger_state.get("why")
     structure_ready = trigger_state.get("structure_ready")
+
+    current_bar = recent[-1] if recent else None
+    most_recent_completed = recent[-2] if len(recent) >= 2 else None
+
+    if (structure_context or {}).get("setup_type") == "Continuation" and continuation_context:
+        trigger_level = _to_float(continuation_context.get("trigger_level"))
+        current_close = _to_float((current_bar or {}).get("close"))
+        completed_close = _to_float((most_recent_completed or {}).get("close"))
+
+        if option_type == "C":
+            current_raw = bool(trigger_level is not None and current_close is not None and current_close > trigger_level)
+            completed_raw = bool(trigger_level is not None and completed_close is not None and completed_close > trigger_level)
+            current_relation = "above" if current_raw else "below" if trigger_level is not None and current_close is not None and current_close < trigger_level else "at" if trigger_level is not None and current_close is not None else None
+            completed_relation = "above" if completed_raw else "below" if trigger_level is not None and completed_close is not None and completed_close < trigger_level else "at" if trigger_level is not None and completed_close is not None else None
+        else:
+            current_raw = bool(trigger_level is not None and current_close is not None and current_close < trigger_level)
+            completed_raw = bool(trigger_level is not None and completed_close is not None and completed_close < trigger_level)
+            current_relation = "below" if current_raw else "above" if trigger_level is not None and current_close is not None and current_close > trigger_level else "at" if trigger_level is not None and current_close is not None else None
+            completed_relation = "below" if completed_raw else "above" if trigger_level is not None and completed_close is not None and completed_close > trigger_level else "at" if trigger_level is not None and completed_close is not None else None
+
+        current_bar_eval = {
+            "time_iso": (current_bar or {}).get("time_iso"),
+            "open": _round_or_none(_to_float((current_bar or {}).get("open")), 4),
+            "high": _round_or_none(_to_float((current_bar or {}).get("high")), 4),
+            "low": _round_or_none(_to_float((current_bar or {}).get("low")), 4),
+            "close": _round_or_none(current_close, 4),
+            "reference_window_size": continuation_context.get("shelf_candle_count"),
+            "reference_trigger_level": continuation_context.get("trigger_level"),
+            "relation_to_trigger_level": current_relation,
+            "relation_to_ema50_1h": _relation_to_ema(current_bar, ema50_1h),
+            "raw_cross_pass": current_raw,
+            "ema_side_pass": bool((option_type == "C" and current_close is not None and (ema50_1h is None or current_close > ema50_1h)) or (option_type == "P" and current_close is not None and (ema50_1h is None or current_close < ema50_1h))),
+            "raw_chart_trigger_pass": current_raw,
+            "structure_ready": structure_ready,
+            "gated_trigger_pass": False,
+            "status": "fail" if current_raw else "unconfirmed",
+            "why": "waiting_for_completed_shelf_break_close" if current_raw else trigger_state.get("why"),
+            "breakout_hold_confirmed": continuation_context.get("shelf_proven"),
+            "breakout_hold_reference_level": continuation_context.get("trigger_level"),
+            "breakout_hold_reclaim_limit_level": continuation_context.get("shelf_low") if option_type == "C" else continuation_context.get("shelf_high"),
+        }
+        completed_eval = {
+            "time_iso": (most_recent_completed or {}).get("time_iso"),
+            "open": _round_or_none(_to_float((most_recent_completed or {}).get("open")), 4),
+            "high": _round_or_none(_to_float((most_recent_completed or {}).get("high")), 4),
+            "low": _round_or_none(_to_float((most_recent_completed or {}).get("low")), 4),
+            "close": _round_or_none(completed_close, 4),
+            "reference_window_size": continuation_context.get("shelf_candle_count"),
+            "reference_trigger_level": continuation_context.get("trigger_level"),
+            "relation_to_trigger_level": completed_relation,
+            "relation_to_ema50_1h": _relation_to_ema(most_recent_completed, ema50_1h),
+            "raw_cross_pass": completed_raw,
+            "ema_side_pass": bool((option_type == "C" and completed_close is not None and (ema50_1h is None or completed_close > ema50_1h)) or (option_type == "P" and completed_close is not None and (ema50_1h is None or completed_close < ema50_1h))),
+            "raw_chart_trigger_pass": completed_raw,
+            "structure_ready": structure_ready,
+            "gated_trigger_pass": bool(trigger_state.get("completed_candle_trigger_present") is True),
+            "status": "pass" if trigger_state.get("completed_candle_trigger_present") is True else "fail" if completed_raw else "unconfirmed",
+            "why": trigger_state.get("why"),
+            "breakout_hold_confirmed": continuation_context.get("shelf_proven"),
+            "breakout_hold_reference_level": continuation_context.get("trigger_level"),
+            "breakout_hold_reclaim_limit_level": continuation_context.get("shelf_low") if option_type == "C" else continuation_context.get("shelf_high"),
+        }
+
+        if trigger_state.get("completed_candle_trigger_present"):
+            trigger_scan_status = "pass_most_recent_completed_candle"
+            why = "SAFE-FAST continuation trigger passed on the first completed break from the shelf."
+        elif continuation_context.get("exact_reason") == "late":
+            trigger_scan_status = "fail"
+            why = continuation_context.get("status_message")
+        elif continuation_context.get("exact_reason") == "early":
+            trigger_scan_status = "fail"
+            why = continuation_context.get("status_message")
+        elif not market_open:
+            trigger_scan_status = "fail"
+            why = "Market is closed, so trigger scan cannot produce a live entry."
+        else:
+            trigger_scan_status = "unconfirmed"
+            why = trigger_state.get("why") or "Continuation trigger scan is waiting for the first completed shelf break."
+
+        return {
+            "scan_basis": "current_bar_plus_last_completed_1h_candle_against_continuation_shelf",
+            "required_completed_candle_count": continuation_context.get("shelf_candle_count"),
+            "trigger_style": trigger_state.get("trigger_style"),
+            "market_open": market_open,
+            "fresh_entry_allowed": fresh_entry_allowed,
+            "structure_ready": structure_ready,
+            "current_bar": current_bar_eval,
+            "most_recent_completed_candle": completed_eval,
+            "current_bar_reference_candles": continuation_context.get("shelf_candles") or [],
+            "completed_candle_reference_candles": continuation_context.get("shelf_candles") or [],
+            "trigger_scan_status": trigger_scan_status,
+            "why_trigger_scan_passes_or_fails": why,
+        }
 
     current_bar = recent[-1] if recent else None
     most_recent_completed = recent[-2] if len(recent) >= 2 else None
@@ -649,6 +833,7 @@ def _build_trigger_scan_context(
     }
 
 
+
 def _build_setup_route_context(
     option_type: str,
     structure_context: Dict[str, Any],
@@ -666,6 +851,46 @@ def _build_setup_route_context(
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
     allowed_setup_types = ALLOWED_SETUP_TYPES
     route_type_allowed = intended_setup_type in allowed_setup_types
+    continuation_context = structure_context.get("continuation_context") or {}
+
+    if intended_setup_type == "Continuation":
+        if continuation_context.get("exact_reason") == "tradeable":
+            retest_quality = "first_break_in_range"
+        elif continuation_context.get("exact_reason") == "late":
+            retest_quality = "late_from_hold"
+        elif continuation_context.get("shelf_proven"):
+            retest_quality = "shelf_proven_waiting_break"
+        else:
+            retest_quality = "hold_not_proven"
+        next_bar_confirmation_required = False
+
+        if route_type_allowed is False:
+            setup_route_status = "fail"
+            why = "Setup type is not one of the allowed SAFE-FAST routes."
+        elif room_pass is False:
+            setup_route_status = "fail"
+            why = "Room to the first wall is too tight for this setup route."
+        elif wall_pass is False:
+            setup_route_status = "fail"
+            why = "Wall thesis does not support this setup route."
+        elif continuation_context.get("exact_reason") == "late":
+            setup_route_status = "fail"
+            why = continuation_context.get("status_message") or "Too late for the current continuation shelf."
+        elif setup_eligible_now is True and trigger_present and structure_ready:
+            setup_route_status = "pass"
+            why = continuation_context.get("status_message") or "Continuation hold is proven and the first break is still in range."
+        else:
+            setup_route_status = "pending_confirmation"
+            why = continuation_context.get("status_message") or "Continuation hold is still building or waiting for the first valid break."
+
+        return {
+            "intended_setup_type": intended_setup_type,
+            "retest_quality": retest_quality,
+            "fast_entry_allowed": False,
+            "next_bar_confirmation_required": next_bar_confirmation_required,
+            "setup_route_status": setup_route_status,
+            "why_setup_route_passes_or_fails": why,
+        }
 
     if intended_setup_type == "Clean Fast Break":
         retest_quality = "breakout_path" if not chop_risk else "messy_breakout"
@@ -796,6 +1021,7 @@ def _build_room_wall_context(structure_context: Dict[str, Any]) -> Dict[str, Any
     }
 
 
+
 def _build_extension_quality_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
     extension_state = structure_context.get("extension_state")
     late_move = structure_context.get("late_move")
@@ -806,8 +1032,12 @@ def _build_extension_quality_context(structure_context: Dict[str, Any]) -> Dict[
     early_trigger_window_passed = structure_context.get("early_trigger_window_passed")
     extension_confirmer_flags = structure_context.get("extension_confirmer_flags")
     extension_confirmer_count = structure_context.get("extension_confirmer_count")
+    continuation_context = structure_context.get("continuation_context") or {}
 
-    if extension_blocks_now is True:
+    if continuation_context.get("exact_reason") == "late":
+        extension_quality_status = "fail"
+        why = continuation_context.get("status_message") or "Too late for the current continuation hold."
+    elif extension_blocks_now is True:
         extension_quality_status = "fail"
         why = "Move is materially extended for SAFE-FAST right now."
     elif extension_state == "extended" or late_move is True or extension_material is True:
@@ -836,10 +1066,11 @@ def _build_extension_quality_context(structure_context: Dict[str, Any]) -> Dict[
         "extension_material": extension_material,
         "extension_soft_flag": extension_soft_flag,
         "extension_blocks_now": extension_blocks_now,
+        "continuation_exact_reason": continuation_context.get("exact_reason"),
+        "continuation_status_message": continuation_context.get("status_message"),
         "extension_quality_status": extension_quality_status,
         "why_extension_passes_or_fails": why,
     }
-
 
 
 def _build_execution_quality_context(
@@ -1190,6 +1421,7 @@ def _build_live_map_block(
         option_type=option_type,
         chart_check=chart_check,
         trigger_state=trigger_state,
+        structure_context=structure_context,
     )
     setup_route = _build_setup_route_context(
         option_type=option_type,
@@ -1236,6 +1468,7 @@ def _build_live_map_block(
         "ticker": ticker,
         "primary_entry_zone": primary_entry_zone,
         "backup_entry_zone": backup_entry_zone,
+        "continuation": structure_context.get("continuation_context") if structure_context.get("setup_type") == "Continuation" else None,
         "trigger_style": trigger_state.get("trigger_style"),
         "trigger_level": trigger_state.get("trigger_level"),
         "trigger_present": trigger_state.get("trigger_present"),
@@ -3298,6 +3531,383 @@ def _wall_thesis(
     }
 
 
+
+def _continuation_pair_overlaps(candle_a: Optional[Dict[str, Any]], candle_b: Optional[Dict[str, Any]]) -> bool:
+    high_a = _to_float((candle_a or {}).get("high"))
+    low_a = _to_float((candle_a or {}).get("low"))
+    high_b = _to_float((candle_b or {}).get("high"))
+    low_b = _to_float((candle_b or {}).get("low"))
+    if None in {high_a, low_a, high_b, low_b}:
+        return False
+    overlap = min(high_a, high_b) - max(low_a, low_b)
+    range_a = max(high_a - low_a, 0.0001)
+    range_b = max(high_b - low_b, 0.0001)
+    return bool(overlap > 0 and overlap >= min(range_a, range_b) * 0.20)
+
+
+def _build_continuation_window_snapshot(
+    *,
+    option_type: str,
+    shelf_candles: List[Dict[str, Any]],
+    pre_shelf_candles: List[Dict[str, Any]],
+    atr14: Optional[float],
+    ema50_1h: Optional[float],
+    current_price: Optional[float],
+    break_candle: Optional[Dict[str, Any]] = None,
+    room_pass: Optional[bool] = None,
+    extension_blocks_now: bool = False,
+) -> Dict[str, Any]:
+    highs = [_to_float(c.get("high")) for c in shelf_candles]
+    lows = [_to_float(c.get("low")) for c in shelf_candles]
+    closes = [_to_float(c.get("close")) for c in shelf_candles]
+    valid_prices = all(v is not None for v in highs + lows + closes)
+
+    fallback_atr = None
+    if atr14 not in (None, 0):
+        fallback_atr = float(atr14)
+    elif current_price not in (None, 0):
+        fallback_atr = max(float(current_price) * 0.0040, 0.50)
+
+    shelf_high = max(highs) if valid_prices and highs else None
+    shelf_low = min(lows) if valid_prices and lows else None
+    shelf_range = (shelf_high - shelf_low) if shelf_high is not None and shelf_low is not None else None
+    range_ok = bool(
+        shelf_range is not None
+        and fallback_atr is not None
+        and shelf_range <= fallback_atr
+    )
+
+    overlap_hits = 0
+    for left, right in zip(shelf_candles, shelf_candles[1:]):
+        if _continuation_pair_overlaps(left, right):
+            overlap_hits += 1
+    overlap_confirmed = bool(len(shelf_candles) >= 2 and overlap_hits >= 1)
+
+    reclaim_area = None
+    if pre_shelf_candles:
+        reclaim_window = pre_shelf_candles[-6:]
+        if option_type == "C":
+            reclaim_area = max(
+                (_to_float(c.get("high")) for c in reclaim_window if _to_float(c.get("high")) is not None),
+                default=None,
+            )
+        else:
+            reclaim_area = min(
+                (_to_float(c.get("low")) for c in reclaim_window if _to_float(c.get("low")) is not None),
+                default=None,
+            )
+
+    shelf_closes_hold_reclaim = True
+    if reclaim_area is not None and closes:
+        if option_type == "C":
+            shelf_closes_hold_reclaim = all(close is not None and close > reclaim_area for close in closes)
+        else:
+            shelf_closes_hold_reclaim = all(close is not None and close < reclaim_area for close in closes)
+
+    shelf_closes_hold_low = True
+    if closes and shelf_low is not None and shelf_high is not None:
+        if option_type == "C":
+            shelf_closes_hold_low = all(close is not None and close >= shelf_low for close in closes)
+        else:
+            shelf_closes_hold_low = all(close is not None and close <= shelf_high for close in closes)
+
+    ema_side_hold = True
+    if ema50_1h is not None and closes:
+        if option_type == "C":
+            ema_side_hold = all(close is not None and close > ema50_1h for close in closes)
+        else:
+            ema_side_hold = all(close is not None and close < ema50_1h for close in closes)
+
+    impulse_present = False
+    if pre_shelf_candles and closes:
+        prior_window = pre_shelf_candles[-4:]
+        prior_highs = [_to_float(c.get("high")) for c in prior_window if _to_float(c.get("high")) is not None]
+        prior_lows = [_to_float(c.get("low")) for c in prior_window if _to_float(c.get("low")) is not None]
+        prior_closes = [_to_float(c.get("close")) for c in prior_window if _to_float(c.get("close")) is not None]
+        if option_type == "C":
+            prior_anchor = min(prior_closes) if prior_closes else None
+            prior_high = max(prior_highs) if prior_highs else None
+            impulse_present = bool(
+                prior_anchor is not None
+                and shelf_high is not None
+                and max(close for close in closes if close is not None) > prior_anchor
+                and (
+                    prior_high is None
+                    or shelf_high >= prior_high
+                    or (fallback_atr is not None and shelf_high >= prior_high - (fallback_atr * 0.15))
+                )
+            )
+        else:
+            prior_anchor = max(prior_closes) if prior_closes else None
+            prior_low = min(prior_lows) if prior_lows else None
+            impulse_present = bool(
+                prior_anchor is not None
+                and shelf_low is not None
+                and min(close for close in closes if close is not None) < prior_anchor
+                and (
+                    prior_low is None
+                    or shelf_low <= prior_low
+                    or (fallback_atr is not None and shelf_low <= prior_low + (fallback_atr * 0.15))
+                )
+            )
+
+    shelf_exists = bool(
+        len(shelf_candles) >= 2
+        and valid_prices
+        and range_ok
+        and overlap_confirmed
+    )
+    shelf_proven = bool(
+        shelf_exists
+        and ema_side_hold
+        and impulse_present
+        and shelf_closes_hold_reclaim
+        and shelf_closes_hold_low
+    )
+
+    trigger_level = shelf_high if option_type == "C" else shelf_low
+    break_close = _to_float((break_candle or {}).get("close"))
+    break_time_iso = (break_candle or {}).get("time_iso")
+    break_completed = False
+    break_above_ema = False
+    if trigger_level is not None and break_close is not None:
+        if option_type == "C":
+            break_completed = break_close > trigger_level
+            break_above_ema = bool(ema50_1h is None or break_close > ema50_1h)
+        else:
+            break_completed = break_close < trigger_level
+            break_above_ema = bool(ema50_1h is None or break_close < ema50_1h)
+
+    current_distance_to_shelf_break = None
+    if current_price is not None and trigger_level is not None:
+        if option_type == "C":
+            current_distance_to_shelf_break = current_price - trigger_level
+        else:
+            current_distance_to_shelf_break = trigger_level - current_price
+
+    current_distance_to_ema = None
+    if current_price is not None and ema50_1h is not None:
+        if option_type == "C":
+            current_distance_to_ema = current_price - ema50_1h
+        else:
+            current_distance_to_ema = ema50_1h - current_price
+
+    breakout_live_without_completed = bool(
+        trigger_level is not None
+        and current_price is not None
+        and (
+            (option_type == "C" and current_price > trigger_level and not break_completed)
+            or (option_type == "P" and current_price < trigger_level and not break_completed)
+        )
+    )
+
+    inside_half_atr_from_shelf = bool(
+        fallback_atr is not None
+        and current_distance_to_shelf_break is not None
+        and 0 <= current_distance_to_shelf_break <= (fallback_atr * 0.50)
+    )
+    within_two_atr_of_ema = bool(
+        fallback_atr is not None
+        and current_distance_to_ema is not None
+        and current_distance_to_ema <= (fallback_atr * 2.0)
+    )
+    too_far_from_shelf = bool(
+        fallback_atr is not None
+        and current_distance_to_shelf_break is not None
+        and current_distance_to_shelf_break > (fallback_atr * 0.50)
+    )
+    too_far_from_ema = bool(
+        fallback_atr is not None
+        and current_distance_to_ema is not None
+        and current_distance_to_ema > (fallback_atr * 2.0)
+    )
+
+    inside_tradeable_window = bool(
+        shelf_proven
+        and break_completed
+        and break_above_ema
+        and inside_half_atr_from_shelf
+        and within_two_atr_of_ema
+        and room_pass is not False
+        and not extension_blocks_now
+    )
+
+    too_late = bool(
+        shelf_proven
+        and (
+            (break_completed and too_far_from_shelf)
+            or (breakout_live_without_completed and too_far_from_shelf)
+            or too_far_from_ema
+        )
+    )
+
+    if inside_tradeable_window:
+        exact_reason = "tradeable"
+        status_message = "Tradeable now: hold is proven and first break is in range."
+        main_blocker = None
+    elif too_late:
+        exact_reason = "late"
+        status_message = "Too late: the break already expanded too far from the hold."
+        main_blocker = "move_too_extended"
+    elif not shelf_proven:
+        exact_reason = "early"
+        status_message = "Too early: hold is not proven yet."
+        main_blocker = "no_proven_hold"
+    else:
+        exact_reason = "early"
+        status_message = "Too early: hold is proven, but no valid trigger has closed yet."
+        main_blocker = "no_valid_trigger"
+
+    return {
+        "shelf_exists": shelf_exists,
+        "shelf_proven": shelf_proven,
+        "hold_area": _build_price_zone(shelf_low, shelf_high, "continuation_hold_area", "continuation_shelf") if shelf_low is not None and shelf_high is not None else None,
+        "shelf_low": _round_or_none(shelf_low, 4),
+        "shelf_high": _round_or_none(shelf_high, 4),
+        "break_line": _round_or_none(trigger_level, 4),
+        "shelf_range": _round_or_none(shelf_range, 4),
+        "shelf_candle_count": len(shelf_candles),
+        "overlap_hits": overlap_hits,
+        "overlap_confirmed": overlap_confirmed,
+        "reclaim_area": _round_or_none(reclaim_area, 4),
+        "ema_side_hold": ema_side_hold,
+        "impulse_present": impulse_present,
+        "closes_hold_reclaim_area": shelf_closes_hold_reclaim,
+        "closes_hold_shelf": shelf_closes_hold_low,
+        "breakout_completed": break_completed,
+        "breakout_candle_time_iso": break_time_iso,
+        "breakout_candle_close": _round_or_none(break_close, 4),
+        "distance_current_to_shelf_high": _round_or_none(current_distance_to_shelf_break, 4),
+        "distance_current_to_1h_50_ema": _round_or_none(current_distance_to_ema, 4),
+        "distance_current_to_shelf_high_atr": _round_or_none(
+            (current_distance_to_shelf_break / fallback_atr) if fallback_atr not in (None, 0) and current_distance_to_shelf_break is not None else None,
+            3,
+        ),
+        "distance_current_to_1h_50_ema_atr": _round_or_none(
+            (current_distance_to_ema / fallback_atr) if fallback_atr not in (None, 0) and current_distance_to_ema is not None else None,
+            3,
+        ),
+        "inside_tradeable_window": inside_tradeable_window,
+        "tradeable_now": inside_tradeable_window,
+        "current_break_is_first_completed_break": break_completed,
+        "current_breakout_without_completed_confirmation": breakout_live_without_completed,
+        "exact_reason": exact_reason,
+        "status_message": status_message,
+        "main_blocker": main_blocker,
+        "evaluation_mode": "with_break" if break_candle else "hold_only",
+        "trigger_level": _round_or_none(trigger_level, 4),
+        "atr_14_1h": _round_or_none(fallback_atr, 4),
+        "shelf_candles": [
+            {
+                "time_iso": candle.get("time_iso"),
+                "open": _round_or_none(_to_float(candle.get("open")), 4),
+                "high": _round_or_none(_to_float(candle.get("high")), 4),
+                "low": _round_or_none(_to_float(candle.get("low")), 4),
+                "close": _round_or_none(_to_float(candle.get("close")), 4),
+            }
+            for candle in shelf_candles
+        ],
+    }
+
+
+def _build_continuation_window_context(
+    *,
+    option_type: str,
+    candles: List[Dict[str, Any]],
+    latest_close: Optional[float],
+    ema50_1h: Optional[float],
+    trend_supportive: Optional[bool],
+    room_pass: Optional[bool],
+    extension_blocks_now: bool,
+) -> Dict[str, Any]:
+    completed_candles = candles[:-1] if len(candles) >= 2 else list(candles)
+    if len(completed_candles) < 2 or latest_close is None:
+        return {
+            "ok": False,
+            "exact_reason": "early",
+            "status_message": "Too early: hold is not proven yet.",
+            "main_blocker": "no_proven_hold",
+            "shelf_exists": False,
+            "shelf_proven": False,
+            "inside_tradeable_window": False,
+            "tradeable_now": False,
+            "continuation_applicable": bool(trend_supportive is True),
+        }
+
+    atr14 = _calc_atr(candles, 14)
+    snapshots: List[Dict[str, Any]] = []
+
+    for shelf_candle_count in (2, 3, 4):
+        if len(completed_candles) >= shelf_candle_count + 1:
+            shelf_candles = completed_candles[-(shelf_candle_count + 1):-1]
+            pre_shelf_candles = completed_candles[:-(shelf_candle_count + 1)]
+            snapshots.append(
+                _build_continuation_window_snapshot(
+                    option_type=option_type,
+                    shelf_candles=shelf_candles,
+                    pre_shelf_candles=pre_shelf_candles,
+                    atr14=atr14,
+                    ema50_1h=ema50_1h,
+                    current_price=latest_close,
+                    break_candle=completed_candles[-1],
+                    room_pass=room_pass,
+                    extension_blocks_now=extension_blocks_now,
+                )
+            )
+        if len(completed_candles) >= shelf_candle_count:
+            shelf_candles = completed_candles[-shelf_candle_count:]
+            pre_shelf_candles = completed_candles[:-shelf_candle_count]
+            snapshots.append(
+                _build_continuation_window_snapshot(
+                    option_type=option_type,
+                    shelf_candles=shelf_candles,
+                    pre_shelf_candles=pre_shelf_candles,
+                    atr14=atr14,
+                    ema50_1h=ema50_1h,
+                    current_price=latest_close,
+                    break_candle=None,
+                    room_pass=room_pass,
+                    extension_blocks_now=extension_blocks_now,
+                )
+            )
+
+    if not snapshots:
+        return {
+            "ok": False,
+            "exact_reason": "early",
+            "status_message": "Too early: hold is not proven yet.",
+            "main_blocker": "no_proven_hold",
+            "shelf_exists": False,
+            "shelf_proven": False,
+            "inside_tradeable_window": False,
+            "tradeable_now": False,
+            "continuation_applicable": bool(trend_supportive is True),
+            "atr_14_1h": _round_or_none(atr14, 4),
+        }
+
+    priority_rank = {"tradeable": 0, "late": 1, "early": 2}
+
+    def _snapshot_sort_key(snapshot: Dict[str, Any]) -> Any:
+        return (
+            priority_rank.get(snapshot.get("exact_reason"), 9),
+            0 if snapshot.get("shelf_proven") else 1,
+            0 if snapshot.get("breakout_completed") else 1,
+            -(snapshot.get("shelf_candle_count") or 0),
+            abs(snapshot.get("distance_current_to_shelf_high") or 999999),
+        )
+
+    selected = sorted(snapshots, key=_snapshot_sort_key)[0]
+    selected = {
+        **selected,
+        "ok": True,
+        "continuation_applicable": bool(trend_supportive is True),
+        "trend_supportive": trend_supportive,
+        "room_pass": room_pass,
+        "extension_blocks_now": extension_blocks_now,
+    }
+    return selected
+
+
 def _setup_classifier(
     option_type: str,
     chart_check: Dict[str, Any],
@@ -3307,6 +3917,7 @@ def _setup_classifier(
     wall_pass: Optional[bool],
     extension_state: Dict[str, Any],
     candles: List[Dict[str, Any]],
+    continuation_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     latest_close = chart_check.get("latest_close")
     ema50_1h = chart_check.get("ema50_1h")
@@ -3325,15 +3936,25 @@ def _setup_classifier(
         tight_break = (max(recent_closes) - min(recent_closes)) / latest_close <= 0.0035
 
     blocked_now = bool(room_pass is False or wall_pass is False or extension_state.get("state") == "extended")
+    continuation_ctx = continuation_context or {}
+    continuation_shelf_proven = bool(continuation_ctx.get("shelf_proven") is True)
+    continuation_tradeable_now = bool(continuation_ctx.get("tradeable_now") is True)
+    continuation_detected = bool(continuation_shelf_proven or continuation_ctx.get("shelf_exists") is True)
 
     if trend_supportive is True:
+        if continuation_detected:
+            return {
+                "setup_type": "Continuation",
+                "trend_label": trend_label,
+                "allowed_setup": True,
+                "setup_type_allowed": True,
+                "setup_eligible_now": bool(continuation_tradeable_now and not blocked_now and not chop),
+            }
         if not blocked_now:
             if near_ema and (room_ratio or 0) >= 2.5 and not chop:
                 return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
             if tight_break and not chop:
                 return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
-            if near_ema:
-                return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
             return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
 
         if tight_break and not chop:
@@ -3346,8 +3967,6 @@ def _setup_classifier(
         return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False, "setup_type_allowed": False, "setup_eligible_now": False}
 
     return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None, "setup_type_allowed": None, "setup_eligible_now": None}
-
-
 
 
 def _detect_ath_open_air_context(
@@ -3723,6 +4342,16 @@ def _build_structure_context(
         extension_ctx["late_move"] = True
         extension_ctx["ath_open_air_blocks_now"] = True
 
+    continuation_ctx = _build_continuation_window_context(
+        option_type=option_type,
+        candles=candles,
+        latest_close=latest_close,
+        ema50_1h=ema50_1h,
+        trend_supportive=trend_ctx.get("supportive"),
+        room_pass=room_pass,
+        extension_blocks_now=extension_ctx.get("extension_blocks_now"),
+    )
+
     setup_ctx = _setup_classifier(
         option_type=option_type,
         chart_check=chart_check,
@@ -3732,6 +4361,7 @@ def _build_structure_context(
         wall_pass=wall_ctx.get("wall_pass"),
         extension_state=extension_ctx,
         candles=candles,
+        continuation_context=continuation_ctx,
     )
 
     return {
@@ -3800,6 +4430,13 @@ def _build_structure_context(
         "early_enough_soft_caution": extension_ctx.get("early_enough_soft_caution"),
         "extension_soft_flag": extension_ctx.get("extension_soft_flag"),
         "extension_blocks_now": extension_ctx.get("extension_blocks_now"),
+        "continuation_context": continuation_ctx,
+        "continuation_exact_reason": continuation_ctx.get("exact_reason"),
+        "continuation_reason_text": continuation_ctx.get("status_message"),
+        "continuation_tradeable_now": continuation_ctx.get("tradeable_now"),
+        "continuation_window_late": continuation_ctx.get("exact_reason") == "late",
+        "continuation_hold_proven": continuation_ctx.get("shelf_proven"),
+        "continuation_trigger_level": continuation_ctx.get("trigger_level"),
         "iv_state": "unconfirmed",
         "setup_type": setup_ctx.get("setup_type"),
         "trend_label": setup_ctx.get("trend_label"),
@@ -3864,6 +4501,8 @@ def _final_verdict(
         if structure_context.get("wall_pass") is False:
             return "NO_TRADE"
         if structure_context.get("ath_open_air_blocks_now") is True:
+            return "NO_TRADE"
+        if structure_context.get("continuation_window_late") is True:
             return "NO_TRADE"
         if structure_context.get("extension_state") == "extended":
             return "NO_TRADE"
@@ -4022,6 +4661,7 @@ def _build_universe_chart_confirmation_block(
     }
 
 
+
 def _build_user_facing_block(
     request: OnDemandRequest,
     engine_status: str,
@@ -4045,6 +4685,8 @@ def _build_user_facing_block(
         or (str(time_day_gate.get("reason") or "").strip().lower() == "market_closed")
     )
     action_when_blocked = "wait for next session" if market_closed_context else "stand down"
+    continuation_context = structure_context.get("continuation_context") or {}
+    continuation_message = continuation_context.get("status_message")
 
     if request.open_positions > 0:
         return {
@@ -4170,6 +4812,18 @@ def _build_user_facing_block(
                 "setup_state": "NO TRADE",
                 "why": reason,
             }
+        if structure_context.get("continuation_window_late") is True and continuation_message:
+            reason = continuation_message
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": action_when_blocked,
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
         if structure_context.get("extension_state") == "extended":
             reason = "Move is extended versus the RTH 1H 50 EMA or too late relative to the first wall."
             if market_closed_context:
@@ -4194,10 +4848,9 @@ def _build_user_facing_block(
         }
 
     if final_verdict == "TRADE":
-        trade_why = "Trigger is live and the current SAFE-FAST gates pass."
+        trade_why = continuation_message if structure_context.get("setup_type") == "Continuation" and continuation_message else "Trigger is live and the current SAFE-FAST gates pass."
         trade_action = "enter"
         if trigger_state.get("why") == "completed_candle_trigger_approved":
-            trade_why = "Completed-candle signal is approved and still valid."
             trade_action = "enter from completed-candle approval"
         return {
             "good_idea_now": "YES",
@@ -4209,7 +4862,7 @@ def _build_user_facing_block(
         }
 
     if final_verdict == "NO_TRADE":
-        why = "Best ticker failed the 1H EMA alignment check."
+        why = continuation_message if structure_context.get("setup_type") == "Continuation" and continuation_message else "Best ticker failed the 1H EMA alignment check."
         if chart_check_error:
             why = "Chart check failed in this run."
         return {
@@ -4221,15 +4874,18 @@ def _build_user_facing_block(
             "why": why,
         }
 
+    pending_why = continuation_message if structure_context.get("setup_type") == "Continuation" and continuation_message else "Structure is acceptable, but trigger/entry timing still needs confirmation."
+    pending_action = "wait for live trigger"
+    if structure_context.get("setup_type") == "Continuation" and continuation_context.get("shelf_proven") is not True:
+        pending_action = "wait for hold to prove"
     return {
         "good_idea_now": "NO",
         "ticker": ticker,
-        "action": "wait for live trigger",
+        "action": pending_action,
         "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
         "setup_state": "PENDING",
-        "why": "Structure is acceptable, but trigger/entry timing still needs confirmation.",
+        "why": pending_why,
     }
-
 
 
 def _build_breakout_hold_context(
@@ -4321,6 +4977,7 @@ def _build_breakout_hold_context(
         "reason": reason,
     }
 
+
 def _build_trigger_state(
     option_type: str,
     market_context: Dict[str, Any],
@@ -4328,7 +4985,12 @@ def _build_trigger_state(
     structure_context: Dict[str, Any],
     chart_check: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    continuation_context = structure_context.get("continuation_context") or {}
+    continuation_mode = structure_context.get("setup_type") == "Continuation"
     trigger_style = "close_above_recent_high" if option_type == "C" else "close_below_recent_low"
+    if continuation_mode:
+        trigger_style = "first_close_above_shelf_high" if option_type == "C" else "first_close_below_shelf_low"
+
     market_open = bool(market_context.get("is_open"))
     fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
     time_gate_reason = str(time_day_gate.get("reason") or "").strip() or "time_day_gate_blocked"
@@ -4370,6 +5032,89 @@ def _build_trigger_state(
             "live_entry_requires_market_open": not market_open,
             "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
             "why": "insufficient_recent_candles",
+        }
+
+    if continuation_mode and continuation_context:
+        trigger_level = _to_float(continuation_context.get("trigger_level"))
+        current_bar_candle = recent[-1] if recent else None
+        completed_candle = recent[-2] if len(recent) >= 2 else None
+        completed_close = _to_float((completed_candle or {}).get("close"))
+        current_side_ok = bool(
+            (option_type == "C" and current_close is not None and (ema50_1h is None or current_close > ema50_1h))
+            or (option_type == "P" and current_close is not None and (ema50_1h is None or current_close < ema50_1h))
+        )
+        completed_side_ok = bool(
+            (option_type == "C" and completed_close is not None and (ema50_1h is None or completed_close > ema50_1h))
+            or (option_type == "P" and completed_close is not None and (ema50_1h is None or completed_close < ema50_1h))
+        )
+
+        if option_type == "C":
+            current_crossed = bool(trigger_level is not None and current_close is not None and current_close > trigger_level)
+            completed_crossed = bool(trigger_level is not None and completed_close is not None and completed_close > trigger_level)
+        else:
+            current_crossed = bool(trigger_level is not None and current_close is not None and current_close < trigger_level)
+            completed_crossed = bool(trigger_level is not None and completed_close is not None and completed_close < trigger_level)
+
+        structure_ok = bool(
+            structure_context.get("allowed_setup") is True
+            and structure_context.get("wall_pass") is True
+            and structure_context.get("room_hard_fail") is not True
+            and structure_context.get("extension_blocks_now") is not True
+            and structure_context.get("chop_risk") is False
+            and structure_context.get("noisy_chop_explicit") is not True
+            and continuation_context.get("shelf_proven") is True
+            and continuation_context.get("exact_reason") != "late"
+        )
+
+        completed_candle_structural_trigger_present = bool(
+            structure_ok
+            and completed_crossed
+            and completed_side_ok
+            and continuation_context.get("inside_tradeable_window") is True
+        )
+        current_bar_structural_trigger_present = False
+        structural_trigger_present = bool(completed_candle_structural_trigger_present)
+        live_trigger_present = bool(structural_trigger_present and market_open and fresh_entry_allowed)
+
+        if continuation_context.get("exact_reason") == "late":
+            why = "too_late_from_hold"
+        elif continuation_context.get("shelf_proven") is not True:
+            why = "too_early_hold_not_proven"
+        elif completed_candle_structural_trigger_present and market_open and fresh_entry_allowed:
+            why = "completed_candle_trigger_approved"
+        elif completed_candle_structural_trigger_present and not market_open:
+            why = "completed_candle_trigger_market_closed"
+        elif completed_candle_structural_trigger_present and not fresh_entry_allowed:
+            why = time_gate_reason
+        elif current_crossed and current_side_ok and not completed_crossed:
+            why = "waiting_for_completed_shelf_break_close"
+        elif continuation_context.get("breakout_completed") is not True:
+            why = "no_valid_continuation_trigger"
+        elif not structure_ok:
+            why = "structure_not_ready"
+        else:
+            why = "no_valid_continuation_trigger"
+
+        return {
+            "ok": True,
+            "trigger_present": live_trigger_present,
+            "structural_trigger_present": structural_trigger_present,
+            "current_bar_trigger_present": False,
+            "completed_candle_trigger_present": bool(completed_candle_structural_trigger_present and market_open and fresh_entry_allowed),
+            "trigger_style": trigger_style,
+            "trigger_level": _round_or_none(trigger_level, 4),
+            "current_close": _round_or_none(current_close, 4),
+            "price_vs_ema50_1h": price_side,
+            "structure_ready": structure_ok,
+            "live_entry_requires_market_open": not market_open,
+            "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
+            "breakout_hold_current_confirmed": continuation_context.get("shelf_proven"),
+            "breakout_hold_completed_confirmed": continuation_context.get("shelf_proven"),
+            "breakout_hold_reference_current": continuation_context.get("trigger_level"),
+            "breakout_hold_reference_completed": continuation_context.get("trigger_level"),
+            "continuation_exact_reason": continuation_context.get("exact_reason"),
+            "continuation_status_message": continuation_context.get("status_message"),
+            "why": why,
         }
 
     prior = recent[:-1] if len(recent) >= 2 else recent
@@ -4538,6 +5283,7 @@ def _build_targets_block(primary_candidate: Optional[Dict[str, Any]]) -> Dict[st
 
 
 
+
 def _build_checklist_block(
     request: OnDemandRequest,
     market_context: Dict[str, Any],
@@ -4551,14 +5297,28 @@ def _build_checklist_block(
 ) -> Dict[str, Any]:
     ema_value = chart_check.get("ema50_1h") if chart_check else None
     price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
+    continuation_context = structure_context.get("continuation_context") or {}
+    continuation_mode = structure_context.get("setup_type") == "Continuation"
+    continuation_late = bool(continuation_context.get("exact_reason") == "late")
+
+    clear_trigger_yes = bool(trigger_state.get("trigger_present") is True)
+    early_enough_yes = bool(structure_context.get("extension_blocks_now") is not True and structure_context.get("ath_open_air_blocks_now") is not True)
+
+    if continuation_mode:
+        clear_trigger_yes = bool(trigger_state.get("trigger_present") is True)
+        early_enough_yes = bool(
+            structure_context.get("extension_blocks_now") is not True
+            and structure_context.get("ath_open_air_blocks_now") is not True
+            and not continuation_late
+        )
 
     items = [
         {"item": "allowed_setup_type", "yes": _is_allowed_setup_type_name(structure_context.get("setup_type"))},
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is True)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False and structure_context.get("noisy_chop_explicit") is not True)},
         {"item": "clear_room", "yes": bool(structure_context.get("room_hard_fail") is not True and structure_context.get("room_pass") is not False and structure_context.get("ath_open_air_blocks_now") is not True)},
-        {"item": "early_enough", "yes": bool(structure_context.get("extension_blocks_now") is not True and structure_context.get("ath_open_air_blocks_now") is not True)},
-        {"item": "clear_trigger", "yes": bool(trigger_state.get("trigger_present") is True)},
+        {"item": "early_enough", "yes": early_enough_yes},
+        {"item": "clear_trigger", "yes": clear_trigger_yes},
         {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
         {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
         {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
@@ -4581,6 +5341,23 @@ def _build_checklist_block(
     ]
     priority_rank = {name: idx for idx, name in enumerate(priority_order)}
     decision_blockers_priority = sorted(failed_items, key=lambda item: (priority_rank.get(item, 999), item))
+
+    continuation_blocker_override = None
+    continuation_blocker_overrides: List[str] = []
+    continuation_override_allowed = bool(
+        continuation_mode
+        and not any(item in failed_items for item in {"allowed_setup_type", "twentyfour_hour_supportive", "one_hour_clean_around_ema", "clear_room"})
+    )
+    if continuation_override_allowed:
+        if continuation_context.get("exact_reason") == "late":
+            continuation_blocker_override = continuation_context.get("main_blocker") or "move_too_extended"
+        elif continuation_context.get("exact_reason") == "early":
+            continuation_blocker_override = continuation_context.get("main_blocker") or "no_valid_trigger"
+        if continuation_blocker_override:
+            continuation_blocker_overrides = [continuation_blocker_override] + [
+                item for item in decision_blockers_priority if item != continuation_blocker_override
+            ]
+            decision_blockers_priority = continuation_blocker_overrides
 
     global_gate_failures: List[str] = []
     wall_thesis_fit_status = (wall_thesis_fit_context or {}).get("wall_thesis_fit_status")
@@ -4615,7 +5392,10 @@ def _build_checklist_block(
         "live_entry_now_available": live_entry_now_available,
         "market_open": market_context.get("is_open"),
         "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "continuation_blocker_override": continuation_blocker_override,
+        "continuation_blocker_overrides": continuation_blocker_overrides,
     }
+
 
 
 def _failed_reason_messages(
@@ -4628,6 +5408,7 @@ def _failed_reason_messages(
     wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     reasons: List[str] = []
+    continuation_context = structure_context.get("continuation_context") or {}
 
     mapping = {
         "allowed_setup_type": "setup type is not allowed",
@@ -4641,13 +5422,18 @@ def _failed_reason_messages(
         "fits_risk": "risk does not fit the SAFE-FAST budget",
         "open_trade_already": "an open trade already exists",
         "wall_thesis_fit": (wall_thesis_fit_context or {}).get("why_wall_thesis_fit_passes_or_fails") or "Wall thesis and strike placement do not match.",
+        "no_proven_hold": "no proven hold",
+        "no_valid_trigger": "no valid trigger",
+        "move_too_extended": "move too extended",
     }
 
-    for item in checklist.get("failed_items", []):
+    for item in checklist.get("decision_blockers_priority", checklist.get("failed_items", [])):
         msg = mapping.get(item)
         if msg:
             reasons.append(msg)
 
+    if structure_context.get("setup_type") == "Continuation" and continuation_context.get("status_message"):
+        reasons.insert(0, continuation_context.get("status_message"))
     if structure_context.get("extension_state") == "extended":
         reasons.append("move is extended versus the 1H 50 EMA")
     if liquidity_context.get("liquidity_pass") is False and liquidity_context.get("why"):
@@ -4913,6 +5699,7 @@ def _normalize_trade_day_action(
     return "stand down"
 
 
+
 def _derive_trade_day_acceptability_condition(
     user_facing: Dict[str, Any],
     trigger_state: Dict[str, Any],
@@ -4930,6 +5717,15 @@ def _derive_trade_day_acceptability_condition(
             return f"Next regular session opens and price still confirms through {trigger_level_text}."
         return "Next regular session opens and the live trigger is still valid."
 
+    if trigger_reason in {"too_early_hold_not_proven"}:
+        return "Let the hold/base prove itself with at least 2 completed 1H candles near the highs."
+    if trigger_reason in {"no_valid_continuation_trigger", "waiting_for_completed_shelf_break_close"}:
+        if trigger_level_text:
+            return f"Get the first completed 1H close through the shelf break at {trigger_level_text} while price stays in range."
+        return "Get the first completed 1H shelf break while price stays in range."
+    if trigger_reason in {"too_late_from_hold"}:
+        return "Wait for a new shelf to form before looking for another continuation entry."
+
     if trigger_reason in {"waiting_for_completed_breakout_close", "close_trigger_not_hit"} and trigger_level_text:
         return f"Get a valid 1H close through the trigger at {trigger_level_text}."
 
@@ -4940,8 +5736,6 @@ def _derive_trade_day_acceptability_condition(
         return "Hold correctly on the next 1H bar after the breakout candle."
 
     return "Get a live SAFE-FAST trigger with structure still clean."
-
-
 
 
 def _strip_after_hours_prefix(reason: Any) -> str:
@@ -4965,6 +5759,9 @@ def _humanize_blocker_key(blocker: Any) -> str:
         "failed_breakout_hold": "a confirmed breakout hold",
         "next_bar_hold_failed": "a confirmed breakout hold",
         "ath_open_air": "rebuilt 1H structure near all-time highs",
+        "no_proven_hold": "a proven hold",
+        "no_valid_trigger": "the first clean break",
+        "move_too_extended": "move too extended from the hold",
     }
     return mapping.get(key, key.replace("_", " "))
 
@@ -4982,6 +5779,9 @@ def _humanize_next_step(blocker: Any) -> str:
         "failed_breakout_hold": "Rebuild the breakout hold.",
         "next_bar_hold_failed": "Rebuild the breakout hold.",
         "ath_open_air": "Rebuild 1H structure near the highs.",
+        "no_proven_hold": "Let the hold/base prove itself.",
+        "no_valid_trigger": "Wait for the first completed break from the hold.",
+        "move_too_extended": "Wait for a new hold to form before looking for another continuation entry.",
     }
     if key in mapping:
         return mapping[key]
@@ -5008,6 +5808,9 @@ def _humanize_surface_text(value: Any) -> Optional[str]:
         "failed_breakout_hold": "a confirmed breakout hold",
         "next_bar_hold_failed": "a confirmed breakout hold",
         "ath_open_air": "rebuilt 1H structure near all-time highs",
+        "no_proven_hold": "a proven hold",
+        "no_valid_trigger": "the first clean break",
+        "move_too_extended": "move too extended from the hold",
     }
 
     for raw_key, human_text in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
@@ -5028,6 +5831,10 @@ def _humanize_trigger_reason_key(value: Any) -> Optional[str]:
         "market_closed": "market closed",
         "not_present": "not present",
         "not_applicable": "not applicable",
+        "too_early_hold_not_proven": "too early - hold not proven",
+        "no_valid_continuation_trigger": "no valid continuation trigger",
+        "waiting_for_completed_shelf_break_close": "waiting for completed shelf break close",
+        "too_late_from_hold": "too late from the hold",
     }
     return mapping.get(text, text.replace("_", " "))
 
@@ -5048,6 +5855,9 @@ def _humanize_state_reason_key(value: Any) -> Optional[str]:
         "failed_breakout_hold",
         "next_bar_hold_failed",
         "ath_open_air",
+        "no_proven_hold",
+        "no_valid_trigger",
+        "move_too_extended",
     }
     if text in blocker_keys:
         return _humanize_blocker_key(text)
@@ -5929,14 +6739,18 @@ def _build_approval_requirements_context_block(
         "macro_event_clear",
     ]
     next_flip_needed = None
-    for gate_name in actionable_blocker_order:
-        if gate_name in missing_gates:
-            next_flip_needed = gate_name
-            break
-    if next_flip_needed is None:
-        next_flip_needed = blockers[0] if blockers else None
-    if next_flip_needed is None and trigger_state.get("live_entry_requires_market_open"):
-        next_flip_needed = "market_open"
+    continuation_override = checklist_block.get("continuation_blocker_override")
+    if continuation_override:
+        next_flip_needed = continuation_override
+    else:
+        for gate_name in actionable_blocker_order:
+            if gate_name in missing_gates:
+                next_flip_needed = gate_name
+                break
+        if next_flip_needed is None:
+            next_flip_needed = blockers[0] if blockers else None
+        if next_flip_needed is None and trigger_state.get("live_entry_requires_market_open"):
+            next_flip_needed = "market_open"
 
     if approval_context.get("approval_ready_now") is True:
         approval_path_status = "APPROVED_NOW"
@@ -6089,6 +6903,7 @@ async def _screen_ticker_candidate(
 
     reason = summary.get("reason", "No summary available.")
     failed_items = checklist.get("failed_items", [])
+    continuation_context = structure_context.get("continuation_context") or {}
     if "liquidity_ok" in failed_items:
         reason = liquidity_context.get("why") or "Options liquidity is too wide for a clean debit spread entry."
     elif structure_context.get("ok"):
@@ -6104,10 +6919,14 @@ async def _screen_ticker_candidate(
             reason = wall_thesis_fit.get("why_wall_thesis_fit_passes_or_fails") or "Wall thesis and strike placement do not match."
         elif structure_context.get("ath_open_air_blocks_now") is True:
             reason = "Open-air price discovery near highs still lacks rebuilt 1H structure."
+        elif structure_context.get("continuation_window_late") is True and continuation_context.get("status_message"):
+            reason = continuation_context.get("status_message")
         elif structure_context.get("extension_state") == "extended":
             reason = "Move is too extended from the 1H 50 EMA."
         elif chart_alignment is False:
             reason = "Price is on the wrong side of the 1H 50 EMA."
+        elif structure_context.get("setup_type") == "Continuation" and continuation_context.get("status_message"):
+            reason = continuation_context.get("status_message")
         elif "clear_trigger" in failed_items:
             trigger_reason = str(trigger_state.get("why") or "").strip().lower()
             if trigger_reason == "market_closed":
@@ -6193,6 +7012,7 @@ def _build_candidate_context(
             option_type=option_type,
             chart_check=chart_check,
             trigger_state=trigger_state,
+            structure_context=structure_context,
         )
         setup_route = _build_setup_route_context(
             option_type=option_type,
@@ -6259,6 +7079,9 @@ def _build_candidate_context(
             "room_ratio": structure_context.get("room_ratio"),
             "wall_thesis": structure_context.get("wall_thesis"),
             "invalidation_1h_ema50": invalidation_level_1h_ema50,
+            "shelf_low": structure_context.get("continuation_context", {}).get("shelf_low"),
+            "shelf_high": structure_context.get("continuation_context", {}).get("shelf_high"),
+            "break_line": structure_context.get("continuation_context", {}).get("break_line"),
         }
         targets_block = {
             "target_40_pct_value": targets.get("target_40_pct_value"),
@@ -6312,6 +7135,7 @@ def _build_candidate_context(
         "adx_filter": adx_filter if active else None,
         "trap_check_context": trap_check_context if active else None,
         "trigger_scan": trigger_scan if active else None,
+        "continuation": structure_context.get("continuation_context") if active and structure_context.get("setup_type") == "Continuation" else None,
         "primary_entry_zone": primary_entry_zone if active else None,
         "backup_entry_zone": backup_entry_zone if active else None,
         "options": options_block,
