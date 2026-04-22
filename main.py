@@ -1,3 +1,10308 @@
+from __future__ import annotations
+
+# fresh full main.py build with entry_context bridge 2026-04-09T16:05:00Z
+
+import asyncio
+
+import copy
+import hashlib
+import json
+import math
+
+import os
+import re
+from datetime import datetime, time, timedelta
+from html import unescape
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+import httpx
+from fastapi import Body, FastAPI, HTTPException, Query
+from pydantic import BaseModel
+
+from dxlink_candles import get_1h_ema50_snapshot
+
+
+BUILD_TAG = "macro_surface_v26_2026_04_21_pending_next_session_patch1"
+
+app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
+
+API_BASE = "https://api.tastyworks.com"
+USER_AGENT = "safe-fast-backend/1.8.6"
+
+TT_CLIENT_ID = os.getenv("TT_CLIENT_ID", "")
+TT_CLIENT_SECRET = os.getenv("TT_CLIENT_SECRET", "")
+TT_REDIRECT_URI = os.getenv("TT_REDIRECT_URI", "")
+TT_REFRESH_TOKEN = os.getenv("TT_REFRESH_TOKEN", "")
+
+ALLOWED_SYMBOLS = {"SPY", "QQQ", "IWM", "GLD"}
+SYMBOL_ORDER = ["SPY", "QQQ", "IWM", "GLD"]
+
+NY_TZ = ZoneInfo("America/New_York")
+ALLOWED_SETUP_TYPES = {"Ideal", "Clean Fast Break", "Continuation"}
+
+
+def _build_session_basis_context() -> Dict[str, Any]:
+    response_payload = {
+        "ok": True,
+        "chart_provider": "dxfeed_via_dxlink",
+        "structure_basis": "RTH_ONLY",
+        "bar_anchor": "SESSION_ANCHORED_09_30_ET",
+        "operative_timeframes": ["24H_CONTEXT", "RTH_1H_EXECUTION"],
+        "ema_basis": "RTH_1H_50_EMA",
+        "extended_hours_role": "context_only",
+        "fast_entry_policy": "advisory_execution_microscope_only_not_hardwired_here",
+        "time_of_day_policy": "ADVISORY_ONLY_NO_HARD_CUTOFF",
+        "note": "SAFE-FAST structure uses RTH session-anchored 1H candles. Time of day is context only; no hard late-entry cutoff is enforced in code.",
+    }
+
+    return response_payload
+
+
+def _is_allowed_setup_type_name(setup_type: Optional[str]) -> bool:
+    return isinstance(setup_type, str) and setup_type in ALLOWED_SETUP_TYPES
+
+
+class OnDemandRequest(BaseModel):
+    option_type: str = "C"
+    min_dte: int = 14
+    max_dte: int = 30
+    near_limit: int = 16
+    width_min: float = 5.0
+    width_max: float = 10.0
+    risk_min_dollars: float = 250.0
+    risk_max_dollars: float = 300.0
+    hard_max_dollars: float = 400.0
+    allow_fallback: bool = True
+    include_chart_checks: bool = True
+    open_positions: int = 0
+    weekly_trade_count: int = 0
+    macro_context_requested: bool = True
+
+
+def _headers(access_token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    }
+
+
+def _clean_symbol(symbol: str) -> str:
+    value = symbol.strip().upper()
+    if value not in ALLOWED_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Only SAFE-FAST symbols are allowed",
+                "allowed": sorted(ALLOWED_SYMBOLS),
+                "bad_symbol": value,
+            },
+        )
+    return value
+
+
+def _clean_option_type(option_type: str) -> str:
+    value = option_type.strip().upper()
+    if value not in {"C", "P"}:
+        raise HTTPException(status_code=400, detail="option_type must be C or P")
+    return value
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _best_price(contract: Dict[str, Any]) -> Optional[float]:
+    for field in ("mid", "mark", "last", "bid", "ask"):
+        value = _to_float(contract.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def _round_or_none(value: Optional[float], places: int = 4) -> Optional[float]:
+    if value is None:
+        return None
+    return round(value, places)
+
+
+def _decorate_why(why_text: Optional[str], market_closed_context: bool = False) -> str:
+    text_value = str(why_text or "unconfirmed").strip()
+    if market_closed_context:
+        if text_value == "market_closed":
+            return "Market is closed right now, so no live entry can be taken."
+        closed_suffix = "Market is closed right now, so no live entry can be taken."
+        if text_value.endswith(closed_suffix):
+            return text_value
+        return f"{text_value} {closed_suffix}"
+    return text_value
+
+
+def _build_macro_brief(macro_context: Dict[str, Any]) -> str:
+    if not isinstance(macro_context, dict):
+        return "unconfirmed"
+    if macro_context.get("ok") is not True:
+        requested = macro_context.get("requested")
+        if requested is False:
+            return "skipped"
+        return "unconfirmed"
+    if macro_context.get("has_major_event_today"):
+        return "major event today"
+    if macro_context.get("has_major_event_tomorrow"):
+        return "major event tomorrow"
+    risk_level = str(macro_context.get("risk_level") or "").strip().lower()
+    if risk_level == "normal":
+        return "clear today"
+    if risk_level == "high":
+        return "event risk high"
+    if risk_level:
+        return risk_level
+    return "unconfirmed"
+
+
+def _build_price_zone(
+    low: Optional[float],
+    high: Optional[float],
+    label: str,
+    source: str,
+) -> Optional[Dict[str, Any]]:
+    if low is None or high is None:
+        return None
+    zone_low = min(low, high)
+    zone_high = max(low, high)
+    return {
+        "label": label,
+        "low": round(zone_low, 4),
+        "high": round(zone_high, 4),
+        "source": source,
+    }
+
+
+
+def _derive_entry_zones(
+    option_type: str,
+    chart_check: Optional[Dict[str, Any]],
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "primary_entry_zone": None,
+            "backup_entry_zone": None,
+        }
+
+    ema50_1h = _to_float(chart_check.get("ema50_1h"))
+    latest_close = _to_float(chart_check.get("latest_close"))
+    first_wall = _to_float(structure_context.get("first_wall"))
+    room_to_first_wall = _to_float(structure_context.get("room_to_first_wall"))
+    atr_14_1h = _to_float(structure_context.get("atr_14_1h"))
+    trigger_level = _to_float(trigger_state.get("trigger_level"))
+    continuation_context = structure_context.get("continuation_context") or {}
+
+    zone_half_width = None
+    if atr_14_1h is not None and atr_14_1h > 0:
+        zone_half_width = max(atr_14_1h * 0.15, 0.10)
+    elif latest_close is not None and latest_close > 0:
+        zone_half_width = max(latest_close * 0.0015, 0.10)
+    else:
+        zone_half_width = 0.10
+
+    if (
+        _continuation_family_detected(structure_context.get("continuation_context"))
+        and continuation_context.get("shelf_low") is not None
+        and continuation_context.get("shelf_high") is not None
+    ):
+        primary_entry_zone = _build_price_zone(
+            continuation_context.get("shelf_low"),
+            continuation_context.get("shelf_high"),
+            "continuation_hold_zone",
+            "continuation_shelf",
+        )
+        backup_entry_zone = None
+        if continuation_context.get("trigger_level") is not None:
+            backup_entry_zone = _build_price_zone(
+                continuation_context.get("trigger_level") - zone_half_width,
+                continuation_context.get("trigger_level") + zone_half_width,
+                "continuation_break_zone",
+                "continuation_break_line",
+            )
+        return {
+            "primary_entry_zone": primary_entry_zone,
+            "backup_entry_zone": backup_entry_zone,
+        }
+
+    primary_entry_zone = None
+    if ema50_1h is not None:
+        primary_entry_zone = _build_price_zone(
+            ema50_1h - zone_half_width,
+            ema50_1h + zone_half_width,
+            "ema_retest_zone",
+            "ema50_1h_anchor",
+        )
+
+    backup_entry_zone = None
+    if trigger_level is not None:
+        backup_entry_zone = _build_price_zone(
+            trigger_level - zone_half_width,
+            trigger_level + zone_half_width,
+            "trigger_retest_zone",
+            "trigger_level_anchor",
+        )
+    elif first_wall is not None:
+        wall_buffer = max(zone_half_width, (room_to_first_wall or 0.0) * 0.5)
+        if option_type == "C":
+            backup_entry_zone = _build_price_zone(
+                first_wall - wall_buffer,
+                first_wall,
+                "first_wall_retest_zone",
+                "first_wall_anchor",
+            )
+        else:
+            backup_entry_zone = _build_price_zone(
+                first_wall,
+                first_wall + wall_buffer,
+                "first_wall_retest_zone",
+                "first_wall_anchor",
+            )
+
+    return {
+        "primary_entry_zone": primary_entry_zone,
+        "backup_entry_zone": backup_entry_zone,
+    }
+
+
+def _relation_to_ema(candle: Optional[Dict[str, Any]], ema50_1h: Optional[float]) -> Optional[str]:
+    if not candle or ema50_1h is None:
+        return None
+
+    close_value = _to_float(candle.get("close"))
+    high_value = _to_float(candle.get("high"))
+    low_value = _to_float(candle.get("low"))
+
+    if close_value is None:
+        return None
+    if close_value > ema50_1h:
+        return "above"
+    if close_value < ema50_1h:
+        return "below"
+    if high_value is not None and low_value is not None and low_value <= ema50_1h <= high_value:
+        return "inside"
+    return "at"
+
+
+def _build_trigger_detail_context(
+    option_type: str,
+    chart_check: Optional[Dict[str, Any]],
+    trigger_state: Dict[str, Any],
+    structure_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "trigger_candle": None,
+            "current_bar_behavior": {
+                "status": "unconfirmed",
+                "why": "chart_unavailable",
+            },
+        }
+
+    recent = chart_check.get("recent_candles") or []
+    if not recent:
+        return {
+            "trigger_candle": None,
+            "current_bar_behavior": {
+                "status": "unconfirmed",
+                "why": "no_recent_candles",
+            },
+        }
+
+    current_candle = recent[-1]
+    prior_candle = recent[-2] if len(recent) >= 2 else None
+    ema50_1h = _to_float(chart_check.get("ema50_1h"))
+    trigger_level = _to_float(trigger_state.get("trigger_level"))
+    trigger_present = bool(trigger_state.get("trigger_present"))
+    structure_ready = trigger_state.get("structure_ready")
+    price_side = chart_check.get("price_vs_ema50_1h")
+    current_close = _to_float(current_candle.get("close"))
+    current_high = _to_float(current_candle.get("high"))
+    current_low = _to_float(current_candle.get("low"))
+    continuation_context = (structure_context or {}).get("continuation_context") or {}
+
+    if _continuation_family_detected((structure_context or {}).get("continuation_context")) and continuation_context:
+        continuation_reason = continuation_context.get("exact_reason")
+        shelf_high = continuation_context.get("shelf_high")
+        shelf_low = continuation_context.get("shelf_low")
+        if continuation_reason == "tradeable":
+            behavior_label = "first_shelf_break_completed_in_range"
+        elif continuation_reason == "late":
+            behavior_label = "beyond_shelf_break_too_extended"
+        elif continuation_context.get("shelf_proven"):
+            behavior_label = "shelf_proven_waiting_first_break"
+        else:
+            behavior_label = "hold_not_proven_yet"
+
+        trigger_candle_source = "most_recent_completed_candle"
+        trigger_candle_ref = prior_candle
+        trigger_candle_close = _to_float(trigger_candle_ref.get("close")) if trigger_candle_ref else None
+        qualifies_as_trigger_candle = bool(continuation_context.get("breakout_completed") is True)
+
+        trigger_candle = None
+        if trigger_candle_ref:
+            trigger_candle = {
+                "source": trigger_candle_source,
+                "time_iso": trigger_candle_ref.get("time_iso"),
+                "open": _round_or_none(_to_float(trigger_candle_ref.get("open")), 4),
+                "high": _round_or_none(_to_float(trigger_candle_ref.get("high")), 4),
+                "low": _round_or_none(_to_float(trigger_candle_ref.get("low")), 4),
+                "close": _round_or_none(_to_float(trigger_candle_ref.get("close")), 4),
+                "relation_to_trigger_level": (
+                    "above" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close > trigger_level
+                    else "below" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close < trigger_level
+                    else "at" if trigger_level is not None and trigger_candle_close is not None
+                    else None
+                ),
+                "relation_to_ema50_1h": _relation_to_ema(trigger_candle_ref, ema50_1h),
+                "qualifies_as_trigger_candle": qualifies_as_trigger_candle,
+            }
+
+        current_bar_behavior = {
+            "status": "confirmed",
+            "label": behavior_label,
+            "time_iso": current_candle.get("time_iso"),
+            "open": _round_or_none(_to_float(current_candle.get("open")), 4),
+            "high": _round_or_none(current_high, 4),
+            "low": _round_or_none(current_low, 4),
+            "close": _round_or_none(current_close, 4),
+            "price_vs_ema50_1h": price_side,
+            "trigger_level": _round_or_none(trigger_level, 4),
+            "trigger_present": trigger_present,
+            "structure_ready": structure_ready,
+            "why": trigger_state.get("why"),
+            "shelf_low": shelf_low,
+            "shelf_high": shelf_high,
+            "continuation_exact_reason": continuation_reason,
+        }
+
+        return {
+            "trigger_candle": trigger_candle,
+            "current_bar_behavior": current_bar_behavior,
+        }
+
+    if option_type == "C":
+        if trigger_level is not None and current_close is not None and current_close > trigger_level and structure_ready:
+            behavior_label = "breaking_above_trigger"
+        elif trigger_level is not None and current_high is not None and current_high >= trigger_level:
+            behavior_label = "testing_trigger_but_not_confirmed"
+        elif price_side == "above" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
+            behavior_label = "ema_retest_holding_above"
+        elif price_side == "above":
+            behavior_label = "above_ema_but_below_trigger"
+        else:
+            behavior_label = "below_ema_or_not_ready"
+    else:
+        if trigger_level is not None and current_close is not None and current_close < trigger_level and structure_ready:
+            behavior_label = "breaking_below_trigger"
+        elif trigger_level is not None and current_low is not None and current_low <= trigger_level:
+            behavior_label = "testing_trigger_but_not_confirmed"
+        elif price_side == "below" and ema50_1h is not None and current_low is not None and current_high is not None and current_low <= ema50_1h <= current_high:
+            behavior_label = "ema_retest_holding_below"
+        elif price_side == "below":
+            behavior_label = "below_ema_but_above_trigger"
+        else:
+            behavior_label = "above_ema_or_not_ready"
+
+    trigger_candle_source = "current_bar" if trigger_present else "most_recent_completed_candle"
+    trigger_candle_ref = current_candle if trigger_present or prior_candle is None else prior_candle
+    trigger_candle_close = _to_float(trigger_candle_ref.get("close")) if trigger_candle_ref else None
+
+    qualifies_as_trigger_candle = False
+    if trigger_candle_ref and trigger_level is not None and trigger_candle_close is not None:
+        if option_type == "C":
+            qualifies_as_trigger_candle = trigger_candle_close > trigger_level
+        else:
+            qualifies_as_trigger_candle = trigger_candle_close < trigger_level
+
+    trigger_candle = None
+    if trigger_candle_ref:
+        trigger_candle = {
+            "source": trigger_candle_source,
+            "time_iso": trigger_candle_ref.get("time_iso"),
+            "open": _round_or_none(_to_float(trigger_candle_ref.get("open")), 4),
+            "high": _round_or_none(_to_float(trigger_candle_ref.get("high")), 4),
+            "low": _round_or_none(_to_float(trigger_candle_ref.get("low")), 4),
+            "close": _round_or_none(_to_float(trigger_candle_ref.get("close")), 4),
+            "relation_to_trigger_level": (
+                "above" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close > trigger_level
+                else "below" if trigger_level is not None and trigger_candle_close is not None and trigger_candle_close < trigger_level
+                else "at" if trigger_level is not None and trigger_candle_close is not None
+                else None
+            ),
+            "relation_to_ema50_1h": _relation_to_ema(trigger_candle_ref, ema50_1h),
+            "qualifies_as_trigger_candle": qualifies_as_trigger_candle,
+        }
+
+    current_bar_behavior = {
+        "status": "confirmed",
+        "label": behavior_label,
+        "time_iso": current_candle.get("time_iso"),
+        "open": _round_or_none(_to_float(current_candle.get("open")), 4),
+        "high": _round_or_none(current_high, 4),
+        "low": _round_or_none(current_low, 4),
+        "close": _round_or_none(current_close, 4),
+        "price_vs_ema50_1h": price_side,
+        "trigger_level": _round_or_none(trigger_level, 4),
+        "trigger_present": trigger_present,
+        "structure_ready": structure_ready,
+        "why": trigger_state.get("why"),
+    }
+
+    return {
+        "trigger_candle": trigger_candle,
+        "current_bar_behavior": current_bar_behavior,
+    }
+
+
+def _summarize_trigger_scan_candle(
+    candle: Optional[Dict[str, Any]],
+    ema50_1h: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    if not candle:
+        return None
+    return {
+        "time_iso": candle.get("time_iso"),
+        "open": _round_or_none(_to_float(candle.get("open")), 4),
+        "high": _round_or_none(_to_float(candle.get("high")), 4),
+        "low": _round_or_none(_to_float(candle.get("low")), 4),
+        "close": _round_or_none(_to_float(candle.get("close")), 4),
+        "relation_to_ema50_1h": _relation_to_ema(candle, ema50_1h),
+    }
+
+
+def _evaluate_trigger_scan_candle(
+    option_type: str,
+    candle: Optional[Dict[str, Any]],
+    reference_candles: List[Dict[str, Any]],
+    ema50_1h: Optional[float],
+    structure_ready: Optional[bool],
+    market_open: bool,
+    fresh_entry_allowed: bool,
+    gate_reason: Optional[str],
+) -> Dict[str, Any]:
+    if not candle:
+        return {
+            "status": "unconfirmed",
+            "why": "candle_unavailable",
+        }
+
+    if len(reference_candles) < 3:
+        return {
+            "time_iso": candle.get("time_iso"),
+            "open": _round_or_none(_to_float(candle.get("open")), 4),
+            "high": _round_or_none(_to_float(candle.get("high")), 4),
+            "low": _round_or_none(_to_float(candle.get("low")), 4),
+            "close": _round_or_none(_to_float(candle.get("close")), 4),
+            "reference_window_size": len(reference_candles),
+            "reference_trigger_level": None,
+            "relation_to_trigger_level": None,
+            "relation_to_ema50_1h": _relation_to_ema(candle, ema50_1h),
+            "raw_cross_pass": False,
+            "ema_side_pass": False,
+            "raw_chart_trigger_pass": False,
+            "structure_ready": structure_ready,
+            "gated_trigger_pass": False,
+            "status": "unconfirmed",
+            "why": "insufficient_reference_candles",
+        }
+
+    close_value = _to_float(candle.get("close"))
+    if option_type == "C":
+        trigger_level = max((_to_float(ref.get("high")) for ref in reference_candles if _to_float(ref.get("high")) is not None), default=None)
+        raw_cross_pass = bool(trigger_level is not None and close_value is not None and close_value > trigger_level)
+        relation_to_trigger = (
+            "above" if trigger_level is not None and close_value is not None and close_value > trigger_level
+            else "below" if trigger_level is not None and close_value is not None and close_value < trigger_level
+            else "at" if trigger_level is not None and close_value is not None
+            else None
+        )
+        ema_side_pass = bool(close_value is not None and ema50_1h is not None and close_value > ema50_1h)
+    else:
+        trigger_level = min((_to_float(ref.get("low")) for ref in reference_candles if _to_float(ref.get("low")) is not None), default=None)
+        raw_cross_pass = bool(trigger_level is not None and close_value is not None and close_value < trigger_level)
+        relation_to_trigger = (
+            "below" if trigger_level is not None and close_value is not None and close_value < trigger_level
+            else "above" if trigger_level is not None and close_value is not None and close_value > trigger_level
+            else "at" if trigger_level is not None and close_value is not None
+            else None
+        )
+        ema_side_pass = bool(close_value is not None and ema50_1h is not None and close_value < ema50_1h)
+
+    raw_chart_trigger_pass = bool(raw_cross_pass and ema_side_pass)
+    gated_trigger_pass = bool(
+        raw_chart_trigger_pass
+        and structure_ready is True
+        and market_open
+        and fresh_entry_allowed
+    )
+
+    if gated_trigger_pass:
+        status = "pass"
+        why = "Trigger conditions pass on this candle."
+    elif not market_open:
+        status = "fail"
+        why = "market_closed"
+    elif not fresh_entry_allowed:
+        status = "fail"
+        why = gate_reason or "time_day_gate_blocked"
+    elif structure_ready is False:
+        status = "fail"
+        why = "structure_not_ready"
+    elif not ema_side_pass:
+        status = "fail"
+        why = "wrong_side_of_ema"
+    elif not raw_cross_pass:
+        status = "fail"
+        why = "close_trigger_not_hit"
+    else:
+        status = "unconfirmed"
+        why = "trigger_unconfirmed"
+
+    return {
+        "time_iso": candle.get("time_iso"),
+        "open": _round_or_none(_to_float(candle.get("open")), 4),
+        "high": _round_or_none(_to_float(candle.get("high")), 4),
+        "low": _round_or_none(_to_float(candle.get("low")), 4),
+        "close": _round_or_none(close_value, 4),
+        "reference_window_size": len(reference_candles),
+        "reference_trigger_level": _round_or_none(trigger_level, 4),
+        "relation_to_trigger_level": relation_to_trigger,
+        "relation_to_ema50_1h": _relation_to_ema(candle, ema50_1h),
+        "raw_cross_pass": raw_cross_pass,
+        "ema_side_pass": ema_side_pass,
+        "raw_chart_trigger_pass": raw_chart_trigger_pass,
+        "structure_ready": structure_ready,
+        "gated_trigger_pass": gated_trigger_pass,
+        "status": status,
+        "why": why,
+    }
+
+
+
+def _build_trigger_scan_context(
+    option_type: str,
+    chart_check: Optional[Dict[str, Any]],
+    trigger_state: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    structure_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    continuation_context = (structure_context or {}).get("continuation_context") or {}
+
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "scan_basis": "current_bar_plus_last_3_completed_1h_candles",
+            "required_completed_candle_count": 3,
+            "trigger_style": trigger_state.get("trigger_style"),
+            "market_open": market_context.get("is_open"),
+            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+            "current_bar": {
+                "status": "unconfirmed",
+                "why": "chart_unavailable",
+            },
+            "most_recent_completed_candle": {
+                "status": "unconfirmed",
+                "why": "chart_unavailable",
+            },
+            "current_bar_reference_candles": [],
+            "completed_candle_reference_candles": [],
+            "trigger_scan_status": "unconfirmed",
+            "why_trigger_scan_passes_or_fails": "Trigger scan is unconfirmed because chart data is unavailable.",
+        }
+
+    recent = chart_check.get("recent_candles") or []
+    ema50_1h = _to_float(chart_check.get("ema50_1h"))
+    market_open = bool(market_context.get("is_open"))
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
+    gate_reason = trigger_state.get("why")
+    structure_ready = trigger_state.get("structure_ready")
+
+    current_bar = recent[-1] if recent else None
+    most_recent_completed = recent[-2] if len(recent) >= 2 else None
+
+    if _continuation_family_detected((structure_context or {}).get("continuation_context")) and continuation_context:
+        trigger_level = _to_float(continuation_context.get("trigger_level"))
+        current_close = _to_float((current_bar or {}).get("close"))
+        completed_close = _to_float((most_recent_completed or {}).get("close"))
+
+        if option_type == "C":
+            current_raw = bool(trigger_level is not None and current_close is not None and current_close > trigger_level)
+            completed_raw = bool(trigger_level is not None and completed_close is not None and completed_close > trigger_level)
+            current_relation = "above" if current_raw else "below" if trigger_level is not None and current_close is not None and current_close < trigger_level else "at" if trigger_level is not None and current_close is not None else None
+            completed_relation = "above" if completed_raw else "below" if trigger_level is not None and completed_close is not None and completed_close < trigger_level else "at" if trigger_level is not None and completed_close is not None else None
+        else:
+            current_raw = bool(trigger_level is not None and current_close is not None and current_close < trigger_level)
+            completed_raw = bool(trigger_level is not None and completed_close is not None and completed_close < trigger_level)
+            current_relation = "below" if current_raw else "above" if trigger_level is not None and current_close is not None and current_close > trigger_level else "at" if trigger_level is not None and current_close is not None else None
+            completed_relation = "below" if completed_raw else "above" if trigger_level is not None and completed_close is not None and completed_close > trigger_level else "at" if trigger_level is not None and completed_close is not None else None
+
+        current_bar_eval = {
+            "time_iso": (current_bar or {}).get("time_iso"),
+            "open": _round_or_none(_to_float((current_bar or {}).get("open")), 4),
+            "high": _round_or_none(_to_float((current_bar or {}).get("high")), 4),
+            "low": _round_or_none(_to_float((current_bar or {}).get("low")), 4),
+            "close": _round_or_none(current_close, 4),
+            "reference_window_size": continuation_context.get("shelf_candle_count"),
+            "reference_trigger_level": continuation_context.get("trigger_level"),
+            "relation_to_trigger_level": current_relation,
+            "relation_to_ema50_1h": _relation_to_ema(current_bar, ema50_1h),
+            "raw_cross_pass": current_raw,
+            "ema_side_pass": bool((option_type == "C" and current_close is not None and (ema50_1h is None or current_close > ema50_1h)) or (option_type == "P" and current_close is not None and (ema50_1h is None or current_close < ema50_1h))),
+            "raw_chart_trigger_pass": current_raw,
+            "structure_ready": structure_ready,
+            "gated_trigger_pass": False,
+            "status": "fail" if current_raw else "unconfirmed",
+            "why": "waiting_for_completed_shelf_break_close" if current_raw else trigger_state.get("why"),
+            "breakout_hold_confirmed": continuation_context.get("shelf_proven"),
+            "breakout_hold_reference_level": continuation_context.get("trigger_level"),
+            "breakout_hold_reclaim_limit_level": continuation_context.get("shelf_low") if option_type == "C" else continuation_context.get("shelf_high"),
+        }
+        completed_eval = {
+            "time_iso": (most_recent_completed or {}).get("time_iso"),
+            "open": _round_or_none(_to_float((most_recent_completed or {}).get("open")), 4),
+            "high": _round_or_none(_to_float((most_recent_completed or {}).get("high")), 4),
+            "low": _round_or_none(_to_float((most_recent_completed or {}).get("low")), 4),
+            "close": _round_or_none(completed_close, 4),
+            "reference_window_size": continuation_context.get("shelf_candle_count"),
+            "reference_trigger_level": continuation_context.get("trigger_level"),
+            "relation_to_trigger_level": completed_relation,
+            "relation_to_ema50_1h": _relation_to_ema(most_recent_completed, ema50_1h),
+            "raw_cross_pass": completed_raw,
+            "ema_side_pass": bool((option_type == "C" and completed_close is not None and (ema50_1h is None or completed_close > ema50_1h)) or (option_type == "P" and completed_close is not None and (ema50_1h is None or completed_close < ema50_1h))),
+            "raw_chart_trigger_pass": completed_raw,
+            "structure_ready": structure_ready,
+            "gated_trigger_pass": bool(trigger_state.get("completed_candle_trigger_present") is True),
+            "status": "pass" if trigger_state.get("completed_candle_trigger_present") is True else "fail" if completed_raw else "unconfirmed",
+            "why": trigger_state.get("why"),
+            "breakout_hold_confirmed": continuation_context.get("shelf_proven"),
+            "breakout_hold_reference_level": continuation_context.get("trigger_level"),
+            "breakout_hold_reclaim_limit_level": continuation_context.get("shelf_low") if option_type == "C" else continuation_context.get("shelf_high"),
+        }
+
+        if trigger_state.get("completed_candle_trigger_present"):
+            trigger_scan_status = "pass_most_recent_completed_candle"
+            why = "SAFE-FAST continuation trigger passed on the first completed break from the shelf."
+        elif continuation_context.get("exact_reason") == "late":
+            trigger_scan_status = "fail"
+            why = continuation_context.get("status_message")
+        elif continuation_context.get("exact_reason") == "early":
+            trigger_scan_status = "fail"
+            why = continuation_context.get("status_message")
+        elif not market_open:
+            trigger_scan_status = "fail"
+            why = "Market is closed, so trigger scan cannot produce a live entry."
+        else:
+            trigger_scan_status = "unconfirmed"
+            why = trigger_state.get("why") or "Continuation trigger scan is waiting for the first completed shelf break."
+
+        return {
+            "scan_basis": "current_bar_plus_last_completed_1h_candle_against_continuation_shelf",
+            "required_completed_candle_count": continuation_context.get("shelf_candle_count"),
+            "trigger_style": trigger_state.get("trigger_style"),
+            "market_open": market_open,
+            "fresh_entry_allowed": fresh_entry_allowed,
+            "structure_ready": structure_ready,
+            "current_bar": current_bar_eval,
+            "most_recent_completed_candle": completed_eval,
+            "current_bar_reference_candles": continuation_context.get("shelf_candles") or [],
+            "completed_candle_reference_candles": continuation_context.get("shelf_candles") or [],
+            "trigger_scan_status": trigger_scan_status,
+            "why_trigger_scan_passes_or_fails": why,
+        }
+
+    current_bar = recent[-1] if recent else None
+    most_recent_completed = recent[-2] if len(recent) >= 2 else None
+    current_bar_refs = recent[-4:-1] if len(recent) >= 4 else recent[:-1]
+    completed_refs = recent[-5:-2] if len(recent) >= 5 else recent[:-2]
+
+    current_bar_eval = _evaluate_trigger_scan_candle(
+        option_type=option_type,
+        candle=current_bar,
+        reference_candles=current_bar_refs,
+        ema50_1h=ema50_1h,
+        structure_ready=structure_ready,
+        market_open=market_open,
+        fresh_entry_allowed=fresh_entry_allowed,
+        gate_reason=gate_reason,
+    )
+    completed_eval = _evaluate_trigger_scan_candle(
+        option_type=option_type,
+        candle=most_recent_completed,
+        reference_candles=completed_refs,
+        ema50_1h=ema50_1h,
+        structure_ready=structure_ready,
+        market_open=market_open,
+        fresh_entry_allowed=fresh_entry_allowed,
+        gate_reason=gate_reason,
+    )
+
+    current_hold_context = _build_breakout_hold_context(
+        option_type=option_type,
+        current_close=_to_float(current_bar_eval.get("close")),
+        trigger_level=_to_float(completed_eval.get("reference_trigger_level")),
+        structure_context=structure_context,
+        breakout_candle=most_recent_completed,
+        follow_through_candle=current_bar,
+    )
+    completed_hold_context = _build_breakout_hold_context(
+        option_type=option_type,
+        current_close=_to_float(current_bar_eval.get("close")),
+        trigger_level=_to_float(completed_eval.get("reference_trigger_level")),
+        structure_context=structure_context,
+        breakout_candle=most_recent_completed,
+        follow_through_candle=current_bar,
+    )
+
+    if current_bar_eval.get("raw_chart_trigger_pass") and not (
+        completed_eval.get("raw_chart_trigger_pass") and current_hold_context.get("hold_confirmed") is True
+    ):
+        current_bar_eval["gated_trigger_pass"] = False
+        current_bar_eval["status"] = "fail"
+        current_bar_eval["why"] = current_hold_context.get("reason") or "next_bar_hold_not_confirmed"
+    if completed_eval.get("raw_chart_trigger_pass") and completed_hold_context.get("hold_confirmed") is not True:
+        completed_eval["gated_trigger_pass"] = False
+        completed_eval["status"] = "fail"
+        completed_eval["why"] = completed_hold_context.get("reason") or "next_bar_hold_not_confirmed"
+
+    current_bar_eval["breakout_hold_confirmed"] = current_hold_context.get("hold_confirmed")
+    current_bar_eval["breakout_hold_reference_level"] = current_hold_context.get("hold_reference_level")
+    current_bar_eval["breakout_hold_reclaim_limit_level"] = current_hold_context.get("reclaim_limit_level")
+    completed_eval["breakout_hold_confirmed"] = completed_hold_context.get("hold_confirmed")
+    completed_eval["breakout_hold_reference_level"] = completed_hold_context.get("hold_reference_level")
+    completed_eval["breakout_hold_reclaim_limit_level"] = completed_hold_context.get("reclaim_limit_level")
+
+    if current_bar_eval.get("gated_trigger_pass"):
+        trigger_scan_status = "pass_current_bar"
+        why = "SAFE-FAST trigger conditions pass on the current 1H bar."
+    elif completed_eval.get("gated_trigger_pass"):
+        trigger_scan_status = "pass_most_recent_completed_candle"
+        why = "SAFE-FAST trigger conditions passed on the most recent completed 1H candle."
+    elif not market_open:
+        trigger_scan_status = "fail"
+        why = "Market is closed, so trigger scan cannot produce a live entry."
+    elif not fresh_entry_allowed:
+        trigger_scan_status = "fail"
+        why = gate_reason or "Fresh entry is outside the SAFE-FAST time/day window."
+    elif structure_ready is False:
+        trigger_scan_status = "fail"
+        why = "Structure is not ready for a SAFE-FAST trigger."
+    elif current_bar_eval.get("why") == "breakout_hold_not_confirmed" or completed_eval.get("why") == "breakout_hold_not_confirmed":
+        trigger_scan_status = "fail"
+        why = "Breakout printed through resistance/support, but hold-through confirmation is not there yet."
+    elif current_bar_eval.get("raw_chart_trigger_pass") or completed_eval.get("raw_chart_trigger_pass"):
+        trigger_scan_status = "fail"
+        why = "A raw chart trigger appeared, but SAFE-FAST gating still blocks it."
+    elif current_bar_eval.get("status") == "unconfirmed" and completed_eval.get("status") == "unconfirmed":
+        trigger_scan_status = "unconfirmed"
+        why = "Trigger scan is still unconfirmed from the available candles."
+    else:
+        trigger_scan_status = "fail"
+        why = "No SAFE-FAST trigger condition is currently satisfied."
+
+    return {
+        "scan_basis": "current_bar_plus_last_3_completed_1h_candles",
+        "required_completed_candle_count": 3,
+        "trigger_style": trigger_state.get("trigger_style"),
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "structure_ready": structure_ready,
+        "current_bar": current_bar_eval,
+        "most_recent_completed_candle": completed_eval,
+        "current_bar_reference_candles": [
+            _summarize_trigger_scan_candle(candle, ema50_1h) for candle in current_bar_refs
+        ],
+        "completed_candle_reference_candles": [
+            _summarize_trigger_scan_candle(candle, ema50_1h) for candle in completed_refs
+        ],
+        "trigger_scan_status": trigger_scan_status,
+        "why_trigger_scan_passes_or_fails": why,
+    }
+
+
+
+def _build_setup_route_context(
+    option_type: str,
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    intended_setup_type = structure_context.get("setup_type")
+    setup_eligible_now = structure_context.get("setup_eligible_now")
+    chop_risk = bool(structure_context.get("chop_risk"))
+    extension_state = structure_context.get("extension_state")
+    room_pass = structure_context.get("room_pass")
+    wall_pass = structure_context.get("wall_pass")
+    trigger_present = bool(trigger_state.get("trigger_present"))
+    structure_ready = bool(trigger_state.get("structure_ready"))
+    price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
+    allowed_setup_types = ALLOWED_SETUP_TYPES
+    route_type_allowed = intended_setup_type in allowed_setup_types
+    continuation_context = structure_context.get("continuation_context") or {}
+
+    if intended_setup_type == "Continuation":
+        if continuation_context.get("exact_reason") == "tradeable":
+            retest_quality = "first_break_in_range"
+        elif continuation_context.get("exact_reason") == "late":
+            retest_quality = "late_from_hold"
+        elif continuation_context.get("shelf_proven"):
+            retest_quality = "shelf_proven_waiting_break"
+        else:
+            retest_quality = "hold_not_proven"
+        next_bar_confirmation_required = False
+
+        if route_type_allowed is False:
+            setup_route_status = "fail"
+            why = "Setup type is not one of the allowed SAFE-FAST routes."
+        elif room_pass is False:
+            setup_route_status = "fail"
+            why = "Room to the first wall is too tight for this setup route."
+        elif wall_pass is False:
+            setup_route_status = "fail"
+            why = "Wall thesis does not support this setup route."
+        elif continuation_context.get("exact_reason") == "late":
+            setup_route_status = "fail"
+            why = continuation_context.get("status_message") or "Too late for the current continuation shelf."
+        elif setup_eligible_now is True and trigger_present and structure_ready:
+            setup_route_status = "pass"
+            why = continuation_context.get("status_message") or "Continuation hold is proven and the first break is still in range."
+        else:
+            setup_route_status = "pending_confirmation"
+            why = continuation_context.get("status_message") or "Continuation hold is still building or waiting for the first valid break."
+
+        return {
+            "intended_setup_type": intended_setup_type,
+            "retest_quality": retest_quality,
+            "fast_entry_allowed": False,
+            "next_bar_confirmation_required": next_bar_confirmation_required,
+            "setup_route_status": setup_route_status,
+            "why_setup_route_passes_or_fails": why,
+        }
+
+    if intended_setup_type == "Clean Fast Break":
+        retest_quality = "breakout_path" if not chop_risk else "messy_breakout"
+    elif intended_setup_type in {"Ideal", "Continuation"}:
+        if chop_risk:
+            retest_quality = "messy_retest"
+        elif extension_state == "extended":
+            retest_quality = "late_retest"
+        elif price_side in {"above", "below"}:
+            retest_quality = "clean_retest"
+        else:
+            retest_quality = "unconfirmed_retest"
+    else:
+        if chop_risk:
+            retest_quality = "messy_retest"
+        elif extension_state == "extended":
+            retest_quality = "late_retest"
+        else:
+            retest_quality = "not_applicable"
+
+    fast_entry_allowed = bool(
+        intended_setup_type == "Clean Fast Break"
+        and setup_eligible_now is True
+        and room_pass is True
+        and wall_pass is not False
+        and extension_state != "extended"
+        and structure_ready
+        and trigger_present
+    )
+
+    if intended_setup_type == "Clean Fast Break":
+        next_bar_confirmation_required = not fast_entry_allowed
+    elif intended_setup_type in {"Ideal", "Continuation"}:
+        next_bar_confirmation_required = True
+    else:
+        next_bar_confirmation_required = None
+
+    if (
+        route_type_allowed
+        and setup_eligible_now is True
+        and room_pass is True
+        and wall_pass is not False
+        and extension_state != "extended"
+    ):
+        if fast_entry_allowed:
+            setup_route_status = "pass_fast_entry"
+            why = "Clean Fast Break conditions are aligned and fast-entry is allowed."
+        elif next_bar_confirmation_required:
+            setup_route_status = "pending_confirmation"
+            why = "Setup route is valid, but next-bar or close confirmation is still required."
+        else:
+            setup_route_status = "pass"
+            why = "Setup route passes the current SAFE-FAST route checks."
+    elif route_type_allowed is False:
+        setup_route_status = "fail"
+        why = "Setup type is not one of the allowed SAFE-FAST routes."
+    elif room_pass is False:
+        setup_route_status = "fail"
+        why = "Room to the first wall is too tight for this setup route."
+    elif wall_pass is False:
+        setup_route_status = "fail"
+        why = "Wall thesis does not support this setup route."
+    elif extension_state == "extended":
+        setup_route_status = "fail"
+        why = "Setup route is too extended or too late versus the 1H 50 EMA."
+    elif setup_eligible_now is False:
+        setup_route_status = "fail"
+        why = "This is an allowed SAFE-FAST route class, but the current structure does not qualify it as a valid setup."
+    else:
+        setup_route_status = "unconfirmed"
+        why = "Setup route is still unconfirmed from the available chart context."
+
+    return {
+        "intended_setup_type": intended_setup_type,
+        "retest_quality": retest_quality,
+        "fast_entry_allowed": fast_entry_allowed,
+        "next_bar_confirmation_required": next_bar_confirmation_required,
+        "setup_route_status": setup_route_status,
+        "why_setup_route_passes_or_fails": why,
+    }
+
+
+def _build_room_wall_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
+    room_pass = structure_context.get("room_pass")
+    room_quality = structure_context.get("room_quality")
+    room_hard_fail = structure_context.get("room_hard_fail")
+    wall_pass = structure_context.get("wall_pass")
+    wall_thesis = structure_context.get("wall_thesis")
+    extension_blocks_now = structure_context.get("extension_blocks_now")
+
+    if room_hard_fail is True or room_pass is False:
+        room_wall_status = "fail"
+        why = "Room to the first wall is too tight for SAFE-FAST."
+    elif wall_pass is False:
+        room_wall_status = "fail"
+        why = "Wall thesis does not support the current path."
+    elif room_quality == "caution" and wall_pass is True:
+        room_wall_status = "caution"
+        why = "Room is workable, but not especially spacious."
+    elif room_pass is True and wall_pass is True:
+        room_wall_status = "pass"
+        if wall_thesis == "TO_THE_WALL":
+            why = "Room and wall context are aligned only up to the first wall."
+        else:
+            why = "Room and wall context are aligned for the current path."
+    else:
+        room_wall_status = "unconfirmed"
+        why = "Room/wall context is still unconfirmed from the available chart inputs."
+
+    return {
+        "first_wall": structure_context.get("first_wall"),
+        "next_pocket": structure_context.get("next_pocket"),
+        "room_reference_price": structure_context.get("room_reference_price"),
+        "room_reference_basis": structure_context.get("room_reference_basis"),
+        "room_to_first_wall": structure_context.get("room_to_first_wall"),
+        "room_to_first_wall_current": structure_context.get("room_to_first_wall_current"),
+        "room_ratio": structure_context.get("room_ratio"),
+        "room_ratio_current": structure_context.get("room_ratio_current"),
+        "next_pocket_room_ratio": structure_context.get("next_pocket_room_ratio"),
+        "room_quality": room_quality,
+        "room_pass": room_pass,
+        "room_hard_fail": room_hard_fail,
+        "wall_thesis": wall_thesis,
+        "wall_pass": wall_pass,
+        "extension_blocks_now": extension_blocks_now,
+        "room_wall_status": room_wall_status,
+        "why_room_or_wall_passes_or_fails": why,
+    }
+
+
+
+def _build_extension_quality_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
+    extension_state = structure_context.get("extension_state")
+    late_move = structure_context.get("late_move")
+    extension_material = structure_context.get("extension_material")
+    extension_soft_flag = structure_context.get("extension_soft_flag")
+    extension_blocks_now = structure_context.get("extension_blocks_now")
+    degraded_entry_quality = structure_context.get("degraded_entry_quality")
+    early_trigger_window_passed = structure_context.get("early_trigger_window_passed")
+    extension_confirmer_flags = structure_context.get("extension_confirmer_flags")
+    extension_confirmer_count = structure_context.get("extension_confirmer_count")
+    continuation_context = structure_context.get("continuation_context") or {}
+
+    if continuation_context.get("exact_reason") == "late":
+        extension_quality_status = "fail"
+        why = continuation_context.get("status_message") or "Too late for the current continuation hold."
+    elif extension_blocks_now is True:
+        extension_quality_status = "fail"
+        why = "Move is materially extended for SAFE-FAST right now."
+    elif extension_state == "extended" or late_move is True or extension_material is True:
+        if extension_soft_flag is True:
+            extension_quality_status = "caution"
+            why = "Extension is elevated, but treated as a soft caution rather than a hard blocker."
+        else:
+            extension_quality_status = "caution"
+            why = "Extension is elevated and needs confirmation from cleaner structure."
+    elif extension_state is None and late_move is None:
+        extension_quality_status = "unconfirmed"
+        why = "Extension quality is still unconfirmed from the available chart inputs."
+    else:
+        extension_quality_status = "pass"
+        why = "Extension quality is not currently blocking the setup."
+
+    return {
+        "extension_state": extension_state,
+        "late_move": late_move,
+        "pct_from_ema": structure_context.get("pct_from_ema"),
+        "atr_multiple_from_ema": structure_context.get("atr_multiple_from_ema"),
+        "degraded_entry_quality": degraded_entry_quality,
+        "early_trigger_window_passed": early_trigger_window_passed,
+        "extension_confirmer_flags": extension_confirmer_flags,
+        "extension_confirmer_count": extension_confirmer_count,
+        "extension_material": extension_material,
+        "extension_soft_flag": extension_soft_flag,
+        "extension_blocks_now": extension_blocks_now,
+        "continuation_exact_reason": continuation_context.get("exact_reason"),
+        "continuation_status_message": continuation_context.get("status_message"),
+        "extension_quality_status": extension_quality_status,
+        "why_extension_passes_or_fails": why,
+    }
+
+
+def _build_execution_quality_context(
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    market_open = bool(market_context.get("is_open"))
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
+    liquidity_pass = liquidity_context.get("liquidity_pass")
+    liquidity_status = liquidity_context.get("status")
+    iv_status = iv_context.get("status")
+    has_major_event_today = bool(macro_context.get("has_major_event_today"))
+    has_major_event_tomorrow = bool(macro_context.get("has_major_event_tomorrow"))
+    macro_risk_level = macro_context.get("risk_level")
+
+    if not market_open or not fresh_entry_allowed:
+        execution_quality_status = "fail"
+        why = "After-hours / closed-session structural read only. No live entry can be taken right now."
+    elif liquidity_pass is False:
+        execution_quality_status = "fail"
+        why = liquidity_context.get("why") or "Liquidity is too weak for a clean SAFE-FAST entry."
+    elif has_major_event_today:
+        execution_quality_status = "caution"
+        why = "A major macro event is in play today, so execution quality needs extra caution."
+    elif has_major_event_tomorrow:
+        execution_quality_status = "caution"
+        why = "A major macro event is in play tomorrow, so execution quality needs extra caution."
+    elif iv_context.get("hard_block") is True:
+        execution_quality_status = "fail"
+        why = iv_context.get("why") or "IV / pricing proxy is too elevated for a clean debit spread entry."
+    elif iv_status == "caution":
+        execution_quality_status = "caution"
+        why = iv_context.get("why") or "IV / pricing proxy is elevated, so execution quality needs extra caution."
+    elif iv_status == "unconfirmed":
+        execution_quality_status = "caution"
+        why = "IV / pricing proxy is still unconfirmed, even though time window and liquidity are acceptable."
+    elif liquidity_pass is True:
+        execution_quality_status = "pass"
+        why = iv_context.get("why") or "Time window and liquidity are acceptable for execution."
+    else:
+        execution_quality_status = "unconfirmed"
+        why = "Execution quality is still unconfirmed from the available inputs."
+
+    return {
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "macro_risk_level": macro_risk_level,
+        "has_major_event_today": has_major_event_today,
+        "has_major_event_tomorrow": has_major_event_tomorrow,
+        "iv_status": iv_status,
+        "liquidity_status": liquidity_status,
+        "liquidity_pass": liquidity_pass,
+        "execution_quality_status": execution_quality_status,
+        "why_execution_quality_passes_or_fails": why,
+    }
+
+
+
+
+
+def _build_event_gate_context(
+    macro_context: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> Dict[str, Any]:
+    market_open = bool(market_context.get("is_open"))
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
+    has_major_event_today = bool(macro_context.get("has_major_event_today"))
+    has_major_event_tomorrow = bool(macro_context.get("has_major_event_tomorrow"))
+    events = macro_context.get("events") or []
+    risk_level = macro_context.get("risk_level")
+    note = macro_context.get("note")
+
+    if not market_open:
+        event_gate_status = "unconfirmed"
+        why = "Market is closed, so the live event gate is not actionable right now."
+    elif has_major_event_today:
+        event_gate_status = "fail"
+        why = "A major macro event is in play today, so the SAFE-FAST event gate fails unless explicitly approved."
+    elif has_major_event_tomorrow:
+        event_gate_status = "caution"
+        why = "A major macro event is tomorrow, so overnight hold risk needs extra caution."
+    elif not fresh_entry_allowed:
+        event_gate_status = "caution"
+        why = "No major macro event blocks the map, but the fresh-entry window is already closed."
+    else:
+        event_gate_status = "pass"
+        why = "No major macro event is blocking the SAFE-FAST event gate right now."
+
+    return {
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "has_major_event_today": has_major_event_today,
+        "has_major_event_tomorrow": has_major_event_tomorrow,
+        "events": events,
+        "risk_level": risk_level,
+        "event_gate_status": event_gate_status,
+        "why_event_gate_passes_or_fails": why,
+        "note": note,
+    }
+
+
+def _build_wall_thesis_fit_context(
+    option_type: str,
+    structure_context: Dict[str, Any],
+    primary_candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    wall_thesis = structure_context.get("wall_thesis")
+    effective_wall_thesis = structure_context.get("effective_wall_thesis") or wall_thesis
+    first_wall = _to_float(structure_context.get("first_wall"))
+    next_pocket = _to_float(structure_context.get("next_pocket"))
+    next_pocket_room_ratio = _to_float(structure_context.get("next_pocket_room_ratio"))
+    current_price_beyond_first_wall = structure_context.get("current_price_beyond_first_wall")
+    breakout_path_required = bool(structure_context.get("breakout_path_required"))
+    long_strike = _to_float(primary_candidate.get("long_strike")) if primary_candidate else None
+    short_strike = _to_float(primary_candidate.get("short_strike")) if primary_candidate else None
+
+    tolerance = None
+    if first_wall is not None:
+        tolerance = max(abs(first_wall) * 0.0015, 0.10)
+
+    short_strike_vs_first_wall = None
+    if short_strike is not None and first_wall is not None and tolerance is not None:
+        if abs(short_strike - first_wall) <= tolerance:
+            short_strike_vs_first_wall = "on_wall_zone"
+        elif option_type == "C":
+            short_strike_vs_first_wall = "beyond_first_wall" if short_strike > first_wall else "inside_first_wall"
+        else:
+            short_strike_vs_first_wall = "beyond_first_wall" if short_strike < first_wall else "inside_first_wall"
+
+    short_strike_on_magnet_level = None
+    if short_strike is not None:
+        magnet_hits = []
+        for level in (first_wall, next_pocket):
+            if level is None:
+                continue
+            local_tol = max(abs(level) * 0.0015, 0.10)
+            if abs(short_strike - level) <= local_tol:
+                magnet_hits.append(level)
+        short_strike_on_magnet_level = bool(magnet_hits) if magnet_hits else False
+
+    requires_breakout = effective_wall_thesis == "THROUGH_THE_WALL"
+
+    if primary_candidate is None:
+        status = "unconfirmed"
+        why = "Wall-thesis fit is unconfirmed because no primary candidate is available."
+    elif effective_wall_thesis not in {"TO_THE_WALL", "THROUGH_THE_WALL"}:
+        status = "unconfirmed"
+        why = "Wall thesis is still unconfirmed from the available structure inputs."
+    elif short_strike is None or first_wall is None:
+        status = "unconfirmed"
+        why = "Wall-thesis fit is unconfirmed because strike or wall data is missing."
+    elif effective_wall_thesis == "TO_THE_WALL":
+        if breakout_path_required or current_price_beyond_first_wall is True:
+            status = "fail"
+            why = "TO_THE_WALL fails because price is already through the first wall, so this now requires a THROUGH_THE_WALL thesis."
+        elif short_strike_on_magnet_level:
+            status = "fail"
+            why = "TO_THE_WALL fails because the short strike sits on a magnet level."
+        elif short_strike_vs_first_wall != "beyond_first_wall":
+            status = "fail"
+            why = "TO_THE_WALL fails because the short strike is not beyond the first wall."
+        else:
+            status = "pass"
+            why = "TO_THE_WALL fits because the short strike sits beyond the first wall without sitting on it."
+    else:
+        if next_pocket is None:
+            status = "fail"
+            why = "THROUGH_THE_WALL fails because no clear next pocket is mapped beyond the first wall."
+        elif next_pocket_room_ratio is None or next_pocket_room_ratio < 1.5:
+            status = "fail"
+            why = "THROUGH_THE_WALL fails because the next pocket beyond the first wall is not clear enough."
+        elif short_strike_vs_first_wall not in {"on_wall_zone", "beyond_first_wall"}:
+            status = "fail"
+            why = "THROUGH_THE_WALL fails because the short strike is not positioned for a breakout path."
+        elif current_price_beyond_first_wall is True:
+            status = "pass"
+            why = "THROUGH_THE_WALL fits because price is through the first wall and a clear next pocket is mapped."
+        else:
+            status = "pass"
+            why = "THROUGH_THE_WALL fits because breakout continuation into the next pocket is mapped."
+
+    return {
+        "wall_thesis": wall_thesis,
+        "effective_wall_thesis": effective_wall_thesis,
+        "long_strike": long_strike,
+        "short_strike": short_strike,
+        "first_wall": structure_context.get("first_wall"),
+        "next_pocket": structure_context.get("next_pocket"),
+        "next_pocket_room_ratio": _round_or_none(next_pocket_room_ratio, 3),
+        "current_price_beyond_first_wall": current_price_beyond_first_wall,
+        "breakout_path_required": breakout_path_required,
+        "short_strike_vs_first_wall": short_strike_vs_first_wall,
+        "requires_breakout": requires_breakout,
+        "short_strike_on_magnet_level": short_strike_on_magnet_level,
+        "wall_thesis_fit_status": status,
+        "why_wall_thesis_fit_passes_or_fails": why,
+    }
+
+
+
+def _build_adx_filter_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
+    adx_value = _to_float(structure_context.get("adx_value_1h"))
+    adx_trend = structure_context.get("adx_trend")
+    chop_risk_from_adx = structure_context.get("chop_risk_from_adx")
+
+    adx_override_blocked_by: List[str] = [
+        "price",
+        "room",
+        "late_move",
+        "wall_placement",
+        "risk",
+        "trigger_rules",
+    ]
+
+    if adx_value is None:
+        status = "unconfirmed"
+        why = "ADX is not available from the current candle set, so the secondary ADX filter remains unconfirmed."
+    elif chop_risk_from_adx is True:
+        status = "caution"
+        why = "ADX is secondary only. Current ADX implies chop risk, but it does not override primary SAFE-FAST blockers."
+    else:
+        status = "pass"
+        why = "ADX does not currently add extra chop risk, but it remains secondary to primary SAFE-FAST rules."
+
+    return {
+        "adx_value_1h": adx_value,
+        "adx_trend": adx_trend,
+        "chop_risk_from_adx": chop_risk_from_adx,
+        "adx_override_blocked_by": adx_override_blocked_by,
+        "adx_filter_status": status,
+        "why_adx_passes_or_fails": why,
+    }
+
+
+def _build_options_structure_context(
+    request: OnDemandRequest,
+    selected_summary: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+    liquidity_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    expiration_date = selected_summary.get("expiration_date") if selected_summary else None
+    days_to_expiration = selected_summary.get("days_to_expiration") if selected_summary else None
+    width = primary_candidate.get("width") if primary_candidate else None
+    est_debit = primary_candidate.get("est_debit") if primary_candidate else None
+    max_loss = primary_candidate.get("max_loss_dollars_1lot") if primary_candidate else None
+    max_profit = primary_candidate.get("max_profit_dollars_1lot") if primary_candidate else None
+    risk_reward = primary_candidate.get("risk_reward") if primary_candidate else None
+    feasibility_pass = primary_candidate.get("feasibility_pass") if primary_candidate else None
+    fits_risk_budget = primary_candidate.get("fits_risk_budget") if primary_candidate else None
+    liquidity_pass = liquidity_context.get("liquidity_pass")
+    liquidity_status = liquidity_context.get("status")
+
+    dte_rule_pass = None
+    if isinstance(days_to_expiration, (int, float)):
+        dte_rule_pass = request.min_dte <= float(days_to_expiration) <= request.max_dte
+
+    width_rule_pass = None
+    if isinstance(width, (int, float)):
+        width_rule_pass = request.width_min <= float(width) <= request.width_max
+
+    debit_feasibility_rule_pass = None
+    if isinstance(est_debit, (int, float)) and isinstance(width, (int, float)):
+        debit_feasibility_rule_pass = (1.60 * float(est_debit)) <= float(width)
+
+    preferred_risk_band_pass = None
+    if isinstance(max_loss, (int, float)):
+        preferred_risk_band_pass = request.risk_min_dollars <= float(max_loss) <= request.risk_max_dollars
+
+    hard_risk_cap_pass = None
+    if isinstance(max_loss, (int, float)):
+        hard_risk_cap_pass = float(max_loss) <= request.hard_max_dollars
+
+    if primary_candidate is None:
+        options_structure_status = "unconfirmed"
+        why = "Options structure is unconfirmed because no primary candidate is available."
+    elif feasibility_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate fails the defined-risk debit spread feasibility rule."
+    elif debit_feasibility_rule_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate fails the 1.60 x debit <= width feasibility rule."
+    elif fits_risk_budget is False or hard_risk_cap_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate does not fit the SAFE-FAST risk budget."
+    elif dte_rule_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate is outside the SAFE-FAST DTE window."
+    elif width_rule_pass is False:
+        options_structure_status = "fail"
+        why = "Candidate is outside the SAFE-FAST width range."
+    elif liquidity_pass is False:
+        options_structure_status = "fail"
+        why = liquidity_context.get("why") or "Options structure is not liquid enough for a clean entry."
+    elif (
+        feasibility_pass is True
+        and debit_feasibility_rule_pass is True
+        and fits_risk_budget is True
+        and dte_rule_pass is True
+        and width_rule_pass is True
+        and liquidity_pass is True
+    ):
+        options_structure_status = "pass"
+        why = "Options structure fits DTE, width, risk, feasibility, and liquidity rules."
+    else:
+        options_structure_status = "caution"
+        why = "Options structure is mostly aligned, but one or more checks remain unconfirmed."
+
+    return {
+        "expiration_date": expiration_date,
+        "days_to_expiration": days_to_expiration,
+        "width": width,
+        "est_debit": est_debit,
+        "max_loss_dollars_1lot": max_loss,
+        "max_profit_dollars_1lot": max_profit,
+        "risk_reward": risk_reward,
+        "feasibility_pass": feasibility_pass,
+        "fits_risk_budget": fits_risk_budget,
+        "preferred_risk_band_pass": preferred_risk_band_pass,
+        "hard_risk_cap_pass": hard_risk_cap_pass,
+        "dte_rule_pass": dte_rule_pass,
+        "width_rule_pass": width_rule_pass,
+        "debit_feasibility_rule_pass": debit_feasibility_rule_pass,
+        "liquidity_status": liquidity_status,
+        "liquidity_pass": liquidity_pass,
+        "options_structure_status": options_structure_status,
+        "why_options_structure_passes_or_fails": why,
+    }
+
+
+
+def _build_live_map_block(
+    ticker: Optional[str],
+    option_type: str,
+    primary_entry_zone: Optional[Dict[str, Any]],
+    backup_entry_zone: Optional[Dict[str, Any]],
+    trigger_state: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+    structure_context: Dict[str, Any],
+    invalidation_level_1h_ema50: Optional[float],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+    selected_summary: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+    request: OnDemandRequest,
+) -> Dict[str, Any]:
+    trigger_detail = _build_trigger_detail_context(
+        option_type=option_type,
+        chart_check=chart_check,
+        trigger_state=trigger_state,
+        structure_context=structure_context,
+    )
+    setup_route = _build_setup_route_context(
+        option_type=option_type,
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        chart_check=chart_check,
+    )
+    room_wall = _build_room_wall_context(structure_context)
+    extension_quality = _build_extension_quality_context(structure_context)
+    execution_quality = _build_execution_quality_context(
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        macro_context=macro_context,
+        iv_context=iv_context,
+        liquidity_context=liquidity_context,
+    )
+    event_gate = _build_event_gate_context(
+        macro_context=macro_context,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+    )
+    options_structure = _build_options_structure_context(
+        request=request,
+        selected_summary=selected_summary,
+        primary_candidate=primary_candidate,
+        liquidity_context=liquidity_context,
+    )
+    wall_thesis_fit = _build_wall_thesis_fit_context(
+        option_type=option_type,
+        structure_context=structure_context,
+        primary_candidate=primary_candidate,
+    )
+    adx_filter = _build_adx_filter_context(structure_context)
+    trap_check_context = _build_trap_check_context(structure_context)
+    trigger_scan = _build_trigger_scan_context(
+        option_type=option_type,
+        chart_check=chart_check,
+        trigger_state=trigger_state,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+    )
+    return {
+        "ticker": ticker,
+        "primary_entry_zone": primary_entry_zone,
+        "backup_entry_zone": backup_entry_zone,
+        "continuation": structure_context.get("continuation_context") if _continuation_family_detected(structure_context.get("continuation_context")) else None,
+        "trigger_style": trigger_state.get("trigger_style"),
+        "trigger_level": trigger_state.get("trigger_level"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_candle": trigger_detail.get("trigger_candle"),
+        "current_bar_behavior": trigger_detail.get("current_bar_behavior"),
+        "setup_route": setup_route,
+        "room_wall": room_wall,
+        "extension_quality": extension_quality,
+        "execution_quality": execution_quality,
+        "event_gate": event_gate,
+        "options_structure": options_structure,
+        "wall_thesis_fit": wall_thesis_fit,
+        "adx_filter": adx_filter,
+        "trap_check_context": trap_check_context,
+        "trigger_scan": trigger_scan,
+        "invalidation_1h_ema50": invalidation_level_1h_ema50,
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+    }
+
+
+
+def _calc_pct_of_mid(bid: Optional[float], ask: Optional[float], mid: Optional[float]) -> Optional[float]:
+    if bid is None or ask is None or mid in (None, 0):
+        return None
+    return round(((ask - bid) / mid) * 100, 3)
+
+
+def _classify_liquidity(
+    entry_slippage_vs_mid: Optional[float],
+    long_leg_width_pct_of_mid: Optional[float],
+    short_leg_width_pct_of_mid: Optional[float],
+) -> Dict[str, Any]:
+    if (
+        entry_slippage_vs_mid is None
+        or long_leg_width_pct_of_mid is None
+        or short_leg_width_pct_of_mid is None
+    ):
+        return {
+            "label": "unconfirmed",
+            "liquidity_pass": None,
+            "why": "Quotes did not provide enough bid/ask detail to confirm liquidity.",
+        }
+
+    if (
+        entry_slippage_vs_mid <= 0.15
+        and long_leg_width_pct_of_mid <= 12
+        and short_leg_width_pct_of_mid <= 12
+    ):
+        return {
+            "label": "tight",
+            "liquidity_pass": True,
+            "why": "Bid/ask widths and entry slippage are tight enough for a defined-risk debit spread.",
+        }
+
+    if (
+        entry_slippage_vs_mid <= 0.30
+        and long_leg_width_pct_of_mid <= 20
+        and short_leg_width_pct_of_mid <= 20
+    ):
+        return {
+            "label": "acceptable",
+            "liquidity_pass": True,
+            "why": "Bid/ask widths are workable, but not especially tight.",
+        }
+
+    return {
+        "label": "wide",
+        "liquidity_pass": False,
+        "why": "Bid/ask widths or entry slippage are too wide for a clean SAFE-FAST debit spread entry.",
+    }
+
+
+def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not candidate:
+        return {
+            "ok": False,
+            "status": "unconfirmed",
+            "why": "No candidate available.",
+        }
+
+    label_ctx = _classify_liquidity(
+        candidate.get("entry_slippage_vs_mid"),
+        candidate.get("long_leg_width_pct_of_mid"),
+        candidate.get("short_leg_width_pct_of_mid"),
+    )
+
+    return {
+        "ok": True,
+        "status": label_ctx["label"],
+        "liquidity_pass": label_ctx["liquidity_pass"],
+        "why": label_ctx["why"],
+        "mid_debit": candidate.get("est_debit"),
+        "natural_debit": candidate.get("natural_debit"),
+        "entry_slippage_vs_mid": candidate.get("entry_slippage_vs_mid"),
+        "spread_market_width": candidate.get("spread_market_width"),
+        "long_leg_width": candidate.get("long_leg_width"),
+        "short_leg_width": candidate.get("short_leg_width"),
+        "long_leg_width_pct_of_mid": candidate.get("long_leg_width_pct_of_mid"),
+        "short_leg_width_pct_of_mid": candidate.get("short_leg_width_pct_of_mid"),
+    }
+
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        text_value = str(value).strip()
+        if not text_value:
+            return None
+        text_value = text_value.replace(",", "")
+        return float(text_value)
+    except (TypeError, ValueError):
+        return None
+
+def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            helper = globals().get("_safe_float")
+            if callable(helper):
+                return helper(value)
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return float(value)
+            if isinstance(value, (int, float)):
+                return float(value)
+            text_value = str(value).strip()
+            if not text_value:
+                return None
+            text_value = text_value.replace(",", "")
+            return float(text_value)
+        except (TypeError, ValueError):
+            return None
+
+    if not candidate:
+        return {
+            "ok": False,
+            "status": "unconfirmed",
+            "hard_block": False,
+            "source": "pricing_proxy",
+            "proxy_only": True,
+            "why": "No candidate available, so IV proxy cannot be evaluated.",
+        }
+
+    est_debit = _to_float(candidate.get("est_debit"))
+    spread_market_width = _to_float(candidate.get("spread_market_width"))
+    entry_slippage_vs_mid = _to_float(candidate.get("entry_slippage_vs_mid"))
+    long_leg_width_pct = _to_float(candidate.get("long_leg_width_pct_of_mid"))
+    short_leg_width_pct = _to_float(candidate.get("short_leg_width_pct_of_mid"))
+
+    if (
+        est_debit in (None, 0)
+        or spread_market_width is None
+        or entry_slippage_vs_mid is None
+        or long_leg_width_pct is None
+        or short_leg_width_pct is None
+    ):
+        return {
+            "ok": False,
+            "status": "unconfirmed",
+            "hard_block": False,
+            "source": "pricing_proxy",
+            "proxy_only": True,
+            "why": "IV proxy is still unconfirmed because spread-width or slippage detail is missing.",
+        }
+
+    spread_width_pct_of_debit = round((spread_market_width / est_debit) * 100, 3)
+    slippage_pct_of_debit = round((entry_slippage_vs_mid / est_debit) * 100, 3)
+
+    caution_flags: List[str] = []
+    fail_flags: List[str] = []
+
+    if spread_width_pct_of_debit > 15:
+        fail_flags.append("spread_market_too_wide")
+    elif spread_width_pct_of_debit > 10:
+        caution_flags.append("spread_market_wide")
+
+    if slippage_pct_of_debit > 10:
+        fail_flags.append("entry_slippage_too_large")
+    elif slippage_pct_of_debit > 6:
+        caution_flags.append("entry_slippage_elevated")
+
+    if long_leg_width_pct > 18 or short_leg_width_pct > 18:
+        fail_flags.append("leg_widths_too_wide")
+    elif long_leg_width_pct > 12 or short_leg_width_pct > 12:
+        caution_flags.append("leg_widths_elevated")
+
+    if fail_flags:
+        return {
+            "ok": False,
+            "status": "elevated",
+            "hard_block": True,
+            "source": "pricing_proxy",
+            "proxy_only": True,
+            "spread_width_pct_of_debit": spread_width_pct_of_debit,
+            "slippage_pct_of_debit": slippage_pct_of_debit,
+            "long_leg_width_pct_of_mid": long_leg_width_pct,
+            "short_leg_width_pct_of_mid": short_leg_width_pct,
+            "caution_flags": caution_flags,
+            "fail_flags": fail_flags,
+            "why": "IV / pricing proxy is too elevated for a debit spread right now.",
+        }
+
+    if caution_flags:
+        return {
+            "ok": True,
+            "status": "caution",
+            "hard_block": False,
+            "source": "pricing_proxy",
+            "proxy_only": True,
+            "spread_width_pct_of_debit": spread_width_pct_of_debit,
+            "slippage_pct_of_debit": slippage_pct_of_debit,
+            "long_leg_width_pct_of_mid": long_leg_width_pct,
+            "short_leg_width_pct_of_mid": short_leg_width_pct,
+            "caution_flags": caution_flags,
+            "fail_flags": [],
+            "why": "IV / pricing proxy is elevated. Proceed only with caution.",
+        }
+
+    return {
+        "ok": True,
+        "status": "acceptable",
+        "hard_block": False,
+        "source": "pricing_proxy",
+        "proxy_only": True,
+        "spread_width_pct_of_debit": spread_width_pct_of_debit,
+        "slippage_pct_of_debit": slippage_pct_of_debit,
+        "long_leg_width_pct_of_mid": long_leg_width_pct,
+        "short_leg_width_pct_of_mid": short_leg_width_pct,
+        "caution_flags": [],
+        "fail_flags": [],
+        "why": "IV / pricing proxy looks acceptable for a debit spread.",
+    }
+
+def _market_context_now() -> Dict[str, Any]:
+    now_et = datetime.now(NY_TZ)
+    is_weekday = now_et.weekday() < 5
+    in_regular_session = time(9, 30) <= now_et.time() < time(16, 0)
+    is_open = is_weekday and in_regular_session
+
+    return {
+        "is_open": is_open,
+        "as_of_et": now_et.isoformat(timespec="seconds"),
+        "session": "regular" if is_open else "closed",
+    }
+
+
+def _time_day_gate(market_context: Dict[str, Any]) -> Dict[str, Any]:
+    if not market_context.get("is_open"):
+        return {
+            "fresh_entry_allowed": False,
+            "reason": "market_closed",
+            "cutoff_et": None,
+            "policy": "market_open_required_only",
+        }
+
+    return {
+        "fresh_entry_allowed": True,
+        "reason": "market_open_no_hard_time_cutoff",
+        "cutoff_et": None,
+        "policy": "market_open_required_only",
+    }
+
+
+def _market_context_at(dt_et: datetime) -> Dict[str, Any]:
+    is_weekday = dt_et.weekday() < 5
+    in_regular_session = time(9, 30) <= dt_et.time() < time(16, 0)
+    is_open = is_weekday and in_regular_session
+
+    return {
+        "is_open": is_open,
+        "as_of_et": dt_et.isoformat(timespec="seconds"),
+        "session": "regular" if is_open else "closed",
+    }
+
+
+def _parse_replay_timestamp_et(value: Optional[str]) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=NY_TZ)
+
+    try:
+        return parsed.astimezone(NY_TZ)
+    except Exception:
+        return None
+
+
+def _build_replay_test_context(
+    current_snapshot: Dict[str, Any],
+    request: Optional[ContinuousShadowRequest],
+) -> Dict[str, Any]:
+    replay_timestamp_raw = None if request is None else request.replay_timestamp_et
+    replay_label = None if request is None else request.replay_label
+
+    if not replay_timestamp_raw:
+        return {
+            "ok": True,
+            "enabled": False,
+            "status": "disabled",
+            "scope": "time_gate_only_static_structure_baseline",
+            "why": "no_replay_timestamp_et_supplied",
+        }
+
+    replay_dt = _parse_replay_timestamp_et(replay_timestamp_raw)
+    if replay_dt is None:
+        return {
+            "ok": False,
+            "enabled": True,
+            "status": "invalid_replay_timestamp",
+            "scope": "time_gate_only_static_structure_baseline",
+            "requested_replay_timestamp_et": replay_timestamp_raw,
+            "why": "could_not_parse_replay_timestamp_et",
+        }
+
+    replay_market_context = _market_context_at(replay_dt)
+    replay_time_day_gate = _time_day_gate(replay_market_context)
+    market_closed_tester = current_snapshot.get("market_closed_tester") or {}
+    structural_verdict = str(
+        market_closed_tester.get("underlying_structural_verdict")
+        or current_snapshot.get("final_verdict")
+        or "unconfirmed"
+    ).upper()
+    structural_primary_blocker = (
+        market_closed_tester.get("underlying_structural_primary_blocker")
+        or current_snapshot.get("primary_blocker")
+    )
+    structural_blockers = _ordered_unique_strings(
+        market_closed_tester.get("underlying_structural_blockers")
+        or current_snapshot.get("decision_blockers")
+        or []
+    )
+    would_be_trade_if_open = bool(market_closed_tester.get("would_be_trade_if_open") is True)
+    replay_trade_allowed = bool(
+        replay_market_context.get("is_open") is True
+        and replay_time_day_gate.get("fresh_entry_allowed") is True
+        and would_be_trade_if_open
+    )
+
+    if replay_trade_allowed:
+        replay_takeaway = "Replay tester says this baseline would qualify at the requested replay time."
+    elif replay_market_context.get("is_open") is False:
+        replay_takeaway = (
+            "Replay tester says the requested replay time is outside the regular session, "
+            "so live entry would still be blocked there."
+        )
+    elif structural_verdict == "NO_TRADE":
+        replay_takeaway = (
+            "Replay tester says time would allow entry there, but structure from the current baseline still fails."
+        )
+    else:
+        replay_takeaway = (
+            "Replay tester says time would allow entry there, but approval still would not be ready from the current baseline."
+        )
+
+    return {
+        "ok": True,
+        "enabled": True,
+        "status": "ready",
+        "scope": "time_gate_only_static_structure_baseline",
+        "requested_replay_timestamp_et": replay_timestamp_raw,
+        "resolved_replay_timestamp_et": replay_dt.isoformat(timespec="seconds"),
+        "replay_label": replay_label,
+        "replay_market_context": replay_market_context,
+        "replay_time_day_gate": replay_time_day_gate,
+        "replay_market_open": replay_market_context.get("is_open"),
+        "replay_fresh_entry_allowed": replay_time_day_gate.get("fresh_entry_allowed"),
+        "underlying_structural_verdict": structural_verdict,
+        "underlying_structural_primary_blocker": structural_primary_blocker,
+        "underlying_structural_blockers": structural_blockers,
+        "would_be_trade_if_open": would_be_trade_if_open,
+        "replay_trade_allowed": replay_trade_allowed,
+        "replay_takeaway": replay_takeaway,
+    }
+
+
+def _other_ticker_candidates(
+    summary_payload: Dict[str, Any],
+    best_ticker: Optional[str],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+
+    for s in summary_payload.get("ticker_summaries", []):
+        if s.get("symbol") == best_ticker:
+            continue
+        out.append(
+            {
+                "symbol": s.get("symbol"),
+                "verdict": s.get("verdict"),
+                "reason": s.get("reason"),
+                "primary_candidate": s.get("primary_candidate"),
+            }
+        )
+
+    return out
+
+
+_MACRO_MONTHS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+
+async def _fetch_text(url: str) -> str:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        resp = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
+    resp.raise_for_status()
+    return unescape(resp.text)
+
+
+def _next_trading_days(start_dt: datetime, count: int = 3) -> List[datetime.date]:
+    out: List[datetime.date] = []
+    cur = start_dt.date()
+    while len(out) < count:
+        if cur.weekday() < 5:
+            out.append(cur)
+        cur = cur + timedelta(days=1)
+    return out
+
+
+def _parse_month_day_year(raw: str, fallback_year: int) -> Optional[datetime.date]:
+    cleaned = raw.strip().replace(",", "").replace(".", "")
+    parts = cleaned.split()
+    if len(parts) < 2:
+        return None
+
+    month = _MACRO_MONTHS.get(parts[0].lower())
+    if not month:
+        return None
+
+    day_token = parts[1]
+    if "-" in day_token:
+        day_token = day_token.split("-")[0]
+    if "ÃƒÂ¢Ã‚â‚¬Ã‚â€œ" in day_token:
+        day_token = day_token.split("ÃƒÂ¢Ã‚â‚¬Ã‚â€œ")[0]
+    day_token = re.sub(r"[^0-9]", "", day_token)
+    if not day_token:
+        return None
+
+    year = fallback_year
+    if len(parts) >= 3 and parts[2].isdigit():
+        year = int(parts[2])
+
+    try:
+        return datetime(year, month, int(day_token), tzinfo=NY_TZ).date()
+    except Exception:
+        return None
+
+
+def _extract_dates_by_patterns(text: str, fallback_year: int) -> List[datetime.date]:
+    pattern = re.compile(
+        r"(January|February|March|April|May|June|July|August|September|October|November|December|"
+        r"Jan\.?|Feb\.?|Mar\.?|Apr\.?|May|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)"
+        r"\s+\d{1,2}(?:\s*[-ÃƒÂ¢Ã‚â‚¬Ã‚â€œ]\s*\d{1,2})?(?:,\s*\d{4}|\s+\d{4})?",
+        re.IGNORECASE,
+    )
+    out: List[datetime.date] = []
+    seen = set()
+    for match in pattern.finditer(text):
+        parsed = _parse_month_day_year(match.group(0), fallback_year)
+        if parsed and parsed not in seen:
+            seen.add(parsed)
+            out.append(parsed)
+    return out
+
+
+async def _fetch_fomc_events(now_et: datetime) -> List[Dict[str, Any]]:
+    text = await _fetch_text("https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
+    dates = _extract_dates_by_patterns(text, now_et.year)
+    events = []
+    for d in dates:
+        if d >= now_et.date() - timedelta(days=1):
+            events.append({
+                "date": d.isoformat(),
+                "event": "FOMC",
+                "major": True,
+                "source": "federalreserve.gov",
+            })
+    return events
+
+
+async def _fetch_bls_events(now_et: datetime) -> List[Dict[str, Any]]:
+    urls = [
+        ("CPI", "https://www.bls.gov/schedule/news_release/cpi.htm"),
+        ("Employment Situation", "https://www.bls.gov/schedule/news_release/empsit.htm"),
+    ]
+    events: List[Dict[str, Any]] = []
+    for label, url in urls:
+        text = await _fetch_text(url)
+        dates = _extract_dates_by_patterns(text, now_et.year)
+        for d in dates:
+            if d >= now_et.date() - timedelta(days=1):
+                events.append({
+                    "date": d.isoformat(),
+                    "event": label,
+                    "major": True,
+                    "source": "bls.gov",
+                })
+    return events
+
+
+async def _build_macro_context(requested: bool) -> Dict[str, Any]:
+    if not requested:
+        return {
+            "ok": False,
+            "requested": False,
+            "why": "macro not requested",
+            "has_major_event_today": False,
+            "has_major_event_tomorrow": False,
+            "events": [],
+            "risk_level": "skipped",
+            "note": "Macro context not requested.",
+        }
+
+    now_et = datetime.now(NY_TZ)
+    today = now_et.date()
+    tomorrow = today + timedelta(days=1)
+    hold_window = {d.isoformat() for d in _next_trading_days(now_et, 3)}
+
+    events: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    try:
+        events.extend(await _fetch_fomc_events(now_et))
+    except Exception as e:
+        warnings.append(f"FOMC source unavailable: {e}")
+
+    try:
+        events.extend(await _fetch_bls_events(now_et))
+    except Exception:
+        warnings.append("BLS schedule unavailable; macro check used available sources.")
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for ev in sorted(events, key=lambda x: (x["date"], x["event"])):
+        key = (ev["date"], ev["event"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(ev)
+
+    has_today = any(ev["date"] == today.isoformat() and ev["major"] for ev in deduped)
+    has_tomorrow = any(ev["date"] == tomorrow.isoformat() and ev["major"] for ev in deduped)
+    visible_events = [ev for ev in deduped if ev["date"] in hold_window]
+    in_hold_window = [ev for ev in visible_events if ev["major"]]
+
+    if in_hold_window:
+        risk_level = "high"
+        note = "Major macro event is inside the next 3 trading days."
+    elif visible_events or deduped:
+        risk_level = "normal"
+        note = "No major macro event found inside the next 3 trading days."
+    else:
+        risk_level = "unconfirmed"
+        note = "Macro sources returned no usable schedule data."
+
+    if warnings:
+        note = f"{note} {' | '.join(warnings)}"
+
+    return {
+        "ok": True,
+        "requested": True,
+        "has_major_event_today": has_today,
+        "has_major_event_tomorrow": has_tomorrow,
+        "events": visible_events,
+        "risk_level": risk_level,
+        "note": note,
+        "as_of_et": now_et.isoformat(timespec="seconds"),
+    }
+
+
+async def get_access_token() -> str:
+    if not all([TT_CLIENT_ID, TT_CLIENT_SECRET, TT_REDIRECT_URI, TT_REFRESH_TOKEN]):
+        raise HTTPException(status_code=500, detail="Missing TT OAuth environment variables")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{API_BASE}/oauth/token",
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            data={
+                "grant_type": "refresh_token",
+                "client_id": TT_CLIENT_ID,
+                "client_secret": TT_CLIENT_SECRET,
+                "redirect_uri": TT_REDIRECT_URI,
+                "refresh_token": TT_REFRESH_TOKEN,
+            },
+        )
+
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {"raw": resp.text}
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=payload)
+
+    token = payload.get("access_token")
+    if not token:
+        raise HTTPException(status_code=500, detail=payload)
+
+    return token
+
+
+async def _fetch_option_chain(symbol: str, token: str) -> Any:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{API_BASE}/option-chains/{symbol}",
+            headers=_headers(token),
+        )
+
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {"raw": resp.text}
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=payload)
+
+    return payload
+
+
+async def _fetch_quotes(symbols: List[str], token: str) -> Any:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{API_BASE}/market-data",
+            headers=_headers(token),
+            params={"type": "Equity", "symbols": ",".join(symbols)},
+        )
+
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {"raw": resp.text}
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=payload)
+
+    return payload
+
+
+async def _fetch_option_quotes(option_symbols: List[str], token: str) -> Any:
+    if not option_symbols:
+        return {"data": {"items": []}}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{API_BASE}/market-data/by-type",
+            headers=_headers(token),
+            params={"equity-option": ",".join(option_symbols)},
+        )
+
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = {"raw": resp.text}
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=payload)
+
+    return payload
+
+
+async def _get_underlying_price(symbol: str, token: str) -> float:
+    payload = await _fetch_quotes([symbol], token)
+    items = payload.get("data", {}).get("items", [])
+    if not items:
+        raise HTTPException(status_code=500, detail="No quote data returned")
+
+    item = items[0]
+    for field in ("mark", "last", "mid", "close"):
+        value = _to_float(item.get(field))
+        if value is not None:
+            return value
+
+    raise HTTPException(status_code=500, detail="Could not determine underlying price")
+
+
+def _extract_expirations(chain_payload: Any, min_dte: int, max_dte: int) -> List[Dict[str, Any]]:
+    items = chain_payload.get("data", {}).get("items", [])
+    expirations: List[Dict[str, Any]] = []
+    seen = set()
+
+    for item in items:
+        dte = item.get("days-to-expiration")
+        expiration_date = item.get("expiration-date")
+        if dte is None or expiration_date is None:
+            continue
+
+        dte_int = int(dte)
+        if min_dte <= dte_int <= max_dte:
+            key = (expiration_date, dte_int)
+            if key not in seen:
+                seen.add(key)
+                expirations.append(
+                    {
+                        "expiration_date": expiration_date,
+                        "days_to_expiration": dte_int,
+                    }
+                )
+
+    expirations.sort(key=lambda x: (x["days_to_expiration"], x["expiration_date"]))
+    return expirations
+
+
+def _build_near_contracts(
+    chain_payload: Any,
+    expiration_date: str,
+    option_type: str,
+    underlying_price: float,
+) -> List[Dict[str, Any]]:
+    items = chain_payload.get("data", {}).get("items", [])
+    contracts: List[Dict[str, Any]] = []
+
+    for item in items:
+        if item.get("expiration-date") != expiration_date:
+            continue
+        if item.get("option-type") != option_type:
+            continue
+
+        strike_value = _to_float(item.get("strike-price"))
+        if strike_value is None:
+            continue
+
+        contracts.append(
+            {
+                "symbol": item.get("symbol"),
+                "strike_price": strike_value,
+                "distance_from_underlying": round(abs(strike_value - underlying_price), 4),
+                "expiration_date": item.get("expiration-date"),
+                "days_to_expiration": item.get("days-to-expiration"),
+                "option_type": item.get("option-type"),
+            }
+        )
+
+    contracts.sort(key=lambda x: (x["distance_from_underlying"], x["strike_price"]))
+    return contracts
+
+
+def _merge_quotes_into_contracts(
+    near_contracts: List[Dict[str, Any]],
+    quote_payload: Any,
+) -> List[Dict[str, Any]]:
+    quote_items = quote_payload.get("data", {}).get("items", [])
+    quote_map = {item.get("symbol"): item for item in quote_items}
+
+    merged: List[Dict[str, Any]] = []
+    for contract in near_contracts:
+        quote = quote_map.get(contract["symbol"], {})
+        merged.append(
+            {
+                **contract,
+                "bid": quote.get("bid"),
+                "ask": quote.get("ask"),
+                "mid": quote.get("mid"),
+                "mark": quote.get("mark"),
+                "last": quote.get("last"),
+            }
+        )
+
+    return merged
+
+
+def _generate_debit_spread_candidates(
+    contracts: List[Dict[str, Any]],
+    underlying_price: float,
+    option_type: str,
+    width_min: float,
+    width_max: float,
+    risk_min_dollars: float,
+    risk_max_dollars: float,
+    hard_max_dollars: float,
+    enforce_hard_max: bool,
+    only_preferred: bool,
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    target_risk_mid = (risk_min_dollars + risk_max_dollars) / 2.0
+
+    ordered = sorted(contracts, key=lambda c: (c["strike_price"] is None, c["strike_price"]))
+
+    for i in range(len(ordered)):
+        for j in range(i + 1, len(ordered)):
+            left = ordered[i]
+            right = ordered[j]
+
+            left_strike = _to_float(left.get("strike_price"))
+            right_strike = _to_float(right.get("strike_price"))
+            if left_strike is None or right_strike is None:
+                continue
+
+            width = round(abs(right_strike - left_strike), 4)
+            if width < width_min or width > width_max:
+                continue
+
+            if option_type == "C":
+                long_leg = left
+                short_leg = right
+            else:
+                long_leg = right
+                short_leg = left
+
+            long_price = _best_price(long_leg)
+            short_price = _best_price(short_leg)
+            if long_price is None or short_price is None:
+                continue
+
+            est_debit = round(long_price - short_price, 4)
+            if est_debit <= 0:
+                continue
+
+            max_loss_dollars_1lot = round(est_debit * 100, 2)
+            max_profit_dollars_1lot = round((width - est_debit) * 100, 2)
+            feasibility_pass = (1.6 * est_debit) <= width
+            within_hard_max = max_loss_dollars_1lot <= hard_max_dollars
+            preferred_risk_band_pass = risk_min_dollars <= max_loss_dollars_1lot <= risk_max_dollars
+
+            if enforce_hard_max and not within_hard_max:
+                continue
+            if only_preferred and not preferred_risk_band_pass:
+                continue
+
+            long_strike = _to_float(long_leg.get("strike_price")) or 0.0
+
+            long_bid = _to_float(long_leg.get("bid"))
+            long_ask = _to_float(long_leg.get("ask"))
+            long_mid = _to_float(long_leg.get("mid")) or _to_float(long_leg.get("mark"))
+            short_bid = _to_float(short_leg.get("bid"))
+            short_ask = _to_float(short_leg.get("ask"))
+            short_mid = _to_float(short_leg.get("mid")) or _to_float(short_leg.get("mark"))
+
+            natural_debit = None
+            if long_ask is not None and short_bid is not None:
+                natural_debit = round(long_ask - short_bid, 4)
+
+            bid_debit = None
+            if long_bid is not None and short_ask is not None:
+                bid_debit = round(long_bid - short_ask, 4)
+
+            spread_market_width = None
+            if natural_debit is not None and bid_debit is not None:
+                spread_market_width = round(natural_debit - bid_debit, 4)
+
+            entry_slippage_vs_mid = None
+            if natural_debit is not None:
+                entry_slippage_vs_mid = round(max(natural_debit - est_debit, 0.0), 4)
+
+            long_leg_width = None
+            if long_bid is not None and long_ask is not None:
+                long_leg_width = round(long_ask - long_bid, 4)
+
+            short_leg_width = None
+            if short_bid is not None and short_ask is not None:
+                short_leg_width = round(short_ask - short_bid, 4)
+
+            candidates.append(
+                {
+                    "long_symbol": long_leg.get("symbol"),
+                    "short_symbol": short_leg.get("symbol"),
+                    "long_strike": left_strike if option_type == "C" else right_strike,
+                    "short_strike": right_strike if option_type == "C" else left_strike,
+                    "width": width,
+                    "est_debit": est_debit,
+                    "max_loss_dollars_1lot": max_loss_dollars_1lot,
+                    "max_profit_dollars_1lot": max_profit_dollars_1lot,
+                    "risk_reward": round(max_profit_dollars_1lot / max_loss_dollars_1lot, 4) if max_loss_dollars_1lot > 0 else None,
+                    "feasibility_pass": feasibility_pass,
+                    "preferred_risk_band_pass": preferred_risk_band_pass,
+                    "within_hard_max": within_hard_max,
+                    "fits_risk_budget": preferred_risk_band_pass and within_hard_max,
+                    "long_distance_from_underlying": round(abs(long_strike - underlying_price), 4),
+                    "distance_from_target_risk_mid": round(abs(max_loss_dollars_1lot - target_risk_mid), 2),
+                    "long_bid": _round_or_none(long_bid),
+                    "long_ask": _round_or_none(long_ask),
+                    "long_mid": _round_or_none(long_mid),
+                    "short_bid": _round_or_none(short_bid),
+                    "short_ask": _round_or_none(short_ask),
+                    "short_mid": _round_or_none(short_mid),
+                    "natural_debit": _round_or_none(natural_debit),
+                    "bid_debit": _round_or_none(bid_debit),
+                    "spread_market_width": _round_or_none(spread_market_width),
+                    "entry_slippage_vs_mid": _round_or_none(entry_slippage_vs_mid),
+                    "long_leg_width": _round_or_none(long_leg_width),
+                    "short_leg_width": _round_or_none(short_leg_width),
+                    "long_leg_width_pct_of_mid": _calc_pct_of_mid(long_bid, long_ask, long_mid),
+                    "short_leg_width_pct_of_mid": _calc_pct_of_mid(short_bid, short_ask, short_mid),
+                }
+            )
+
+    candidates.sort(
+        key=lambda x: (
+            not x["fits_risk_budget"],
+            not x["feasibility_pass"],
+            x["distance_from_target_risk_mid"],
+            x["long_distance_from_underlying"],
+            x["width"],
+            x["est_debit"],
+        )
+    )
+    return candidates
+
+
+def _candidate_liquidity_pass(candidate: Dict[str, Any]) -> bool:
+    liquidity_ctx = _classify_liquidity(
+        candidate.get("entry_slippage_vs_mid"),
+        candidate.get("long_leg_width_pct_of_mid"),
+        candidate.get("short_leg_width_pct_of_mid"),
+    )
+    return liquidity_ctx.get("liquidity_pass") is True
+
+
+
+def _select_shortlist(all_candidates: List[Dict[str, Any]], allow_fallback: bool) -> Dict[str, Any]:
+    preferred = [c for c in all_candidates if c["feasibility_pass"] and c["fits_risk_budget"]]
+    fallback = [c for c in all_candidates if c["feasibility_pass"] and c["within_hard_max"]]
+
+    preferred_liquid = [c for c in preferred if _candidate_liquidity_pass(c)]
+    fallback_liquid = [c for c in fallback if _candidate_liquidity_pass(c)]
+
+    if preferred_liquid:
+        selected = preferred_liquid
+        selection_mode = "preferred"
+        reason = "Using candidates that pass feasibility, preferred risk band, hard max, and liquidity."
+    elif allow_fallback and fallback_liquid:
+        selected = fallback_liquid
+        selection_mode = "fallback"
+        reason = "No preferred liquid candidates found. Using feasible liquid candidates that still stay under hard max."
+    else:
+        selected = []
+        selection_mode = "none"
+        reason = "No feasible liquid candidates found for the current filters."
+
+    return {
+        "selection_mode": selection_mode,
+        "reason": reason,
+        "preferred_count": len(preferred_liquid),
+        "fallback_count": len(fallback_liquid),
+        "primary_candidate": selected[0] if len(selected) >= 1 else None,
+        "backup_candidate": selected[1] if len(selected) >= 2 else None,
+    }
+
+
+def _compact_candidate(candidate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not candidate:
+        return None
+    return {
+        "long_symbol": candidate.get("long_symbol"),
+        "short_symbol": candidate.get("short_symbol"),
+        "long_strike": candidate.get("long_strike"),
+        "short_strike": candidate.get("short_strike"),
+        "width": candidate.get("width"),
+        "est_debit": candidate.get("est_debit"),
+        "max_loss_dollars_1lot": candidate.get("max_loss_dollars_1lot"),
+        "max_profit_dollars_1lot": candidate.get("max_profit_dollars_1lot"),
+        "risk_reward": candidate.get("risk_reward"),
+        "feasibility_pass": candidate.get("feasibility_pass"),
+        "fits_risk_budget": candidate.get("fits_risk_budget"),
+        "distance_from_target_risk_mid": candidate.get("distance_from_target_risk_mid"),
+        "natural_debit": candidate.get("natural_debit"),
+        "bid_debit": candidate.get("bid_debit"),
+        "spread_market_width": candidate.get("spread_market_width"),
+        "entry_slippage_vs_mid": candidate.get("entry_slippage_vs_mid"),
+        "long_leg_width": candidate.get("long_leg_width"),
+        "short_leg_width": candidate.get("short_leg_width"),
+        "long_leg_width_pct_of_mid": candidate.get("long_leg_width_pct_of_mid"),
+        "short_leg_width_pct_of_mid": candidate.get("short_leg_width_pct_of_mid"),
+    }
+
+
+def _compact_ticker_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "symbol": summary.get("symbol"),
+        "verdict": summary.get("verdict"),
+        "selection_mode": summary.get("selection_mode"),
+        "expiration_date": summary.get("expiration_date"),
+        "days_to_expiration": summary.get("days_to_expiration"),
+        "underlying_price": summary.get("underlying_price"),
+        "preferred_count": summary.get("preferred_count"),
+        "fallback_count": summary.get("fallback_count"),
+        "reason": summary.get("reason"),
+        "primary_candidate": _compact_candidate(summary.get("primary_candidate")),
+        "backup_candidate": _compact_candidate(summary.get("backup_candidate")),
+    }
+
+
+def _apply_engine_liquidity_gate(ticker_summaries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    liquidity_ready: List[Dict[str, Any]] = []
+    liquidity_failed_symbols: List[str] = []
+    liquidity_unconfirmed_symbols: List[str] = []
+
+    for summary in ticker_summaries:
+        primary_candidate = summary.get("primary_candidate")
+        liquidity_block = _build_liquidity_block(primary_candidate)
+
+        summary["engine_liquidity_context"] = liquidity_block
+        summary["engine_liquidity_pass"] = liquidity_block.get("liquidity_pass")
+
+        if primary_candidate is None:
+            continue
+
+        if liquidity_block.get("liquidity_pass") is True:
+            liquidity_ready.append(summary)
+        elif liquidity_block.get("liquidity_pass") is False:
+            liquidity_failed_symbols.append(summary.get("symbol"))
+        else:
+            liquidity_unconfirmed_symbols.append(summary.get("symbol"))
+
+    if liquidity_ready:
+        return {
+            "ranked_summaries": _rank_ticker_summaries(liquidity_ready),
+            "liquidity_gate_applied": True,
+            "liquidity_gate_reason": "Liquidity-failed candidates were removed before engine best-ticker selection.",
+            "liquidity_failed_symbols": liquidity_failed_symbols,
+            "liquidity_unconfirmed_symbols": liquidity_unconfirmed_symbols,
+        }
+
+    return {
+        "ranked_summaries": _rank_ticker_summaries(ticker_summaries),
+        "liquidity_gate_applied": False,
+        "liquidity_gate_reason": "No liquidity-passing candidates were available, so the engine fell back to the original ranked list.",
+        "liquidity_failed_symbols": liquidity_failed_symbols,
+        "liquidity_unconfirmed_symbols": liquidity_unconfirmed_symbols,
+    }
+
+
+def _rank_ticker_summaries(ticker_summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        ticker_summaries,
+        key=lambda x: (
+            {"ACTIVE_NOW": 0, "PENDING": 1, "NO_TRADE": 2}.get(x["verdict"], 3),
+            x["primary_candidate"]["distance_from_target_risk_mid"] if x.get("primary_candidate") else 999999,
+            SYMBOL_ORDER.index(x["symbol"]) if x["symbol"] in SYMBOL_ORDER else 999999,
+        ),
+    )
+
+
+async def _build_ticker_summary(
+    symbol: str,
+    option_type: str,
+    min_dte: int,
+    max_dte: int,
+    near_limit: int,
+    width_min: float,
+    width_max: float,
+    risk_min_dollars: float,
+    risk_max_dollars: float,
+    hard_max_dollars: float,
+    allow_fallback: bool,
+    token: str,
+) -> Dict[str, Any]:
+    chain_payload = await _fetch_option_chain(symbol, token)
+    expirations = _extract_expirations(chain_payload, min_dte, max_dte)
+
+    if not expirations:
+        return {
+            "symbol": symbol,
+            "verdict": "NO_TRADE",
+            "reason": "No expirations found in requested DTE range.",
+            "selection_mode": "none",
+            "expiration_date": None,
+            "days_to_expiration": None,
+            "underlying_price": None,
+            "preferred_count": 0,
+            "fallback_count": 0,
+            "primary_candidate": None,
+            "backup_candidate": None,
+        }
+
+    chosen_expiration = expirations[0]
+    underlying_price = await _get_underlying_price(symbol, token)
+
+    near_contracts = _build_near_contracts(
+        chain_payload=chain_payload,
+        expiration_date=chosen_expiration["expiration_date"],
+        option_type=option_type,
+        underlying_price=underlying_price,
+    )[:near_limit]
+
+    option_symbols = [c["symbol"] for c in near_contracts if c.get("symbol")]
+    quote_payload = await _fetch_option_quotes(option_symbols, token)
+    merged_contracts = _merge_quotes_into_contracts(near_contracts, quote_payload)
+
+    all_candidates = _generate_debit_spread_candidates(
+        contracts=merged_contracts,
+        underlying_price=underlying_price,
+        option_type=option_type,
+        width_min=width_min,
+        width_max=width_max,
+        risk_min_dollars=risk_min_dollars,
+        risk_max_dollars=risk_max_dollars,
+        hard_max_dollars=hard_max_dollars,
+        enforce_hard_max=True,
+        only_preferred=False,
+    )
+
+    shortlist = _select_shortlist(all_candidates, allow_fallback)
+
+    if shortlist["selection_mode"] == "preferred":
+        verdict = "ACTIVE_NOW"
+    elif shortlist["selection_mode"] == "fallback":
+        verdict = "PENDING"
+    else:
+        verdict = "NO_TRADE"
+
+    return {
+        "symbol": symbol,
+        "verdict": verdict,
+        "reason": shortlist["reason"],
+        "selection_mode": shortlist["selection_mode"],
+        "expiration_date": chosen_expiration["expiration_date"],
+        "days_to_expiration": chosen_expiration["days_to_expiration"],
+        "underlying_price": underlying_price,
+        "preferred_count": shortlist["preferred_count"],
+        "fallback_count": shortlist["fallback_count"],
+        "primary_candidate": shortlist["primary_candidate"],
+        "backup_candidate": shortlist["backup_candidate"],
+    }
+
+
+async def _build_summary_compact_payload(
+    option_type: str,
+    min_dte: int,
+    max_dte: int,
+    near_limit: int,
+    width_min: float,
+    width_max: float,
+    risk_min_dollars: float,
+    risk_max_dollars: float,
+    hard_max_dollars: float,
+    allow_fallback: bool,
+    token: str,
+) -> Dict[str, Any]:
+    clean_option_type = _clean_option_type(option_type)
+    ticker_summaries = []
+
+    for symbol in SYMBOL_ORDER:
+        summary = await _build_ticker_summary(
+            symbol=symbol,
+            option_type=clean_option_type,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            near_limit=near_limit,
+            width_min=width_min,
+            width_max=width_max,
+            risk_min_dollars=risk_min_dollars,
+            risk_max_dollars=risk_max_dollars,
+            hard_max_dollars=hard_max_dollars,
+            allow_fallback=allow_fallback,
+            token=token,
+        )
+        ticker_summaries.append(summary)
+
+    engine_gate = _apply_engine_liquidity_gate(ticker_summaries)
+    ranked = engine_gate["ranked_summaries"]
+    best_summary = ranked[0] if ranked else None
+    best_ticker = best_summary["symbol"] if best_summary and best_summary.get("primary_candidate") else None
+    verdict = best_summary["verdict"] if best_summary else "NO_TRADE"
+
+    return {
+        "ok": True,
+        "verdict": verdict,
+        "best_ticker": best_ticker,
+        "candidate_sort_reason": {
+            **_candidate_sort_reason_from_best(best_summary),
+            "liquidity_gate_applied": engine_gate["liquidity_gate_applied"],
+            "liquidity_gate_reason": engine_gate["liquidity_gate_reason"],
+            "liquidity_failed_symbols": engine_gate["liquidity_failed_symbols"],
+            "liquidity_unconfirmed_symbols": engine_gate["liquidity_unconfirmed_symbols"],
+        },
+        "selection_mode": best_summary["selection_mode"] if best_summary else "none",
+        "reason": best_summary["reason"] if best_summary else "No summary available.",
+        "primary_candidate": _compact_candidate(best_summary["primary_candidate"]) if best_summary else None,
+        "backup_candidate": _compact_candidate(best_summary["backup_candidate"]) if best_summary else None,
+        "ticker_summaries": [_compact_ticker_summary(s) for s in ticker_summaries],
+    }
+
+
+def _candidate_sort_reason_from_best(best_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    primary = (best_summary or {}).get("primary_candidate") or {}
+    return {
+        "best_ticker": (best_summary or {}).get("symbol"),
+        "selection_mode": (best_summary or {}).get("selection_mode"),
+        "reason": (best_summary or {}).get("reason"),
+        "distance_from_target_risk_mid": primary.get("distance_from_target_risk_mid"),
+        "feasibility_pass": primary.get("feasibility_pass"),
+        "fits_risk_budget": primary.get("fits_risk_budget"),
+    }
+
+
+def _normalize_engine_verdict_for_session(
+    verdict: Optional[str],
+    has_primary_candidate: bool,
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> str:
+    current = verdict or "NO_TRADE"
+
+    if not has_primary_candidate:
+        return "NO_TRADE"
+
+    if current != "ACTIVE_NOW":
+        return current
+
+    if not market_context.get("is_open"):
+        return "PENDING"
+
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return "PENDING"
+
+    return current
+
+
+def _normalize_engine_summary_for_session(
+    summary_payload: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> Dict[str, Any]:
+    normalized = {**summary_payload}
+    original_summaries = summary_payload.get("ticker_summaries", [])
+    normalized_summaries: List[Dict[str, Any]] = []
+
+    for summary in original_summaries:
+        updated = {**summary}
+        updated["verdict"] = _normalize_engine_verdict_for_session(
+            verdict=summary.get("verdict"),
+            has_primary_candidate=bool(summary.get("primary_candidate")),
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+        )
+        normalized_summaries.append(updated)
+
+    normalized["ticker_summaries"] = normalized_summaries
+
+    best_ticker = normalized.get("best_ticker")
+    best_summary = next(
+        (summary for summary in normalized_summaries if summary.get("symbol") == best_ticker),
+        None,
+    )
+
+    if best_summary:
+        normalized["verdict"] = best_summary.get("verdict", "NO_TRADE")
+        normalized["reason"] = best_summary.get("reason", normalized.get("reason"))
+        normalized["selection_mode"] = best_summary.get("selection_mode", normalized.get("selection_mode", "none"))
+        normalized["primary_candidate"] = best_summary.get("primary_candidate")
+        normalized["backup_candidate"] = best_summary.get("backup_candidate")
+    else:
+        normalized["verdict"] = _normalize_engine_verdict_for_session(
+            verdict=summary_payload.get("verdict"),
+            has_primary_candidate=bool(summary_payload.get("primary_candidate")),
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+        )
+
+    return normalized
+
+
+async def _build_chart_check_payload(symbol: str, token: str) -> Dict[str, Any]:
+    snapshot = await get_1h_ema50_snapshot(
+        symbol=symbol,
+        access_token=token,
+        api_base=API_BASE,
+        user_agent=USER_AGENT,
+        days_back=14,
+    )
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "session_basis": _build_session_basis_context(),
+        "latest_close": snapshot["latest_close"],
+        "ema50_1h": snapshot["ema50_1h"],
+        "price_vs_ema50_1h": snapshot["price_vs_ema50_1h"],
+        "latest_candle_time": snapshot["latest_candle_time"],
+        "candle_count": snapshot["candle_count"],
+        "recent_candles": snapshot.get("recent_candles", []),
+        "_all_candles": snapshot.get("all_candles", []),
+    }
+
+
+def _calc_ema(values: List[float], length: int) -> Optional[float]:
+    if not values:
+        return None
+    multiplier = 2 / (length + 1)
+    ema = values[0]
+    for value in values[1:]:
+        ema = ((value - ema) * multiplier) + ema
+    return round(ema, 4)
+
+
+
+
+def _calc_atr(candles: List[Dict[str, Any]], length: int = 14) -> Optional[float]:
+    if not candles or length <= 0:
+        return None
+
+    valid: List[Dict[str, float]] = []
+    for candle in candles:
+        high = _to_float(candle.get("high"))
+        low = _to_float(candle.get("low"))
+        close = _to_float(candle.get("close"))
+        if high is None or low is None or close is None:
+            continue
+        valid.append({"high": high, "low": low, "close": close})
+
+    if len(valid) < 2:
+        return None
+
+    true_ranges: List[float] = []
+    prev_close = valid[0]["close"]
+
+    for candle in valid[1:]:
+        high = candle["high"]
+        low = candle["low"]
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+        true_ranges.append(tr)
+        prev_close = candle["close"]
+
+    if not true_ranges:
+        return None
+
+    if len(true_ranges) < length:
+        return round(sum(true_ranges) / len(true_ranges), 4)
+
+    atr = sum(true_ranges[:length]) / length
+    for tr in true_ranges[length:]:
+        atr = ((atr * (length - 1)) + tr) / length
+
+    return round(atr, 4)
+
+def _candles_by_day_et(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    ordered_days: List[str] = []
+
+    for candle in candles:
+        ts = datetime.fromisoformat(candle["time_iso"]).astimezone(NY_TZ)
+        day_key = ts.date().isoformat()
+        if day_key not in grouped:
+            grouped[day_key] = {
+                "date": day_key,
+                "open": candle["open"],
+                "high": candle["high"],
+                "low": candle["low"],
+                "close": candle["close"],
+            }
+            ordered_days.append(day_key)
+        else:
+            grouped[day_key]["high"] = max(grouped[day_key]["high"], candle["high"])
+            grouped[day_key]["low"] = min(grouped[day_key]["low"], candle["low"])
+            grouped[day_key]["close"] = candle["close"]
+
+    return [grouped[day] for day in ordered_days]
+
+
+def _calc_adx(candles: List[Dict[str, Any]], length: int = 14) -> Dict[str, Any]:
+    """
+    Wilder-style 1H ADX with a softer minimum-history requirement.
+
+    Goal:
+    - keep SAFE-FAST response shape unchanged
+    - avoid null ADX when there is enough recent 1H history to derive a usable read
+    - preserve ADX as a secondary filter only
+    """
+    if not candles or length <= 0:
+        return {
+            "adx_value_1h": None,
+            "plus_di_1h": None,
+            "minus_di_1h": None,
+            "adx_trend": "unconfirmed",
+            "chop_risk_from_adx": None,
+        }
+
+    valid: List[Dict[str, float]] = []
+    for candle in candles:
+        high = _to_float(candle.get("high"))
+        low = _to_float(candle.get("low"))
+        close = _to_float(candle.get("close"))
+        if high is None or low is None or close is None:
+            continue
+        valid.append({"high": high, "low": low, "close": close})
+
+    minimum_bars = max(length + 1, 6)
+    if len(valid) < minimum_bars:
+        return {
+            "adx_value_1h": None,
+            "plus_di_1h": None,
+            "minus_di_1h": None,
+            "adx_trend": "unconfirmed",
+            "chop_risk_from_adx": None,
+        }
+
+    trs: List[float] = []
+    plus_dm_values: List[float] = []
+    minus_dm_values: List[float] = []
+
+    for i in range(1, len(valid)):
+        current = valid[i]
+        prev = valid[i - 1]
+
+        up_move = current["high"] - prev["high"]
+        down_move = prev["low"] - current["low"]
+
+        plus_dm = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+        tr = max(
+            current["high"] - current["low"],
+            abs(current["high"] - prev["close"]),
+            abs(current["low"] - prev["close"]),
+        )
+
+        trs.append(tr)
+        plus_dm_values.append(plus_dm)
+        minus_dm_values.append(minus_dm)
+
+    if len(trs) < 2:
+        return {
+            "adx_value_1h": None,
+            "plus_di_1h": None,
+            "minus_di_1h": None,
+            "adx_trend": "unconfirmed",
+            "chop_risk_from_adx": None,
+        }
+
+    period = min(length, len(trs))
+    tr_n = sum(trs[:period])
+    plus_dm_n = sum(plus_dm_values[:period])
+    minus_dm_n = sum(minus_dm_values[:period])
+
+    def _di_and_dx(smoothed_tr: float, smoothed_plus_dm: float, smoothed_minus_dm: float) -> Dict[str, float]:
+        if smoothed_tr <= 0:
+            plus_di_local = 0.0
+            minus_di_local = 0.0
+            dx_local = 0.0
+        else:
+            plus_di_local = 100.0 * (smoothed_plus_dm / smoothed_tr)
+            minus_di_local = 100.0 * (smoothed_minus_dm / smoothed_tr)
+            denom = plus_di_local + minus_di_local
+            dx_local = 0.0 if denom <= 0 else 100.0 * abs(plus_di_local - minus_di_local) / denom
+        return {
+            "plus_di": plus_di_local,
+            "minus_di": minus_di_local,
+            "dx": dx_local,
+        }
+
+    first_values = _di_and_dx(tr_n, plus_dm_n, minus_dm_n)
+    dx_values: List[float] = [first_values["dx"]]
+    plus_di = first_values["plus_di"]
+    minus_di = first_values["minus_di"]
+
+    for i in range(period, len(trs)):
+        tr_n = tr_n - (tr_n / period) + trs[i]
+        plus_dm_n = plus_dm_n - (plus_dm_n / period) + plus_dm_values[i]
+        minus_dm_n = minus_dm_n - (minus_dm_n / period) + minus_dm_values[i]
+
+        values = _di_and_dx(tr_n, plus_dm_n, minus_dm_n)
+        plus_di = values["plus_di"]
+        minus_di = values["minus_di"]
+        dx_values.append(values["dx"])
+
+    if not dx_values:
+        return {
+            "adx_value_1h": None,
+            "plus_di_1h": round(plus_di, 3) if plus_di is not None else None,
+            "minus_di_1h": round(minus_di, 3) if minus_di is not None else None,
+            "adx_trend": "unconfirmed",
+            "chop_risk_from_adx": None,
+        }
+
+    adx_seed_period = min(period, len(dx_values))
+    first_adx = sum(dx_values[:adx_seed_period]) / adx_seed_period
+    adx_series: List[float] = [first_adx]
+    for dx in dx_values[adx_seed_period:]:
+        adx_series.append(((adx_series[-1] * (period - 1)) + dx) / period)
+
+    adx_value = adx_series[-1] if adx_series else None
+    adx_prev = adx_series[-2] if len(adx_series) >= 2 else None
+
+    if adx_value is None:
+        adx_trend = "unconfirmed"
+    elif adx_prev is None:
+        adx_trend = "flat"
+    else:
+        delta = adx_value - adx_prev
+        if delta > 0.25:
+            adx_trend = "rising"
+        elif delta < -0.25:
+            adx_trend = "falling"
+        else:
+            adx_trend = "flat"
+
+    chop_risk_from_adx = None
+    if adx_value is not None:
+        chop_risk_from_adx = bool(adx_value < 18 or adx_trend in {"flat", "falling"})
+
+    return {
+        "adx_value_1h": round(adx_value, 3) if adx_value is not None else None,
+        "plus_di_1h": round(plus_di, 3) if plus_di is not None else None,
+        "minus_di_1h": round(minus_di, 3) if minus_di is not None else None,
+        "adx_trend": adx_trend,
+        "chop_risk_from_adx": chop_risk_from_adx,
+    }
+
+
+def _condense_levels(levels: List[float], tolerance: float, descending: bool = False) -> List[float]:
+    ordered = sorted(levels, reverse=descending)
+    out: List[float] = []
+    for level in ordered:
+        if not out or abs(level - out[-1]) > tolerance:
+            out.append(level)
+    return out
+
+
+def _derive_room_reference_price(
+    latest_close: float,
+    ema50_1h: float,
+) -> float:
+    """
+    Room should be judged from the mapped entry area, not only from the stretched last print.
+    Use a blended reference biased toward the 1H EMA so late prints do not instantly collapse room.
+    """
+    return round(ema50_1h + ((latest_close - ema50_1h) * 0.33), 4)
+
+
+def _find_wall_levels(
+    candles: List[Dict[str, Any]],
+    latest_close: float,
+    option_type: str,
+) -> Dict[str, Any]:
+    if not candles:
+        return {
+            "first_wall": None,
+            "next_pocket": None,
+            "room_distance": None,
+            "room_ratio": None,
+            "room_pass": None,
+        }
+
+    window = candles[-35:] if len(candles) >= 35 else candles
+    tolerance = max(latest_close * 0.0015, 0.10)
+    meaningful_gap = max(latest_close * 0.0004, 0.10)
+
+    if option_type == "C":
+        candidate_levels = [
+            round(c["high"], 2)
+            for c in window
+            if _to_float(c.get("high")) is not None and c["high"] > (latest_close + meaningful_gap)
+        ]
+        if not candidate_levels:
+            candidate_levels = [
+                round(c["high"], 2)
+                for c in window
+                if _to_float(c.get("high")) is not None and c["high"] > latest_close
+            ]
+        levels = _condense_levels(candidate_levels, tolerance, descending=False)
+        first_wall = levels[0] if levels else None
+        next_pocket = levels[1] if len(levels) > 1 else None
+
+        if levels:
+            cluster_span = levels[-1] - levels[0]
+            nearest_gap = levels[0] - latest_close if levels[0] is not None else None
+            farthest_gap = levels[-1] - latest_close if levels[-1] is not None else None
+            stale_top_cluster_cleared = bool(
+                len(levels) <= 3
+                and cluster_span <= max(tolerance * 1.25, latest_close * 0.0012, 0.20)
+                and nearest_gap is not None
+                and farthest_gap is not None
+                and nearest_gap <= max(latest_close * 0.0018, 0.35)
+                and farthest_gap <= max(latest_close * 0.0030, 0.60)
+            )
+            if stale_top_cluster_cleared:
+                first_wall = None
+                next_pocket = None
+    else:
+        candidate_levels = [
+            round(c["low"], 2)
+            for c in window
+            if _to_float(c.get("low")) is not None and c["low"] < (latest_close - meaningful_gap)
+        ]
+        if not candidate_levels:
+            candidate_levels = [
+                round(c["low"], 2)
+                for c in window
+                if _to_float(c.get("low")) is not None and c["low"] < latest_close
+            ]
+        levels = _condense_levels(candidate_levels, tolerance, descending=True)
+        first_wall = levels[0] if levels else None
+        next_pocket = levels[1] if len(levels) > 1 else None
+
+    return {
+        "first_wall": first_wall,
+        "next_pocket": next_pocket,
+        "room_distance": round(abs(first_wall - latest_close), 4) if first_wall is not None else None,
+    }
+
+
+def _recent_trading_day_candles(
+    candles: List[Dict[str, Any]],
+    max_days: int = 5,
+) -> List[Dict[str, Any]]:
+    if not candles or max_days <= 0:
+        return []
+
+    day_keys: List[str] = []
+    for candle in reversed(candles):
+        time_iso = candle.get("time_iso")
+        if not time_iso:
+            continue
+        try:
+            day_key = datetime.fromisoformat(time_iso).astimezone(NY_TZ).date().isoformat()
+        except Exception:
+            continue
+        if day_key not in day_keys:
+            day_keys.append(day_key)
+        if len(day_keys) >= max_days:
+            break
+
+    if not day_keys:
+        return candles[-35:] if len(candles) >= 35 else candles
+
+    allowed_days = set(day_keys)
+    out: List[Dict[str, Any]] = []
+    for candle in candles:
+        time_iso = candle.get("time_iso")
+        if not time_iso:
+            continue
+        try:
+            day_key = datetime.fromisoformat(time_iso).astimezone(NY_TZ).date().isoformat()
+        except Exception:
+            continue
+        if day_key in allowed_days:
+            out.append(candle)
+    return out
+
+
+def _find_hidden_left_wick_cluster(
+    candles: List[Dict[str, Any]],
+    latest_close: Optional[float],
+    option_type: str,
+) -> Dict[str, Any]:
+    if not candles or latest_close is None:
+        return {
+            "lookback_days": 5,
+            "cluster_found": None,
+            "side": "resistance" if option_type == "C" else "support",
+            "zone": None,
+            "nearest_level": None,
+            "distance_from_price": None,
+            "wick_count": 0,
+            "candidate_levels": [],
+            "why": "insufficient_candle_data",
+        }
+
+    recent = _recent_trading_day_candles(candles, max_days=5)
+    if not recent:
+        return {
+            "lookback_days": 5,
+            "cluster_found": None,
+            "side": "resistance" if option_type == "C" else "support",
+            "zone": None,
+            "nearest_level": None,
+            "distance_from_price": None,
+            "wick_count": 0,
+            "candidate_levels": [],
+            "why": "recent_trading_window_unavailable",
+        }
+
+    band = max(latest_close * 0.0025, 0.10)
+    side = "resistance" if option_type == "C" else "support"
+    candidate_levels: List[float] = []
+
+    for candle in recent:
+        open_value = _to_float(candle.get("open"))
+        high_value = _to_float(candle.get("high"))
+        low_value = _to_float(candle.get("low"))
+        close_value = _to_float(candle.get("close"))
+        if None in {open_value, high_value, low_value, close_value}:
+            continue
+
+        candle_range = max(high_value - low_value, 0.0001)
+        body = abs(close_value - open_value)
+        upper_wick = high_value - max(open_value, close_value)
+        lower_wick = min(open_value, close_value) - low_value
+
+        if option_type == "C":
+            qualifies = (
+                high_value > latest_close
+                and upper_wick >= max(body, candle_range * 0.30)
+            )
+            if qualifies:
+                candidate_levels.append(round(high_value, 4))
+        else:
+            qualifies = (
+                low_value < latest_close
+                and lower_wick >= max(body, candle_range * 0.30)
+            )
+            if qualifies:
+                candidate_levels.append(round(low_value, 4))
+
+    if len(candidate_levels) < 2:
+        return {
+            "lookback_days": 5,
+            "cluster_found": False,
+            "side": side,
+            "zone": None,
+            "nearest_level": None,
+            "distance_from_price": None,
+            "wick_count": len(candidate_levels),
+            "candidate_levels": sorted(candidate_levels),
+            "why": "no_hidden_cluster_detected",
+        }
+
+    ordered = sorted(candidate_levels) if option_type == "C" else sorted(candidate_levels, reverse=True)
+    current_cluster: List[float] = []
+    winning_cluster: Optional[List[float]] = None
+
+    for level in ordered:
+        if not current_cluster:
+            current_cluster = [level]
+            continue
+        if abs(level - current_cluster[-1]) <= band:
+            current_cluster.append(level)
+            continue
+        if len(current_cluster) >= 2:
+            winning_cluster = current_cluster
+            break
+        current_cluster = [level]
+
+    if winning_cluster is None and len(current_cluster) >= 2:
+        winning_cluster = current_cluster
+
+    if not winning_cluster:
+        return {
+            "lookback_days": 5,
+            "cluster_found": False,
+            "side": side,
+            "zone": None,
+            "nearest_level": None,
+            "distance_from_price": None,
+            "wick_count": len(candidate_levels),
+            "candidate_levels": ordered,
+            "why": "no_hidden_cluster_detected",
+        }
+
+    zone_low = round(min(winning_cluster), 4)
+    zone_high = round(max(winning_cluster), 4)
+    nearest_level = zone_low if option_type == "C" else zone_high
+    distance_from_price = round(abs(nearest_level - latest_close), 4)
+
+    return {
+        "lookback_days": 5,
+        "cluster_found": True,
+        "side": side,
+        "zone": {
+            "low": zone_low,
+            "high": zone_high,
+            "band_width": round(zone_high - zone_low, 4),
+        },
+        "nearest_level": nearest_level,
+        "distance_from_price": distance_from_price,
+        "wick_count": len(winning_cluster),
+        "candidate_levels": ordered,
+        "why": "hidden_left_wick_cluster_detected",
+    }
+
+
+def _compute_noisy_chop_detail(
+    candles: List[Dict[str, Any]],
+    ema50_1h: Optional[float],
+) -> Dict[str, Any]:
+    if not candles:
+        return {
+            "noisy_chop": None,
+            "overlap_rule_triggered": None,
+            "overlap_hits_last4": 0,
+            "ema_whipsaw_chop": None,
+            "ema_cross_back_count": 0,
+            "why": "no_candles_available",
+        }
+
+    recent = candles[-4:] if len(candles) >= 4 else candles
+    overlap_hits = 0
+    for index in range(1, len(recent)):
+        current = recent[index]
+        previous = recent[index - 1]
+        current_high = _to_float(current.get("high"))
+        current_low = _to_float(current.get("low"))
+        previous_high = _to_float(previous.get("high"))
+        previous_low = _to_float(previous.get("low"))
+        if None in {current_high, current_low, previous_high, previous_low}:
+            continue
+        overlap = max(0.0, min(current_high, previous_high) - max(current_low, previous_low))
+        current_range = max(current_high - current_low, 0.0001)
+        if (overlap / current_range) > 0.5:
+            overlap_hits += 1
+
+    overlap_rule_triggered = overlap_hits >= 3
+
+    ema_cross_back_count = 0
+    ema_whipsaw_chop = None
+    if ema50_1h is not None:
+        sides: List[int] = []
+        for candle in recent:
+            close_value = _to_float(candle.get("close"))
+            if close_value is None:
+                continue
+            if close_value > ema50_1h:
+                sides.append(1)
+            elif close_value < ema50_1h:
+                sides.append(-1)
+            else:
+                sides.append(0)
+
+        ema_cross_back_count = 0
+        for previous_side, current_side in zip(sides, sides[1:]):
+            if previous_side == 0 or current_side == 0:
+                continue
+            if previous_side != current_side:
+                ema_cross_back_count += 1
+
+        ema_whipsaw_chop = ema_cross_back_count >= 2
+
+    noisy_chop = bool(overlap_rule_triggered or ema_whipsaw_chop is True)
+
+    return {
+        "noisy_chop": noisy_chop,
+        "overlap_rule_triggered": overlap_rule_triggered,
+        "overlap_hits_last4": overlap_hits,
+        "ema_whipsaw_chop": ema_whipsaw_chop,
+        "ema_cross_back_count": ema_cross_back_count,
+        "why": (
+            "overlap_and_ema_whipsaw"
+            if overlap_rule_triggered and ema_whipsaw_chop
+            else "overlap_rule"
+            if overlap_rule_triggered
+            else "ema_whipsaw"
+            if ema_whipsaw_chop
+            else "no_explicit_noisy_chop_detected"
+        ),
+    }
+
+
+def _build_trap_check_context(structure_context: Dict[str, Any]) -> Dict[str, Any]:
+    if not structure_context.get("ok"):
+        return {
+            "trap_check_status": "unconfirmed",
+            "primary_trap": None,
+            "blockers": [],
+            "cautions": [],
+            "checks": {
+                "hidden_left_structure": {"status": "unconfirmed", "why": "structure_context_unavailable"},
+                "overextension_vs_ema": {"status": "unconfirmed", "why": "structure_context_unavailable"},
+                "volume_climax_exhaustion": {"status": "unconfirmed", "why": "structure_context_unavailable"},
+                "noisy_chop": {"status": "unconfirmed", "why": "structure_context_unavailable"},
+                "parabolic_exhaustion": {"status": "unconfirmed", "why": "structure_context_unavailable"},
+            },
+            "why_trap_check_passes_or_fails": "Trap check is unconfirmed because structure context is unavailable.",
+        }
+
+    hidden_left = structure_context.get("hidden_left_wick_cluster") or {}
+    hidden_left_ratio = _to_float(structure_context.get("hidden_left_distance_to_invalidation_ratio"))
+    hidden_left_confirms_room_trap = bool(structure_context.get("hidden_left_cluster_confirms_room_trap") is True)
+
+    if hidden_left.get("cluster_found") is True:
+        if hidden_left_confirms_room_trap or (hidden_left_ratio is not None and hidden_left_ratio < 2.0):
+            hidden_left_status = "fail"
+            hidden_left_why = "Hidden left-side wick cluster sits too close relative to invalidation distance."
+        else:
+            hidden_left_status = "caution"
+            hidden_left_why = "Hidden left-side wick cluster exists, but does not yet confirm a hard room trap."
+    elif hidden_left.get("cluster_found") is False:
+        hidden_left_status = "pass"
+        hidden_left_why = "No hidden left-side wick cluster was detected in the recent 5-day window."
+    else:
+        hidden_left_status = "unconfirmed"
+        hidden_left_why = hidden_left.get("why") or "Hidden left-side structure is unconfirmed."
+
+    extension_blocks_now = bool(structure_context.get("extension_blocks_now") is True)
+    extension_soft_flag = bool(structure_context.get("extension_soft_flag") is True)
+    extension_state = structure_context.get("extension_state")
+
+    if extension_blocks_now or extension_state == "extended":
+        overextension_status = "fail"
+        overextension_why = "Extension is currently blocking the setup."
+    elif extension_soft_flag or extension_state == "caution":
+        overextension_status = "caution"
+        overextension_why = "Extension is elevated, but only as a caution right now."
+    elif extension_state in {"acceptable", "pass"}:
+        overextension_status = "pass"
+        overextension_why = "Extension is not currently a trap."
+    else:
+        overextension_status = "unconfirmed"
+        overextension_why = "Extension status is unconfirmed."
+
+    if structure_context.get("volume_climax_exhaustion") is True:
+        volume_status = "fail"
+        volume_why = "Volume climax / exhaustion is present."
+    elif structure_context.get("volume_climax_exhaustion") is False:
+        volume_status = "pass"
+        volume_why = "No volume climax / exhaustion was detected."
+    else:
+        volume_status = "unconfirmed"
+        volume_why = "Volume climax / exhaustion is unconfirmed."
+
+    if structure_context.get("noisy_chop_explicit") is True:
+        noisy_chop_status = "fail"
+        noisy_chop_why = "Explicit noisy chop is present."
+    elif structure_context.get("valid_post_impulse_shelf_not_chop") is True:
+        noisy_chop_status = "pass"
+        noisy_chop_why = "Valid post-impulse shelf is not treated as chop."
+    elif structure_context.get("noisy_chop_explicit") is False:
+        noisy_chop_status = "pass"
+        noisy_chop_why = "No explicit noisy chop was detected."
+    else:
+        noisy_chop_status = "unconfirmed"
+        noisy_chop_why = "Noisy chop is unconfirmed."
+
+    if structure_context.get("parabolic_exhaustion") is True:
+        parabolic_status = "fail"
+        parabolic_why = "Parabolic / exhausted move behavior is present."
+    elif structure_context.get("parabolic_exhaustion") is False:
+        parabolic_status = "pass"
+        parabolic_why = "No parabolic / exhausted move behavior was detected."
+    else:
+        parabolic_status = "unconfirmed"
+        parabolic_why = "Parabolic / exhausted move behavior is unconfirmed."
+
+    checks = {
+        "hidden_left_structure": {
+            "status": hidden_left_status,
+            "why": hidden_left_why,
+            "side": hidden_left.get("side"),
+            "zone": hidden_left.get("zone"),
+            "nearest_level": hidden_left.get("nearest_level"),
+            "wick_count": hidden_left.get("wick_count"),
+            "distance_from_price": hidden_left.get("distance_from_price"),
+            "distance_to_invalidation_ratio": structure_context.get("hidden_left_distance_to_invalidation_ratio"),
+            "confirms_room_trap": structure_context.get("hidden_left_cluster_confirms_room_trap"),
+        },
+        "overextension_vs_ema": {
+            "status": overextension_status,
+            "why": overextension_why,
+            "extension_state": structure_context.get("extension_state"),
+            "pct_from_ema": structure_context.get("pct_from_ema"),
+            "atr_multiple_from_ema": structure_context.get("atr_multiple_from_ema"),
+            "extension_soft_flag": structure_context.get("extension_soft_flag"),
+            "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        },
+        "volume_climax_exhaustion": {
+            "status": volume_status,
+            "why": volume_why,
+            "volume_climax_exhaustion": structure_context.get("volume_climax_exhaustion"),
+        },
+        "noisy_chop": {
+            "status": noisy_chop_status,
+            "why": noisy_chop_why,
+            "noisy_chop_explicit": structure_context.get("noisy_chop_explicit"),
+            "overlap_hits_last4": structure_context.get("overlap_chop_hits_last4"),
+            "ema_whipsaw_chop": structure_context.get("ema_whipsaw_chop"),
+            "candle_overlap_chop_risk": structure_context.get("candle_overlap_chop_risk"),
+            "chop_risk": structure_context.get("chop_risk"),
+        },
+        "parabolic_exhaustion": {
+            "status": parabolic_status,
+            "why": parabolic_why,
+            "parabolic_exhaustion": structure_context.get("parabolic_exhaustion"),
+        },
+    }
+
+    blockers = [name for name, block in checks.items() if block.get("status") == "fail"]
+    cautions = [name for name, block in checks.items() if block.get("status") == "caution"]
+
+    if blockers:
+        trap_check_status = "fail"
+        primary_trap = blockers[0]
+        why = "One or more explicit trap checks are failing."
+    elif cautions:
+        trap_check_status = "caution"
+        primary_trap = cautions[0]
+        why = "Trap check is not failing, but one or more caution traps are active."
+    elif all(block.get("status") == "pass" for block in checks.values()):
+        trap_check_status = "pass"
+        primary_trap = None
+        why = "Explicit trap checks currently pass."
+    else:
+        trap_check_status = "unconfirmed"
+        primary_trap = None
+        why = "Trap check remains partly unconfirmed from the available chart inputs."
+
+    return {
+        "trap_check_status": trap_check_status,
+        "primary_trap": primary_trap,
+        "blockers": blockers,
+        "cautions": cautions,
+        "checks": checks,
+        "why_trap_check_passes_or_fails": why,
+    }
+
+
+def _twentyfour_hour_context(candles: List[Dict[str, Any]], option_type: str) -> Dict[str, Any]:
+    daily_bars = _candles_by_day_et(candles)
+    closes = [bar["close"] for bar in daily_bars if bar.get("close") is not None]
+
+    if len(closes) < 4:
+        return {
+            "label": "unconfirmed",
+            "supportive": None,
+            "source": "1h_aggregated_daily_proxy",
+        }
+
+    ema3 = _calc_ema(closes[-6:], 3)
+    ema5 = _calc_ema(closes[-6:], 5)
+    slope_up = ema3 is not None and ema5 is not None and ema3 > ema5 and closes[-1] > closes[-3]
+    slope_down = ema3 is not None and ema5 is not None and ema3 < ema5 and closes[-1] < closes[-3]
+
+    if slope_up:
+        label = "bullish"
+    elif slope_down:
+        label = "bearish"
+    else:
+        label = "mixed"
+
+    supportive = None
+    if option_type == "C":
+        supportive = True if label == "bullish" else False if label == "bearish" else None
+    else:
+        supportive = True if label == "bearish" else False if label == "bullish" else None
+
+    return {
+        "label": label,
+        "supportive": supportive,
+        "source": "1h_aggregated_daily_proxy",
+    }
+
+
+def _is_chop(candles: List[Dict[str, Any]]) -> bool:
+    if len(candles) < 4:
+        return False
+    recent = candles[-4:]
+    overlap_hits = 0
+    for i in range(1, len(recent)):
+        current = recent[i]
+        prev = recent[i - 1]
+        overlap = max(0.0, min(current["high"], prev["high"]) - max(current["low"], prev["low"]))
+        current_range = max(current["high"] - current["low"], 0.0001)
+        if (overlap / current_range) > 0.5:
+            overlap_hits += 1
+    return overlap_hits >= 3
+
+
+
+def _extension_state(
+    symbol: str,
+    latest_close: float,
+    ema50_1h: float,
+    first_wall: Optional[float],
+) -> Dict[str, Any]:
+    pct_from_ema_ratio = abs(latest_close - ema50_1h) / ema50_1h if ema50_1h else None
+    threshold_pct_by_symbol = {
+        "SPY": 0.75,
+        "QQQ": 0.85,
+        "IWM": 0.95,
+        "GLD": 1.05,
+    }
+    threshold_pct = threshold_pct_by_symbol.get(symbol, 0.85)
+    room_distance = abs(first_wall - latest_close) if first_wall is not None else None
+    move_ratio = (abs(latest_close - ema50_1h) / room_distance) if room_distance not in (None, 0) else None
+    pct_from_ema = round(pct_from_ema_ratio * 100, 3) if pct_from_ema_ratio is not None else None
+    universal_caution_pct = 0.40
+    extension_caution_0_40_pct = bool(pct_from_ema is not None and pct_from_ema >= universal_caution_pct)
+    move_ratio_caution = bool(move_ratio is not None and move_ratio >= 0.55)
+    hard_extension_threshold_hit = bool(pct_from_ema is not None and pct_from_ema >= threshold_pct)
+
+    return {
+        "state": "caution" if (extension_caution_0_40_pct or move_ratio_caution) else "acceptable",
+        "pct_from_ema": pct_from_ema,
+        "move_to_wall_ratio": round(move_ratio, 3) if move_ratio is not None else None,
+        "threshold_pct": threshold_pct,
+        "late_move": False,
+        "universal_extension_caution_pct": universal_caution_pct,
+        "extension_caution_0_40_pct": extension_caution_0_40_pct,
+        "extension_caution_note": "0.40% from the 1H EMA is a caution only, not a hard blocker.",
+        "baseline_extension_threshold_pct": threshold_pct,
+        "move_ratio_caution": move_ratio_caution,
+        "hard_extension_threshold_hit": hard_extension_threshold_hit,
+    }
+
+
+def _wall_thesis(
+
+    option_type: str,
+    primary_candidate: Optional[Dict[str, Any]],
+    first_wall: Optional[float],
+    next_pocket: Optional[float],
+    invalidation_distance: Optional[float],
+    latest_close: Optional[float] = None,
+) -> Dict[str, Any]:
+    if not primary_candidate or first_wall is None:
+        return {
+            "wall_thesis": "unconfirmed",
+            "effective_wall_thesis": "unconfirmed",
+            "wall_pass": None,
+            "next_pocket_room_ratio": None,
+            "current_price_beyond_first_wall": None,
+            "breakout_path_required": False,
+            "why": "wall_or_candidate_unconfirmed",
+        }
+
+    short_strike = _to_float(primary_candidate.get("short_strike"))
+    if short_strike is None:
+        return {
+            "wall_thesis": "unconfirmed",
+            "effective_wall_thesis": "unconfirmed",
+            "wall_pass": None,
+            "next_pocket_room_ratio": None,
+            "current_price_beyond_first_wall": None,
+            "breakout_path_required": False,
+            "why": "short_strike_unconfirmed",
+        }
+
+    next_pocket_room = None
+    if next_pocket is not None and invalidation_distance not in (None, 0):
+        next_pocket_room = abs(next_pocket - first_wall) / invalidation_distance
+
+    current_price_beyond_first_wall = None
+    if latest_close is not None:
+        if option_type == "C":
+            current_price_beyond_first_wall = latest_close > first_wall
+        else:
+            current_price_beyond_first_wall = latest_close < first_wall
+
+    strike_supports_to_wall = short_strike > first_wall if option_type == "C" else short_strike < first_wall
+    through_the_wall_available = bool(next_pocket is not None and (next_pocket_room or 0) >= 1.5)
+
+    if current_price_beyond_first_wall is True:
+        if through_the_wall_available:
+            return {
+                "wall_thesis": "THROUGH_THE_WALL_REQUIRED",
+                "effective_wall_thesis": "THROUGH_THE_WALL",
+                "wall_pass": True,
+                "next_pocket_room_ratio": next_pocket_room,
+                "current_price_beyond_first_wall": True,
+                "breakout_path_required": True,
+                "why": "price_is_already_through_first_wall",
+            }
+        return {
+            "wall_thesis": "THROUGH_THE_WALL_REQUIRED",
+            "effective_wall_thesis": "THROUGH_THE_WALL",
+            "wall_pass": False,
+            "next_pocket_room_ratio": next_pocket_room,
+            "current_price_beyond_first_wall": True,
+            "breakout_path_required": True,
+            "why": "price_is_through_first_wall_but_no_clear_next_pocket",
+        }
+
+    if strike_supports_to_wall:
+        return {
+            "wall_thesis": "TO_THE_WALL",
+            "effective_wall_thesis": "TO_THE_WALL",
+            "wall_pass": True,
+            "next_pocket_room_ratio": next_pocket_room,
+            "current_price_beyond_first_wall": current_price_beyond_first_wall,
+            "breakout_path_required": False,
+            "why": "to_the_wall_path",
+        }
+
+    if through_the_wall_available:
+        return {
+            "wall_thesis": "THROUGH_THE_WALL",
+            "effective_wall_thesis": "THROUGH_THE_WALL",
+            "wall_pass": True,
+            "next_pocket_room_ratio": next_pocket_room,
+            "current_price_beyond_first_wall": current_price_beyond_first_wall,
+            "breakout_path_required": False,
+            "why": "through_the_wall_path",
+        }
+
+    return {
+        "wall_thesis": "WALL_MISMATCH",
+        "effective_wall_thesis": "WALL_MISMATCH",
+        "wall_pass": False,
+        "next_pocket_room_ratio": next_pocket_room,
+        "current_price_beyond_first_wall": current_price_beyond_first_wall,
+        "breakout_path_required": False,
+        "why": "wall_thesis_and_strike_do_not_match",
+    }
+
+
+
+def _continuation_pair_overlaps(candle_a: Optional[Dict[str, Any]], candle_b: Optional[Dict[str, Any]]) -> bool:
+    high_a = _to_float((candle_a or {}).get("high"))
+    low_a = _to_float((candle_a or {}).get("low"))
+    high_b = _to_float((candle_b or {}).get("high"))
+    low_b = _to_float((candle_b or {}).get("low"))
+    if None in {high_a, low_a, high_b, low_b}:
+        return False
+    overlap = min(high_a, high_b) - max(low_a, low_b)
+    range_a = max(high_a - low_a, 0.0001)
+    range_b = max(high_b - low_b, 0.0001)
+    return bool(overlap > 0 and overlap >= min(range_a, range_b) * 0.20)
+
+
+def _build_continuation_window_snapshot(
+    *,
+    option_type: str,
+    shelf_candles: List[Dict[str, Any]],
+    pre_shelf_candles: List[Dict[str, Any]],
+    atr14: Optional[float],
+    ema50_1h: Optional[float],
+    current_price: Optional[float],
+    break_candle: Optional[Dict[str, Any]] = None,
+    room_pass: Optional[bool] = None,
+    extension_blocks_now: bool = False,
+) -> Dict[str, Any]:
+    highs = [_to_float(c.get("high")) for c in shelf_candles]
+    lows = [_to_float(c.get("low")) for c in shelf_candles]
+    opens = [_to_float(c.get("open")) for c in shelf_candles]
+    closes = [_to_float(c.get("close")) for c in shelf_candles]
+    valid_prices = all(v is not None for v in highs + lows + opens + closes)
+
+    fallback_atr = None
+    if atr14 not in (None, 0):
+        fallback_atr = float(atr14)
+    elif current_price not in (None, 0):
+        fallback_atr = max(float(current_price) * 0.0040, 0.50)
+
+    body_highs: List[float] = []
+    body_lows: List[float] = []
+    for candle_open, candle_close in zip(opens, closes):
+        if candle_open is None or candle_close is None:
+            continue
+        body_highs.append(max(candle_open, candle_close))
+        body_lows.append(min(candle_open, candle_close))
+
+    shelf_wick_high = max(highs) if valid_prices and highs else None
+    shelf_wick_low = min(lows) if valid_prices and lows else None
+    shelf_body_high = max(body_highs) if body_highs else None
+    shelf_body_low = min(body_lows) if body_lows else None
+
+    # PATCH: define the shelf ceiling/floor from the repeated body/close cluster, not the single wick extreme.
+    # Keep the wick extremes separately for context, but do not use them as the primary continuation trigger.
+    if option_type == "C":
+        shelf_high = shelf_body_high if shelf_body_high is not None else shelf_wick_high
+        shelf_low = shelf_wick_low if shelf_wick_low is not None else shelf_body_low
+    else:
+        shelf_high = shelf_wick_high if shelf_wick_high is not None else shelf_body_high
+        shelf_low = shelf_body_low if shelf_body_low is not None else shelf_wick_low
+
+    shelf_range = (shelf_high - shelf_low) if shelf_high is not None and shelf_low is not None else None
+    shelf_body_range = (
+        shelf_body_high - shelf_body_low
+        if shelf_body_high is not None and shelf_body_low is not None
+        else None
+    )
+    effective_range_for_validation = shelf_body_range if shelf_body_range is not None else shelf_range
+    range_ok = bool(
+        effective_range_for_validation is not None
+        and fallback_atr is not None
+        and effective_range_for_validation <= fallback_atr
+    )
+
+    overlap_hits = 0
+    for left, right in zip(shelf_candles, shelf_candles[1:]):
+        if _continuation_pair_overlaps(left, right):
+            overlap_hits += 1
+    overlap_confirmed = bool(len(shelf_candles) >= 2 and overlap_hits >= 1)
+
+    reclaim_area = None
+    if pre_shelf_candles:
+        reclaim_window = pre_shelf_candles[-6:]
+        if option_type == "C":
+            reclaim_area = max(
+                (_to_float(c.get("high")) for c in reclaim_window if _to_float(c.get("high")) is not None),
+                default=None,
+            )
+        else:
+            reclaim_area = min(
+                (_to_float(c.get("low")) for c in reclaim_window if _to_float(c.get("low")) is not None),
+                default=None,
+            )
+
+    shelf_closes_hold_reclaim = True
+    if reclaim_area is not None and closes:
+        if option_type == "C":
+            shelf_closes_hold_reclaim = all(close is not None and close > reclaim_area for close in closes)
+        else:
+            shelf_closes_hold_reclaim = all(close is not None and close < reclaim_area for close in closes)
+
+    shelf_closes_hold_low = True
+    if closes and shelf_low is not None and shelf_high is not None:
+        if option_type == "C":
+            shelf_closes_hold_low = all(close is not None and close >= shelf_low for close in closes)
+        else:
+            shelf_closes_hold_low = all(close is not None and close <= shelf_high for close in closes)
+
+    ema_side_hold = True
+    if ema50_1h is not None and closes:
+        if option_type == "C":
+            ema_side_hold = all(close is not None and close > ema50_1h for close in closes)
+        else:
+            ema_side_hold = all(close is not None and close < ema50_1h for close in closes)
+
+    impulse_present = False
+    if pre_shelf_candles and closes:
+        prior_window = pre_shelf_candles[-4:]
+        prior_highs = [_to_float(c.get("high")) for c in prior_window if _to_float(c.get("high")) is not None]
+        prior_lows = [_to_float(c.get("low")) for c in prior_window if _to_float(c.get("low")) is not None]
+        prior_closes = [_to_float(c.get("close")) for c in prior_window if _to_float(c.get("close")) is not None]
+        if option_type == "C":
+            prior_anchor = min(prior_closes) if prior_closes else None
+            prior_high = max(prior_highs) if prior_highs else None
+            impulse_present = bool(
+                prior_anchor is not None
+                and shelf_high is not None
+                and max(close for close in closes if close is not None) > prior_anchor
+                and (
+                    prior_high is None
+                    or (shelf_wick_high is not None and shelf_wick_high >= prior_high)
+                    or (shelf_high is not None and shelf_high >= prior_high)
+                    or (
+                        fallback_atr is not None
+                        and (
+                            (shelf_wick_high is not None and shelf_wick_high >= prior_high - (fallback_atr * 0.15))
+                            or (shelf_high is not None and shelf_high >= prior_high - (fallback_atr * 0.15))
+                        )
+                    )
+                )
+            )
+        else:
+            prior_anchor = max(prior_closes) if prior_closes else None
+            prior_low = min(prior_lows) if prior_lows else None
+            impulse_present = bool(
+                prior_anchor is not None
+                and shelf_low is not None
+                and min(close for close in closes if close is not None) < prior_anchor
+                and (
+                    prior_low is None
+                    or (shelf_wick_low is not None and shelf_wick_low <= prior_low)
+                    or (shelf_low is not None and shelf_low <= prior_low)
+                    or (
+                        fallback_atr is not None
+                        and (
+                            (shelf_wick_low is not None and shelf_wick_low <= prior_low + (fallback_atr * 0.15))
+                            or (shelf_low is not None and shelf_low <= prior_low + (fallback_atr * 0.15))
+                        )
+                    )
+                )
+            )
+
+    completed_hold_sequence = list(shelf_candles)
+    if break_candle:
+        completed_hold_sequence.append(break_candle)
+
+    reclaim_hold_count = 0
+    reclaim_hold_candles: List[Dict[str, Any]] = []
+    if reclaim_area is not None:
+        for candle in reversed(completed_hold_sequence):
+            candle_close = _to_float(candle.get("close"))
+            if candle_close is None:
+                break
+            if option_type == "C":
+                if candle_close > reclaim_area:
+                    reclaim_hold_count += 1
+                    reclaim_hold_candles.insert(0, candle)
+                else:
+                    break
+            else:
+                if candle_close < reclaim_area:
+                    reclaim_hold_count += 1
+                    reclaim_hold_candles.insert(0, candle)
+                else:
+                    break
+
+    reclaim_hold_body_high = None
+    reclaim_hold_body_low = None
+    if reclaim_hold_candles:
+        body_highs = []
+        body_lows = []
+        for candle in reclaim_hold_candles:
+            candle_open = _to_float(candle.get("open"))
+            candle_close = _to_float(candle.get("close"))
+            if candle_open is None or candle_close is None:
+                continue
+            body_highs.append(max(candle_open, candle_close))
+            body_lows.append(min(candle_open, candle_close))
+        if body_highs and body_lows:
+            reclaim_hold_body_high = max(body_highs)
+            reclaim_hold_body_low = min(body_lows)
+
+    reclaim_hold_body_range = (
+        reclaim_hold_body_high - reclaim_hold_body_low
+        if reclaim_hold_body_high is not None and reclaim_hold_body_low is not None
+        else None
+    )
+    reclaim_hold_overlap_hits = 0
+    for left, right in zip(reclaim_hold_candles, reclaim_hold_candles[1:]):
+        if _continuation_pair_overlaps(left, right):
+            reclaim_hold_overlap_hits += 1
+    reclaim_hold_overlap_confirmed = bool(len(reclaim_hold_candles) >= 2 and reclaim_hold_overlap_hits >= 1)
+    reclaim_hold_range_ok = bool(
+        reclaim_hold_body_range is not None
+        and fallback_atr is not None
+        and reclaim_hold_body_range <= (fallback_atr * 1.15)
+    )
+    reclaim_hold_range_soft_ok = bool(
+        reclaim_hold_body_range is not None
+        and fallback_atr is not None
+        and reclaim_hold_body_range <= (fallback_atr * 1.50)
+    )
+    reclaim_hold_proven = bool(
+        (
+            reclaim_hold_count >= 2
+            and ema_side_hold
+            and impulse_present
+            and reclaim_hold_overlap_confirmed
+            and reclaim_hold_range_ok
+        )
+        or (
+            reclaim_hold_count >= 3
+            and ema_side_hold
+            and impulse_present
+            and reclaim_hold_overlap_confirmed
+            and reclaim_hold_range_soft_ok
+        )
+    )
+
+    shelf_exists = bool(
+        (
+            len(shelf_candles) >= 2
+            and valid_prices
+            and range_ok
+            and overlap_confirmed
+        )
+        or reclaim_hold_proven
+    )
+    shelf_proven = bool(
+        (
+            shelf_exists
+            and ema_side_hold
+            and impulse_present
+            and shelf_closes_hold_reclaim
+            and shelf_closes_hold_low
+        )
+        or reclaim_hold_proven
+    )
+
+    trigger_level = shelf_high if option_type == "C" else shelf_low
+    break_reference_level = reclaim_area if reclaim_area is not None else trigger_level
+    break_close = _to_float((break_candle or {}).get("close"))
+    break_time_iso = (break_candle or {}).get("time_iso")
+    break_completed = False
+    break_above_ema = False
+    if break_reference_level is not None and break_close is not None:
+        if option_type == "C":
+            break_completed = break_close > break_reference_level
+            break_above_ema = bool(ema50_1h is None or break_close > ema50_1h)
+        else:
+            break_completed = break_close < break_reference_level
+            break_above_ema = bool(ema50_1h is None or break_close < ema50_1h)
+
+    current_distance_to_shelf_break = None
+    if current_price is not None and trigger_level is not None:
+        if option_type == "C":
+            current_distance_to_shelf_break = current_price - trigger_level
+        else:
+            current_distance_to_shelf_break = trigger_level - current_price
+
+    current_distance_to_ema = None
+    if current_price is not None and ema50_1h is not None:
+        if option_type == "C":
+            current_distance_to_ema = current_price - ema50_1h
+        else:
+            current_distance_to_ema = ema50_1h - current_price
+
+    breakout_live_without_completed = bool(
+        trigger_level is not None
+        and current_price is not None
+        and (
+            (option_type == "C" and current_price > trigger_level and not break_completed)
+            or (option_type == "P" and current_price < trigger_level and not break_completed)
+        )
+    )
+
+    inside_half_atr_from_shelf = bool(
+        fallback_atr is not None
+        and current_distance_to_shelf_break is not None
+        and 0 <= current_distance_to_shelf_break <= (fallback_atr * 0.50)
+    )
+    inside_one_atr_from_shelf = bool(
+        fallback_atr is not None
+        and current_distance_to_shelf_break is not None
+        and 0 <= current_distance_to_shelf_break <= (fallback_atr * 1.00)
+    )
+    within_two_atr_of_ema = bool(
+        fallback_atr is not None
+        and current_distance_to_ema is not None
+        and current_distance_to_ema <= (fallback_atr * 2.0)
+    )
+    too_far_from_shelf = bool(
+        fallback_atr is not None
+        and current_distance_to_shelf_break is not None
+        and current_distance_to_shelf_break > (fallback_atr * 1.00)
+    )
+    too_far_from_ema = bool(
+        fallback_atr is not None
+        and current_distance_to_ema is not None
+        and current_distance_to_ema > (fallback_atr * 3.0)
+    )
+
+    tradeable_window_open = bool(
+        reclaim_hold_proven
+        and break_completed
+        and break_above_ema
+        and room_pass is not False
+        and inside_one_atr_from_shelf
+    )
+    strict_tradeable_window = bool(
+        shelf_proven
+        and break_completed
+        and break_above_ema
+        and inside_half_atr_from_shelf
+        and within_two_atr_of_ema
+        and room_pass is not False
+        and not extension_blocks_now
+    )
+
+    inside_tradeable_window = bool(strict_tradeable_window or tradeable_window_open)
+
+    preserve_pending_window = bool(
+        reclaim_hold_proven
+        and break_completed
+        and room_pass is not False
+        and current_distance_to_shelf_break is not None
+        and current_distance_to_shelf_break >= 0
+        and (
+            inside_one_atr_from_shelf
+            or (
+                shelf_trigger_basis == "body_defined_shelf"
+                and fallback_atr is not None
+                and current_distance_to_shelf_break <= (fallback_atr * 1.00)
+            )
+        )
+    )
+
+    too_late = bool(
+        reclaim_hold_proven
+        and break_completed
+        and not preserve_pending_window
+        and (
+            too_far_from_shelf
+            or (
+                too_far_from_ema
+                and not inside_one_atr_from_shelf
+                and current_distance_to_shelf_break is not None
+                and current_distance_to_shelf_break > 0
+            )
+        )
+    )
+
+    if inside_tradeable_window:
+        exact_reason = "tradeable"
+        status_message = "Tradeable now: reclaim hold is proven and the shelf break is in range."
+        main_blocker = None
+    elif too_late:
+        exact_reason = "late"
+        status_message = "Too late: the break already expanded too far from the hold."
+        main_blocker = "move_too_extended"
+    elif reclaim_hold_proven:
+        exact_reason = "early"
+        status_message = "Hold above the break area is proven. Waiting for the first completed 1H close above the shelf high."
+        main_blocker = "no_valid_trigger"
+    elif break_completed and reclaim_hold_count == 1:
+        exact_reason = "early"
+        status_message = "One completed 1H candle has held above the break area. SAFE-FAST still needs 1 more completed 1H candle to prove the hold."
+        main_blocker = "no_proven_hold"
+    elif not shelf_proven:
+        exact_reason = "early"
+        status_message = "Too early: hold is not proven yet."
+        main_blocker = "no_proven_hold"
+    else:
+        exact_reason = "early"
+        status_message = "Too early: hold is proven, but no valid trigger has closed yet."
+        main_blocker = "no_valid_trigger"
+
+    return {
+        "shelf_exists": shelf_exists,
+        "shelf_proven": shelf_proven,
+        "reclaim_hold_proven": reclaim_hold_proven,
+        "hold_closes_above_reclaim_count": reclaim_hold_count,
+        "hold_area": _build_price_zone(shelf_low, shelf_high, "continuation_hold_area", "continuation_shelf") if shelf_low is not None and shelf_high is not None else None,
+        "shelf_low": _round_or_none(shelf_low, 4),
+        "shelf_high": _round_or_none(shelf_high, 4),
+        "shelf_body_high": _round_or_none(shelf_body_high, 4),
+        "shelf_body_low": _round_or_none(shelf_body_low, 4),
+        "shelf_wick_high": _round_or_none(shelf_wick_high, 4),
+        "shelf_wick_low": _round_or_none(shelf_wick_low, 4),
+        "break_line": _round_or_none(break_reference_level, 4),
+        "reclaim_break_line": _round_or_none(break_reference_level, 4),
+        "shelf_trigger_level": _round_or_none(trigger_level, 4),
+        "shelf_range": _round_or_none(shelf_range, 4),
+        "shelf_candle_count": len(shelf_candles),
+        "overlap_hits": overlap_hits,
+        "overlap_confirmed": overlap_confirmed,
+        "reclaim_area": _round_or_none(reclaim_area, 4),
+        "ema_side_hold": ema_side_hold,
+        "impulse_present": impulse_present,
+        "closes_hold_reclaim_area": shelf_closes_hold_reclaim,
+        "closes_hold_shelf": shelf_closes_hold_low,
+        "breakout_completed": break_completed,
+        "breakout_candle_time_iso": break_time_iso,
+        "breakout_candle_close": _round_or_none(break_close, 4),
+        "distance_current_to_shelf_high": _round_or_none(current_distance_to_shelf_break, 4),
+        "distance_current_to_1h_50_ema": _round_or_none(current_distance_to_ema, 4),
+        "distance_current_to_shelf_high_atr": _round_or_none(
+            (current_distance_to_shelf_break / fallback_atr) if fallback_atr not in (None, 0) and current_distance_to_shelf_break is not None else None,
+            3,
+        ),
+        "distance_current_to_1h_50_ema_atr": _round_or_none(
+            (current_distance_to_ema / fallback_atr) if fallback_atr not in (None, 0) and current_distance_to_ema is not None else None,
+            3,
+        ),
+        "inside_tradeable_window": inside_tradeable_window,
+        "tradeable_now": inside_tradeable_window,
+        "preserve_pending_window": preserve_pending_window,
+        "current_break_is_first_completed_break": break_completed,
+        "current_breakout_without_completed_confirmation": breakout_live_without_completed,
+        "exact_reason": exact_reason,
+        "status_message": status_message,
+        "main_blocker": main_blocker,
+        "evaluation_mode": "with_break" if break_candle else "hold_only",
+        "trigger_level": _round_or_none(trigger_level, 4),
+        "trigger_basis": "body_defined_shelf" if option_type == "C" else "body_defined_shelf",
+        "atr_14_1h": _round_or_none(fallback_atr, 4),
+        "reclaim_hold_body_range": _round_or_none(reclaim_hold_body_range, 4),
+        "reclaim_hold_overlap_hits": reclaim_hold_overlap_hits,
+        "reclaim_hold_range_soft_ok": reclaim_hold_range_soft_ok,
+        "shelf_candles": [
+            {
+                "time_iso": candle.get("time_iso"),
+                "open": _round_or_none(_to_float(candle.get("open")), 4),
+                "high": _round_or_none(_to_float(candle.get("high")), 4),
+                "low": _round_or_none(_to_float(candle.get("low")), 4),
+                "close": _round_or_none(_to_float(candle.get("close")), 4),
+            }
+            for candle in shelf_candles
+        ],
+    }
+
+
+def _build_continuation_window_context(
+    *,
+    option_type: str,
+    candles: List[Dict[str, Any]],
+    latest_close: Optional[float],
+    ema50_1h: Optional[float],
+    trend_supportive: Optional[bool],
+    room_pass: Optional[bool],
+    extension_blocks_now: bool,
+) -> Dict[str, Any]:
+    completed_candles = candles[:-1] if len(candles) >= 2 else list(candles)
+    if len(completed_candles) < 2 or latest_close is None:
+        return {
+            "ok": False,
+            "exact_reason": "early",
+            "status_message": "Too early: hold is not proven yet.",
+            "main_blocker": "no_proven_hold",
+            "shelf_exists": False,
+            "shelf_proven": False,
+            "inside_tradeable_window": False,
+            "tradeable_now": False,
+            "continuation_applicable": bool(trend_supportive is True),
+        }
+
+    atr14 = _calc_atr(candles, 14)
+    snapshots: List[Dict[str, Any]] = []
+
+    for shelf_candle_count in (2, 3, 4):
+        if len(completed_candles) >= shelf_candle_count + 1:
+            shelf_candles = completed_candles[-(shelf_candle_count + 1):-1]
+            pre_shelf_candles = completed_candles[:-(shelf_candle_count + 1)]
+            snapshots.append(
+                _build_continuation_window_snapshot(
+                    option_type=option_type,
+                    shelf_candles=shelf_candles,
+                    pre_shelf_candles=pre_shelf_candles,
+                    atr14=atr14,
+                    ema50_1h=ema50_1h,
+                    current_price=latest_close,
+                    break_candle=completed_candles[-1],
+                    room_pass=room_pass,
+                    extension_blocks_now=extension_blocks_now,
+                )
+            )
+        if len(completed_candles) >= shelf_candle_count:
+            shelf_candles = completed_candles[-shelf_candle_count:]
+            pre_shelf_candles = completed_candles[:-shelf_candle_count]
+            snapshots.append(
+                _build_continuation_window_snapshot(
+                    option_type=option_type,
+                    shelf_candles=shelf_candles,
+                    pre_shelf_candles=pre_shelf_candles,
+                    atr14=atr14,
+                    ema50_1h=ema50_1h,
+                    current_price=latest_close,
+                    break_candle=None,
+                    room_pass=room_pass,
+                    extension_blocks_now=extension_blocks_now,
+                )
+            )
+
+    if not snapshots:
+        return {
+            "ok": False,
+            "exact_reason": "early",
+            "status_message": "Too early: hold is not proven yet.",
+            "main_blocker": "no_proven_hold",
+            "shelf_exists": False,
+            "shelf_proven": False,
+            "inside_tradeable_window": False,
+            "tradeable_now": False,
+            "continuation_applicable": bool(trend_supportive is True),
+            "atr_14_1h": _round_or_none(atr14, 4),
+        }
+
+    priority_rank = {"tradeable": 0, "late": 1, "early": 2}
+
+    def _snapshot_sort_key(snapshot: Dict[str, Any]) -> Any:
+        return (
+            priority_rank.get(snapshot.get("exact_reason"), 9),
+            0 if snapshot.get("reclaim_hold_proven") else 1,
+            0 if snapshot.get("shelf_proven") else 1,
+            -(snapshot.get("hold_closes_above_reclaim_count") or 0),
+            0 if snapshot.get("breakout_completed") else 1,
+            abs(snapshot.get("distance_current_to_shelf_high") or 999999),
+            -(snapshot.get("shelf_candle_count") or 0),
+        )
+
+    selected = sorted(snapshots, key=_snapshot_sort_key)[0]
+    selected = {
+        **selected,
+        "ok": True,
+        "continuation_applicable": bool(trend_supportive is True),
+        "trend_supportive": trend_supportive,
+        "room_pass": room_pass,
+        "extension_blocks_now": extension_blocks_now,
+    }
+    return selected
+
+
+
+
+def _continuation_family_detected(continuation_context: Optional[Dict[str, Any]]) -> bool:
+    ctx = continuation_context or {}
+    return bool(
+        ctx.get("shelf_exists") is True
+        or ctx.get("shelf_proven") is True
+        or _to_float(ctx.get("trigger_level")) is not None
+        or (_to_float(ctx.get("shelf_low")) is not None and _to_float(ctx.get("shelf_high")) is not None)
+        or (ctx.get("shelf_candle_count") or 0) >= 2
+        or str(ctx.get("status_message") or "").strip() != ""
+    )
+
+def _setup_classifier(
+    option_type: str,
+    chart_check: Dict[str, Any],
+    trend_ctx: Dict[str, Any],
+    room_ratio: Optional[float],
+    room_pass: Optional[bool],
+    wall_pass: Optional[bool],
+    extension_state: Dict[str, Any],
+    candles: List[Dict[str, Any]],
+    continuation_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    latest_close = chart_check.get("latest_close")
+    ema50_1h = chart_check.get("ema50_1h")
+
+    trend_supportive = trend_ctx.get("supportive")
+    trend_label = "Trend-aligned" if trend_supportive is True else "Countertrend" if trend_supportive is False else "unconfirmed"
+
+    if latest_close is None or ema50_1h is None:
+        return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None, "setup_type_allowed": None, "setup_eligible_now": None}
+
+    near_ema = abs(latest_close - ema50_1h) / ema50_1h <= 0.0035
+    chop = _is_chop(candles)
+    recent_closes = [c["close"] for c in candles[-3:]] if len(candles) >= 3 else []
+    tight_break = False
+    if recent_closes and latest_close:
+        tight_break = (max(recent_closes) - min(recent_closes)) / latest_close <= 0.0035
+
+    blocked_now = bool(room_pass is False or wall_pass is False or extension_state.get("state") == "extended")
+    continuation_ctx = continuation_context or {}
+    continuation_shelf_proven = bool(continuation_ctx.get("shelf_proven") is True)
+    continuation_tradeable_now = bool(continuation_ctx.get("tradeable_now") is True)
+    continuation_detected = _continuation_family_detected(continuation_ctx)
+
+    if continuation_detected and trend_supportive is not False:
+        return {
+            "setup_type": "Continuation",
+            "trend_label": trend_label,
+            "allowed_setup": True,
+            "setup_type_allowed": True,
+            "setup_eligible_now": bool(continuation_tradeable_now and not blocked_now and not chop),
+        }
+
+    if trend_supportive is True:
+        if not blocked_now:
+            if near_ema and (room_ratio or 0) >= 2.5 and not chop:
+                return {"setup_type": "Ideal", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+            if tight_break and not chop:
+                return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": True}
+            return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
+
+        if tight_break and not chop:
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
+        return {"setup_type": "Continuation", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": False}
+
+    if trend_supportive is False:
+        if tight_break and not chop:
+            return {"setup_type": "Clean Fast Break", "trend_label": trend_label, "allowed_setup": True, "setup_type_allowed": True, "setup_eligible_now": not blocked_now}
+        return {"setup_type": "NOT_ALLOWED", "trend_label": trend_label, "allowed_setup": False, "setup_type_allowed": False, "setup_eligible_now": False}
+
+    return {"setup_type": "UNCONFIRMED", "trend_label": trend_label, "allowed_setup": None, "setup_type_allowed": None, "setup_eligible_now": None}
+
+
+def _detect_ath_open_air_context(
+    *,
+    candles: List[Dict[str, Any]],
+    latest_close: float,
+    option_type: str,
+    next_pocket: Optional[float],
+    room_pass: bool,
+    noisy_chop_detail: Dict[str, Any],
+    degraded_entry_quality: bool,
+    early_trigger_window_passed: bool,
+    atr_multiple_from_ema: Optional[float],
+) -> Dict[str, Any]:
+    highs = [_to_float(c.get("high")) for c in candles if _to_float(c.get("high")) is not None]
+    lows = [_to_float(c.get("low")) for c in candles if _to_float(c.get("low")) is not None]
+
+    if option_type == "C":
+        if not highs:
+            return {
+                "at_or_near_ath": False,
+                "ath_level": None,
+                "distance_pct_to_ath": None,
+                "open_air": False,
+                "rebuilt_1h_structure": None,
+                "ath_open_air_blocks_now": False,
+                "why": "ath_unconfirmed",
+            }
+        ath_level = max(highs)
+        distance_pct = abs(ath_level - latest_close) / ath_level * 100.0 if ath_level else None
+        at_or_near_ath = bool(distance_pct is not None and distance_pct <= 0.35)
+    else:
+        if not lows:
+            return {
+                "at_or_near_ath": False,
+                "ath_level": None,
+                "distance_pct_to_ath": None,
+                "open_air": False,
+                "rebuilt_1h_structure": None,
+                "ath_open_air_blocks_now": False,
+                "why": "ath_not_applicable",
+            }
+        ath_level = None
+        distance_pct = None
+        at_or_near_ath = False
+
+    open_air = bool(option_type == "C" and next_pocket is None)
+    rebuilt_1h_structure = bool(
+        room_pass
+        and noisy_chop_detail.get("noisy_chop") is not True
+        and not degraded_entry_quality
+        and not early_trigger_window_passed
+        and (atr_multiple_from_ema is None or atr_multiple_from_ema < 2.0)
+    )
+    ath_open_air_blocks_now = bool(at_or_near_ath and open_air and not rebuilt_1h_structure)
+    why = "ath_open_air_not_applicable"
+    if at_or_near_ath and open_air and not rebuilt_1h_structure:
+        why = "ath_open_air_without_rebuilt_structure"
+    elif at_or_near_ath and open_air and rebuilt_1h_structure:
+        why = "ath_open_air_with_rebuilt_structure"
+    elif at_or_near_ath:
+        why = "near_ath_but_not_open_air"
+
+    return {
+        "at_or_near_ath": at_or_near_ath,
+        "ath_level": _round_or_none(ath_level, 4),
+        "distance_pct_to_ath": _round_or_none(distance_pct, 3),
+        "open_air": open_air,
+        "rebuilt_1h_structure": rebuilt_1h_structure,
+        "ath_open_air_blocks_now": ath_open_air_blocks_now,
+        "why": why,
+    }
+
+
+def _build_structure_context(
+    symbol: str,
+    option_type: str,
+    chart_check: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "ok": False,
+            "why": "chart check unavailable",
+        }
+
+    candles = chart_check.get("_all_candles") or chart_check.get("recent_candles") or []
+    if not candles:
+        return {
+            "ok": False,
+            "why": "full candle history unavailable",
+        }
+
+    latest_close = chart_check.get("latest_close")
+    ema50_1h = chart_check.get("ema50_1h")
+    if latest_close is None or ema50_1h is None:
+        return {
+            "ok": False,
+            "why": "missing latest close or ema",
+        }
+
+    trend_ctx = _twentyfour_hour_context(candles, option_type)
+    wall_levels = _find_wall_levels(candles, latest_close, option_type)
+    room_reference_price = _derive_room_reference_price(latest_close, ema50_1h)
+    room_reference_basis = "ema_weighted_mapped_entry_area"
+
+    invalidation_distance_current = abs(latest_close - ema50_1h) if ema50_1h is not None else None
+    invalidation_distance = abs(room_reference_price - ema50_1h) if ema50_1h is not None else None
+
+    room_to_first_wall_current = wall_levels.get("room_distance")
+    room_to_first_wall = (
+        round(abs(wall_levels.get("first_wall") - room_reference_price), 4)
+        if wall_levels.get("first_wall") is not None else None
+    )
+
+    room_ratio_current = None
+    if room_to_first_wall_current is not None and invalidation_distance_current not in (None, 0):
+        room_ratio_current = room_to_first_wall_current / invalidation_distance_current
+
+    room_ratio = None
+    if room_to_first_wall is not None and invalidation_distance not in (None, 0):
+        room_ratio = room_to_first_wall / invalidation_distance
+
+    hidden_left_wick_cluster = _find_hidden_left_wick_cluster(
+        candles=candles,
+        latest_close=latest_close,
+        option_type=option_type,
+    )
+    hidden_left_distance_to_invalidation_ratio = None
+    if (
+        hidden_left_wick_cluster.get("distance_from_price") not in (None, 0)
+        and invalidation_distance not in (None, 0)
+    ):
+        hidden_left_distance_to_invalidation_ratio = round(
+            hidden_left_wick_cluster.get("distance_from_price") / invalidation_distance,
+            3,
+        )
+    hidden_left_cluster_confirms_room_trap = bool(
+        hidden_left_wick_cluster.get("cluster_found") is True
+        and hidden_left_distance_to_invalidation_ratio is not None
+        and hidden_left_distance_to_invalidation_ratio < 1.35
+    )
+
+    room_quality = "unconfirmed"
+    if hidden_left_cluster_confirms_room_trap:
+        room_quality = "fail"
+    elif room_ratio is None:
+        room_quality = "unconfirmed"
+    elif room_ratio >= 2.0:
+        room_quality = "pass"
+    elif room_ratio >= 1.25:
+        room_quality = "caution"
+    else:
+        room_quality = "fail"
+
+    room_pass = room_quality in {"pass", "caution"}
+    room_hard_fail = room_quality == "fail"
+    room_soft_flag = room_quality == "caution"
+
+    base_extension_ctx = _extension_state(symbol, latest_close, ema50_1h, wall_levels.get("first_wall"))
+    wall_ctx = _wall_thesis(
+        option_type=option_type,
+        primary_candidate=primary_candidate,
+        first_wall=wall_levels.get("first_wall"),
+        next_pocket=wall_levels.get("next_pocket"),
+        invalidation_distance=invalidation_distance,
+        latest_close=latest_close,
+    )
+
+    atr14 = _calc_atr(candles, 14)
+    adx_ctx = _calc_adx(candles, 14)
+    noisy_chop_detail = _compute_noisy_chop_detail(candles, ema50_1h)
+    candle_overlap_chop_risk = bool(noisy_chop_detail.get("overlap_rule_triggered") is True)
+    adx_chop_risk = adx_ctx.get("chop_risk_from_adx")
+    effective_chop_risk = bool(
+        noisy_chop_detail.get("noisy_chop") is True
+        or candle_overlap_chop_risk is True
+        or adx_chop_risk is True
+    )
+    atr_multiple_from_ema = None
+    if atr14 not in (None, 0) and invalidation_distance is not None:
+        atr_multiple_from_ema = round(invalidation_distance / atr14, 3)
+
+    recent = candles[-4:] if len(candles) >= 4 else candles
+    parabolic_exhaustion = False
+    if len(recent) >= 3:
+        closes = [_to_float(c.get("close")) for c in recent[-3:]]
+        highs = [_to_float(c.get("high")) for c in recent[-3:]]
+        lows = [_to_float(c.get("low")) for c in recent[-3:]]
+        if all(v is not None for v in closes + highs + lows):
+            ranges = [max(h - l, 0.0001) for h, l in zip(highs, lows)]
+            directional = closes[0] < closes[1] < closes[2] if option_type == "C" else closes[0] > closes[1] > closes[2]
+            range_expanding = ranges[-1] > ranges[-2] > 0
+            close_near_extreme = ((highs[-1] - closes[-1]) / ranges[-1] <= 0.15) if option_type == "C" else ((closes[-1] - lows[-1]) / ranges[-1] <= 0.15)
+            parabolic_exhaustion = bool(directional and range_expanding and close_near_extreme)
+
+    volume_climax_exhaustion = False
+    volume_values = []
+    for candle in candles[-8:]:
+        vol = _to_float(candle.get("volume"))
+        if vol is None:
+            vol = _to_float(candle.get("vol"))
+        if vol is not None and vol > 0:
+            volume_values.append(vol)
+    if len(volume_values) >= 6:
+        baseline_vol = sum(volume_values[:-1]) / max(len(volume_values[:-1]), 1)
+        volume_climax_exhaustion = bool(baseline_vol > 0 and volume_values[-1] >= baseline_vol * 1.8 and parabolic_exhaustion)
+
+    move_to_wall_ratio = base_extension_ctx.get("move_to_wall_ratio")
+    degraded_entry_quality = bool(move_to_wall_ratio is not None and move_to_wall_ratio >= 0.67)
+    early_trigger_window_passed = bool(
+        (base_extension_ctx.get("pct_from_ema") is not None and base_extension_ctx.get("pct_from_ema") >= base_extension_ctx.get("baseline_extension_threshold_pct", 999))
+        or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.75)
+    )
+
+    extension_confirmer_flags = []
+    if room_hard_fail:
+        extension_confirmer_flags.append("cramped_room")
+    if parabolic_exhaustion:
+        extension_confirmer_flags.append("parabolic_exhaustion")
+    if volume_climax_exhaustion:
+        extension_confirmer_flags.append("volume_climax_exhaustion")
+    if degraded_entry_quality:
+        extension_confirmer_flags.append("degraded_entry_quality")
+    if early_trigger_window_passed:
+        extension_confirmer_flags.append("early_trigger_window_passed")
+
+    extension_confirmer_count = len(extension_confirmer_flags)
+    strong_confirmer_flags = [
+        flag for flag in extension_confirmer_flags
+        if flag in {"cramped_room", "parabolic_exhaustion", "volume_climax_exhaustion"}
+    ]
+    strong_confirmer_count = len(strong_confirmer_flags)
+
+    extension_material = bool(
+        (atr_multiple_from_ema is not None and atr_multiple_from_ema >= 1.35)
+        or (base_extension_ctx.get("pct_from_ema") is not None and base_extension_ctx.get("pct_from_ema") >= base_extension_ctx.get("baseline_extension_threshold_pct", 999))
+        or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.75)
+    )
+
+    no_exhaustion_confirmed = bool(not parabolic_exhaustion and not volume_climax_exhaustion)
+    soft_extension_context = bool(
+        room_pass is True
+        and room_hard_fail is not True
+        and hidden_left_cluster_confirms_room_trap is not True
+        and no_exhaustion_confirmed
+    )
+
+    extreme_pct_threshold_by_symbol = {
+        "SPY": 3.0,
+        "QQQ": 3.75,
+        "IWM": 3.0,
+        "GLD": 2.5,
+    }
+    extreme_atr_threshold_by_symbol = {
+        "SPY": 3.0,
+        "QQQ": 3.0,
+        "IWM": 2.35,
+        "GLD": 2.35,
+    }
+    pct_from_ema = base_extension_ctx.get("pct_from_ema")
+    extreme_extension_only = bool(
+        soft_extension_context
+        and pct_from_ema is not None
+        and atr_multiple_from_ema is not None
+        and pct_from_ema >= extreme_pct_threshold_by_symbol.get(symbol, 3.0)
+        and atr_multiple_from_ema >= extreme_atr_threshold_by_symbol.get(symbol, 2.5)
+        and degraded_entry_quality
+        and early_trigger_window_passed
+    )
+
+    emergency_extension_block = bool(
+        extension_material
+        and (
+            extreme_extension_only
+            or (
+                not soft_extension_context
+                and degraded_entry_quality
+                and early_trigger_window_passed
+                and (
+                    (atr_multiple_from_ema is not None and atr_multiple_from_ema >= 2.6)
+                    or (move_to_wall_ratio is not None and move_to_wall_ratio >= 0.88)
+                )
+            )
+        )
+    )
+
+    extension_blocks_now = bool(
+        extension_material and (
+            room_hard_fail
+            or hidden_left_cluster_confirms_room_trap
+            or parabolic_exhaustion
+            or volume_climax_exhaustion
+            or (strong_confirmer_count >= 2 and not soft_extension_context)
+            or emergency_extension_block
+        )
+    )
+
+    early_enough_status = "fail" if extension_blocks_now else (
+        "caution" if (
+            extension_material
+            or degraded_entry_quality
+            or early_trigger_window_passed
+            or base_extension_ctx.get("extension_caution_0_40_pct")
+            or base_extension_ctx.get("move_ratio_caution")
+        ) else "pass"
+    )
+    early_enough_soft_caution = bool(
+        early_enough_status == "caution"
+        and soft_extension_context
+        and extension_material
+    )
+
+    extension_state = "extended" if extension_blocks_now else (
+        "caution" if (
+            base_extension_ctx.get("extension_caution_0_40_pct")
+            or base_extension_ctx.get("move_ratio_caution")
+            or extension_material
+            or extension_confirmer_count >= 1
+        ) else "acceptable"
+    )
+
+    extension_ctx = {
+        **base_extension_ctx,
+        "state": extension_state,
+        "late_move": extension_blocks_now,
+        "atr_14_1h": atr14,
+        "atr_multiple_from_ema": atr_multiple_from_ema,
+        "parabolic_exhaustion": parabolic_exhaustion,
+        "volume_climax_exhaustion": volume_climax_exhaustion,
+        "degraded_entry_quality": degraded_entry_quality,
+        "early_trigger_window_passed": early_trigger_window_passed,
+        "extension_confirmer_flags": extension_confirmer_flags,
+        "extension_confirmer_count": extension_confirmer_count,
+        "strong_confirmer_flags": strong_confirmer_flags,
+        "strong_confirmer_count": strong_confirmer_count,
+        "extension_material": extension_material,
+        "no_exhaustion_confirmed": no_exhaustion_confirmed,
+        "soft_extension_context": soft_extension_context,
+        "extreme_extension_only": extreme_extension_only,
+        "emergency_extension_block": emergency_extension_block,
+        "early_enough_status": early_enough_status,
+        "early_enough_soft_caution": early_enough_soft_caution,
+        "extension_soft_flag": bool(
+            not extension_blocks_now and (
+                base_extension_ctx.get("extension_caution_0_40_pct")
+                or base_extension_ctx.get("move_ratio_caution")
+                or extension_material
+                or extension_confirmer_count >= 1
+            )
+        ),
+        "extension_blocks_now": extension_blocks_now,
+    }
+
+    ath_context = _detect_ath_open_air_context(
+        candles=candles,
+        latest_close=float(latest_close),
+        option_type=option_type,
+        next_pocket=wall_levels.get("next_pocket"),
+        room_pass=room_pass,
+        noisy_chop_detail=noisy_chop_detail,
+        degraded_entry_quality=degraded_entry_quality,
+        early_trigger_window_passed=early_trigger_window_passed,
+        atr_multiple_from_ema=atr_multiple_from_ema,
+    )
+    if ath_context.get("ath_open_air_blocks_now") is True:
+        room_quality = "fail"
+        room_pass = False
+        room_hard_fail = True
+        room_soft_flag = False
+        extension_ctx["extension_blocks_now"] = True
+        extension_ctx["state"] = "extended"
+        extension_ctx["late_move"] = True
+        extension_ctx["ath_open_air_blocks_now"] = True
+    elif option_type == "C" and wall_levels.get("first_wall") is None:
+        room_pass = True
+        room_hard_fail = False
+        room_soft_flag = False
+        if room_quality in {None, "fail", "unconfirmed"}:
+            room_quality = "pass"
+        if room_ratio is None:
+            room_ratio = 999.0
+        if room_ratio_current is None:
+            room_ratio_current = 999.0
+        wall_ctx["wall_pass"] = True
+        wall_ctx["current_price_beyond_first_wall"] = False
+        wall_ctx["breakout_path_required"] = False
+        wall_ctx["wall_thesis_reason"] = "no_first_wall_open_air_path"
+
+    continuation_ctx = _build_continuation_window_context(
+        option_type=option_type,
+        candles=candles,
+        latest_close=latest_close,
+        ema50_1h=ema50_1h,
+        trend_supportive=trend_ctx.get("supportive"),
+        room_pass=room_pass,
+        extension_blocks_now=extension_ctx.get("extension_blocks_now"),
+    )
+
+    if (
+        option_type == "C"
+        and ath_context.get("open_air") is True
+        and continuation_ctx.get("reclaim_hold_proven") is True
+    ):
+        ath_context = {
+            **ath_context,
+            "rebuilt_1h_structure": True,
+            "ath_open_air_blocks_now": False,
+            "why": "ath_open_air_with_reclaim_hold",
+        }
+        room_pass = True
+        room_hard_fail = False
+        room_soft_flag = False
+        if room_quality in {None, "fail", "unconfirmed"}:
+            room_quality = "pass"
+        if room_ratio is None:
+            room_ratio = 999.0
+        if room_ratio_current is None:
+            room_ratio_current = 999.0
+        wall_ctx["wall_pass"] = True
+        wall_ctx["current_price_beyond_first_wall"] = False
+        wall_ctx["breakout_path_required"] = False
+        wall_ctx["wall_thesis_reason"] = "no_first_wall_open_air_path"
+        extension_ctx["ath_open_air_blocks_now"] = False
+        continuation_ctx = {
+            **continuation_ctx,
+            "room_pass": room_pass,
+            "extension_blocks_now": extension_ctx.get("extension_blocks_now"),
+        }
+
+    valid_post_impulse_shelf_not_chop = bool(
+        continuation_ctx.get("shelf_exists") is True
+        and continuation_ctx.get("shelf_candle_count") in {2, 3, 4}
+        and continuation_ctx.get("overlap_confirmed") is True
+        and continuation_ctx.get("ema_side_hold") is True
+        and continuation_ctx.get("closes_hold_shelf") is True
+        and continuation_ctx.get("impulse_present") is True
+        and noisy_chop_detail.get("ema_whipsaw_chop") is not True
+        and parabolic_exhaustion is not True
+        and volume_climax_exhaustion is not True
+    )
+    if valid_post_impulse_shelf_not_chop and noisy_chop_detail.get("overlap_rule_triggered") is True:
+        noisy_chop_detail = {
+            **noisy_chop_detail,
+            "noisy_chop": False,
+            "overlap_rule_triggered": False,
+            "why": "valid_post_impulse_shelf_not_chop",
+        }
+        candle_overlap_chop_risk = False
+        effective_chop_risk = False
+
+    setup_ctx = _setup_classifier(
+        option_type=option_type,
+        chart_check=chart_check,
+        trend_ctx=trend_ctx,
+        room_ratio=room_ratio,
+        room_pass=room_pass,
+        wall_pass=wall_ctx.get("wall_pass"),
+        extension_state=extension_ctx,
+        candles=candles,
+        continuation_context=continuation_ctx,
+    )
+
+    return {
+        "ok": True,
+        "twentyfour_hour_trend": trend_ctx.get("label"),
+        "twentyfour_hour_supportive": trend_ctx.get("supportive"),
+        "twentyfour_hour_source": trend_ctx.get("source"),
+        "latest_close": latest_close,
+        "first_wall": wall_levels.get("first_wall"),
+        "next_pocket": wall_levels.get("next_pocket"),
+        "room_reference_price": room_reference_price,
+        "room_reference_basis": room_reference_basis,
+        "room_to_first_wall": room_to_first_wall,
+        "room_to_first_wall_current": room_to_first_wall_current,
+        "room_ratio": round(room_ratio, 3) if room_ratio is not None else None,
+        "room_ratio_current": round(room_ratio_current, 3) if room_ratio_current is not None else None,
+        "room_quality": room_quality,
+        "room_pass": room_pass,
+        "room_hard_fail": room_hard_fail,
+        "room_soft_flag": room_soft_flag,
+        "at_or_near_ath": ath_context.get("at_or_near_ath"),
+        "ath_level": ath_context.get("ath_level"),
+        "distance_pct_to_ath": ath_context.get("distance_pct_to_ath"),
+        "open_air_above_price": ath_context.get("open_air"),
+        "rebuilt_1h_structure": ath_context.get("rebuilt_1h_structure"),
+        "ath_open_air_blocks_now": ath_context.get("ath_open_air_blocks_now"),
+        "ath_context_reason": ath_context.get("why"),
+        "wall_thesis": wall_ctx.get("wall_thesis"),
+        "effective_wall_thesis": wall_ctx.get("effective_wall_thesis", wall_ctx.get("wall_thesis")),
+        "wall_pass": wall_ctx.get("wall_pass"),
+        "next_pocket_room_ratio": wall_ctx.get("next_pocket_room_ratio"),
+        "current_price_beyond_first_wall": wall_ctx.get("current_price_beyond_first_wall"),
+        "breakout_path_required": wall_ctx.get("breakout_path_required"),
+        "wall_thesis_reason": wall_ctx.get("why"),
+        "extension_state": extension_ctx.get("state"),
+        "pct_from_ema": extension_ctx.get("pct_from_ema"),
+        "late_move": extension_ctx.get("late_move"),
+        "universal_extension_caution_pct": extension_ctx.get("universal_extension_caution_pct"),
+        "extension_caution_0_40_pct": extension_ctx.get("extension_caution_0_40_pct"),
+        "extension_caution_note": extension_ctx.get("extension_caution_note"),
+        "hidden_left_wick_cluster": hidden_left_wick_cluster,
+        "hidden_left_cluster_found": hidden_left_wick_cluster.get("cluster_found"),
+        "hidden_left_level_zone": hidden_left_wick_cluster.get("zone"),
+        "hidden_left_distance_from_price": hidden_left_wick_cluster.get("distance_from_price"),
+        "hidden_left_distance_to_invalidation_ratio": hidden_left_distance_to_invalidation_ratio,
+        "hidden_left_cluster_confirms_room_trap": hidden_left_cluster_confirms_room_trap,
+        "noisy_chop_detail": noisy_chop_detail,
+        "valid_post_impulse_shelf_not_chop": valid_post_impulse_shelf_not_chop,
+        "noisy_chop_explicit": noisy_chop_detail.get("noisy_chop"),
+        "ema_whipsaw_chop": noisy_chop_detail.get("ema_whipsaw_chop"),
+        "overlap_chop_hits_last4": noisy_chop_detail.get("overlap_hits_last4"),
+        "atr_14_1h": extension_ctx.get("atr_14_1h"),
+        "atr_multiple_from_ema": extension_ctx.get("atr_multiple_from_ema"),
+        "parabolic_exhaustion": extension_ctx.get("parabolic_exhaustion"),
+        "volume_climax_exhaustion": extension_ctx.get("volume_climax_exhaustion"),
+        "degraded_entry_quality": extension_ctx.get("degraded_entry_quality"),
+        "early_trigger_window_passed": extension_ctx.get("early_trigger_window_passed"),
+        "extension_confirmer_flags": extension_ctx.get("extension_confirmer_flags"),
+        "extension_confirmer_count": extension_ctx.get("extension_confirmer_count"),
+        "strong_confirmer_flags": extension_ctx.get("strong_confirmer_flags"),
+        "strong_confirmer_count": extension_ctx.get("strong_confirmer_count"),
+        "extension_material": extension_ctx.get("extension_material"),
+        "no_exhaustion_confirmed": extension_ctx.get("no_exhaustion_confirmed"),
+        "soft_extension_context": extension_ctx.get("soft_extension_context"),
+        "extreme_extension_only": extension_ctx.get("extreme_extension_only"),
+        "early_enough_status": extension_ctx.get("early_enough_status"),
+        "early_enough_soft_caution": extension_ctx.get("early_enough_soft_caution"),
+        "extension_soft_flag": extension_ctx.get("extension_soft_flag"),
+        "extension_blocks_now": extension_ctx.get("extension_blocks_now"),
+        "continuation_context": continuation_ctx,
+        "continuation_exact_reason": continuation_ctx.get("exact_reason"),
+        "continuation_reason_text": continuation_ctx.get("status_message"),
+        "continuation_tradeable_now": continuation_ctx.get("tradeable_now"),
+        "continuation_window_late": continuation_ctx.get("exact_reason") == "late",
+        "continuation_hold_proven": continuation_ctx.get("shelf_proven"),
+        "continuation_trigger_level": continuation_ctx.get("trigger_level"),
+        "iv_state": "unconfirmed",
+        "setup_type": setup_ctx.get("setup_type"),
+        "trend_label": setup_ctx.get("trend_label"),
+        "allowed_setup": setup_ctx.get("allowed_setup"),
+        "setup_type_allowed": setup_ctx.get("setup_type_allowed", setup_ctx.get("allowed_setup")),
+        "setup_eligible_now": setup_ctx.get("setup_eligible_now", setup_ctx.get("allowed_setup")),
+        "chop_risk": effective_chop_risk,
+        "candle_overlap_chop_risk": candle_overlap_chop_risk,
+        "adx_value_1h": adx_ctx.get("adx_value_1h"),
+        "plus_di_1h": adx_ctx.get("plus_di_1h"),
+        "minus_di_1h": adx_ctx.get("minus_di_1h"),
+        "adx_trend": adx_ctx.get("adx_trend"),
+        "chop_risk_from_adx": adx_ctx.get("chop_risk_from_adx"),
+    }
+
+
+def _status_field(value: Any, confirmed: bool) -> Dict[str, Any]:
+
+    return {"status": "confirmed" if confirmed else "unconfirmed", "value": value}
+
+
+def _chart_alignment_ok(option_type: str, chart_check: Optional[Dict[str, Any]]) -> Optional[bool]:
+    if not chart_check or not chart_check.get("ok"):
+        return None
+    side = chart_check.get("price_vs_ema50_1h")
+    return side == "above" if option_type == "C" else side == "below"
+
+
+def _final_verdict(
+    request: OnDemandRequest,
+    engine_status: str,
+    chart_alignment: Optional[bool],
+    market_context: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+    iv_context: Optional[Dict[str, Any]],
+    trigger_state: Dict[str, Any],
+    wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    if request.open_positions > 0:
+        return "NO_TRADE"
+    if request.weekly_trade_count >= 4:
+        return "NO_TRADE"
+    if macro_context.get("ok") and (
+        macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
+    ):
+        return "NO_TRADE"
+    if liquidity_context.get("liquidity_pass") is False:
+        return "NO_TRADE"
+    if (iv_context or {}).get("hard_block") is True:
+        return "NO_TRADE"
+    if (wall_thesis_fit_context or {}).get("wall_thesis_fit_status") == "fail":
+        return "NO_TRADE"
+
+    pending_completed_candle_approval = bool(
+        trigger_state.get("pending_completed_candle_approval") is True
+        or str(trigger_state.get("why") or "").strip().lower() == "pending_completed_candle_approval"
+    )
+
+    if chart_alignment is False:
+        return "NO_TRADE"
+    if structure_context.get("ok"):
+        if structure_context.get("setup_type_allowed") is False:
+            return "NO_TRADE"
+        if structure_context.get("room_hard_fail") is True:
+            return "NO_TRADE"
+        if structure_context.get("wall_pass") is False:
+            return "NO_TRADE"
+        if structure_context.get("ath_open_air_blocks_now") is True and not pending_completed_candle_approval:
+            return "NO_TRADE"
+        if structure_context.get("continuation_window_late") is True:
+            return "NO_TRADE"
+        if structure_context.get("extension_state") == "extended" and not (
+            pending_completed_candle_approval and structure_context.get("extension_soft_flag") is True
+        ):
+            return "NO_TRADE"
+        if structure_context.get("chop_risk") is True:
+            return "NO_TRADE"
+
+    if str(trigger_state.get("why") or "").strip().lower() == "next_bar_hold_failed":
+        return "NO_TRADE"
+
+    if pending_completed_candle_approval:
+        return "PENDING"
+
+    if engine_status == "NO_TRADE":
+        return "NO_TRADE"
+
+    if not market_context["is_open"]:
+        return "PENDING"
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return "PENDING"
+
+    if trigger_state.get("trigger_present") is True:
+        return "TRADE"
+    return "PENDING"
+
+
+def _build_chart_confirmation_block(
+    request: OnDemandRequest,
+    chart_check: Optional[Dict[str, Any]],
+    chart_check_error: Optional[str],
+    structure_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    one_hour_confirmed = bool(chart_check and chart_check.get("ok"))
+    structure_confirmed = bool(structure_context.get("ok"))
+    confirmed = bool(one_hour_confirmed and structure_confirmed and not chart_check_error)
+
+    if confirmed:
+        message = "Chart confirmation available from this run."
+    elif chart_check_error:
+        message = "Candidate engine result only - chart confirmation still required. Chart check failed in this run."
+    elif one_hour_confirmed and not structure_confirmed:
+        message = "Candidate engine result only - structure confirmation still required."
+    else:
+        message = "Candidate engine result only - chart confirmation still required."
+
+    return {
+        "confirmed": confirmed,
+        "message": message,
+        "fields": {
+            "one_hour_50_ema": _status_field(chart_check.get("ema50_1h") if chart_check else None, one_hour_confirmed),
+            "one_hour_price_vs_50_ema": _status_field(chart_check.get("price_vs_ema50_1h") if chart_check else None, one_hour_confirmed),
+            "latest_close": _status_field(chart_check.get("latest_close") if chart_check else None, one_hour_confirmed),
+            "twentyfour_hour_trend": _status_field(structure_context.get("twentyfour_hour_trend"), structure_confirmed),
+            "room_to_first_wall": _status_field(structure_context.get("room_to_first_wall"), structure_confirmed),
+            "first_wall": _status_field(structure_context.get("first_wall"), structure_confirmed),
+            "next_pocket": _status_field(structure_context.get("next_pocket"), structure_confirmed),
+            "room_ratio": _status_field(structure_context.get("room_ratio"), structure_confirmed),
+            "wall_thesis": _status_field(structure_context.get("wall_thesis"), structure_confirmed),
+            "extension_state": _status_field(structure_context.get("extension_state"), structure_confirmed),
+            "iv_state": _status_field(structure_context.get("iv_state"), False),
+            "setup_type": _status_field(structure_context.get("setup_type"), structure_confirmed),
+            "trend_label": _status_field(structure_context.get("trend_label"), structure_confirmed),
+            "open_positions_state": _status_field(request.open_positions, True),
+            "weekly_trade_count_state": _status_field(request.weekly_trade_count, True),
+        },
+    }
+
+
+def _compact_chart_check_summary(chart_check: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not chart_check:
+        return {
+            "ok": False,
+            "why": "chart_check_unavailable",
+        }
+
+    if not chart_check.get("ok"):
+        summary = {
+            "ok": False,
+            "symbol": chart_check.get("symbol"),
+        }
+        for key in ("why", "error", "message", "status"):
+            if chart_check.get(key) is not None:
+                summary[key] = chart_check.get(key)
+        if len(summary) == 2:
+            summary["why"] = "chart_check_unavailable"
+        return summary
+
+    return {
+        "ok": True,
+        "symbol": chart_check.get("symbol"),
+        "latest_close": chart_check.get("latest_close"),
+        "ema50_1h": chart_check.get("ema50_1h"),
+        "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h"),
+        "latest_candle_time": chart_check.get("latest_candle_time"),
+        "candle_count": chart_check.get("candle_count"),
+    }
+
+
+def _build_chart_confirmation_entry(
+    request: OnDemandRequest,
+    symbol: Optional[str],
+    chart_check: Optional[Dict[str, Any]],
+    chart_check_error: Optional[str],
+    structure_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    chart_confirmation = _build_chart_confirmation_block(
+        request=request,
+        chart_check=chart_check,
+        chart_check_error=chart_check_error,
+        structure_context=structure_context,
+    )
+    return {
+        "ticker": symbol,
+        "confirmed": chart_confirmation.get("confirmed"),
+        "message": chart_confirmation.get("message"),
+        "fields": chart_confirmation.get("fields"),
+        "chart_check": _compact_chart_check_summary(chart_check),
+        "trap_check_context": _build_trap_check_context(structure_context),
+    }
+
+
+def _build_universe_chart_confirmation_block(
+    request: OnDemandRequest,
+    screened_candidates: List[Dict[str, Any]],
+    include_chart_checks: bool,
+) -> Dict[str, Any]:
+    if not include_chart_checks:
+        return {
+            "ok": True,
+            "requested": False,
+            "all_tickers_confirmed": False,
+            "confirmed_tickers": [],
+            "unconfirmed_tickers": list(SYMBOL_ORDER),
+            "tickers": [],
+            "message": "Universe chart confirmation was not requested in this run.",
+        }
+
+    entries = [
+        _build_chart_confirmation_entry(
+            request=request,
+            symbol=item.get("symbol"),
+            chart_check=item.get("chart_check"),
+            chart_check_error=item.get("chart_check_error"),
+            structure_context=item.get("structure_context") or {"ok": False, "why": "structure_context_unavailable"},
+        )
+        for item in sorted(
+            screened_candidates,
+            key=lambda item: SYMBOL_ORDER.index(item.get("symbol")) if item.get("symbol") in SYMBOL_ORDER else 999999,
+        )
+    ]
+
+    confirmed_tickers = [entry.get("ticker") for entry in entries if entry.get("confirmed")]
+    unconfirmed_tickers = [entry.get("ticker") for entry in entries if not entry.get("confirmed")]
+
+    return {
+        "ok": True,
+        "requested": True,
+        "all_tickers_confirmed": len(entries) > 0 and not unconfirmed_tickers,
+        "confirmed_tickers": confirmed_tickers,
+        "unconfirmed_tickers": unconfirmed_tickers,
+        "tickers": entries,
+        "message": "Universe chart confirmation block for SPY, QQQ, IWM, and GLD.",
+    }
+
+
+
+def _build_user_facing_block(
+    request: OnDemandRequest,
+    engine_status: str,
+    final_verdict: str,
+    best_ticker: Optional[str],
+    chart_check: Optional[Dict[str, Any]],
+    chart_check_error: Optional[str],
+    engine_reason: str,
+    market_context: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+    iv_context: Optional[Dict[str, Any]],
+    trigger_state: Dict[str, Any],
+    wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    ticker = best_ticker or "UNKNOWN"
+    ema_text = str(chart_check.get("ema50_1h")) if chart_check and chart_check.get("ok") else "unconfirmed"
+    market_closed_context = bool(
+        (market_context.get("is_open") is False)
+        or (str(time_day_gate.get("reason") or "").strip().lower() == "market_closed")
+    )
+    action_when_blocked = "wait for next session" if market_closed_context else "stand down"
+    continuation_context = structure_context.get("continuation_context") or {}
+    continuation_message = continuation_context.get("status_message")
+
+    if request.open_positions > 0:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": action_when_blocked,
+            "invalidation": "No new entry allowed while open_positions > 0.",
+            "setup_state": "NO TRADE",
+            "why": "You already have 1 open position. SAFE-FAST allows max 1 open trade total.",
+        }
+
+    if request.weekly_trade_count >= 4:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": action_when_blocked,
+            "invalidation": "No new entry allowed after max weekly trade count is reached.",
+            "setup_state": "NO TRADE",
+            "why": "Weekly trade count is already at or above the SAFE-FAST max.",
+        }
+
+    if macro_context.get("ok") and (
+        macro_context.get("has_major_event_today") or macro_context.get("has_major_event_tomorrow")
+    ):
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": action_when_blocked,
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "NO TRADE",
+            "why": _decorate_why(
+                macro_context.get("note") or "Major event risk is inside the expected hold window.",
+                market_closed_context=market_closed_context,
+            ),
+        }
+
+    if liquidity_context.get("liquidity_pass") is False:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": action_when_blocked,
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "NO TRADE",
+            "why": _decorate_why(
+                liquidity_context.get("why") or "Options liquidity is too wide for a clean SAFE-FAST entry.",
+                market_closed_context=market_closed_context,
+            ),
+        }
+
+    pending_completed_candle_approval = bool(
+        trigger_state.get("pending_completed_candle_approval") is True
+        or str(trigger_state.get("why") or "").strip().lower() == "pending_completed_candle_approval"
+    )
+
+    if (engine_status == "NO_TRADE" or not best_ticker) and not pending_completed_candle_approval:
+        why = engine_reason
+        if chart_check_error:
+            why = "Chart check failed in this run."
+        if market_closed_context and why == "market_closed":
+            why = "After-hours review only. No structurally valid setup is live from the current read."
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": action_when_blocked,
+            "invalidation": "No valid candidate engine setup is available.",
+            "setup_state": "NO TRADE",
+            "why": _decorate_why(why, market_closed_context=False),
+        }
+
+    if structure_context.get("ok"):
+        if structure_context.get("setup_type_allowed") is False:
+            reason = f"Setup type is {structure_context.get('setup_type')}, which is not one of the allowed SAFE-FAST setup types."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": action_when_blocked,
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
+        if structure_context.get("room_hard_fail") is True or structure_context.get("room_pass") is False:
+            reason = "Room to first wall is too tight for SAFE-FAST."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": action_when_blocked,
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
+        if structure_context.get("wall_pass") is False:
+            reason = "Wall thesis and strike placement do not match."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": action_when_blocked,
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
+        if (wall_thesis_fit_context or {}).get("wall_thesis_fit_status") == "fail":
+            reason = (wall_thesis_fit_context or {}).get("why_wall_thesis_fit_passes_or_fails") or "Wall thesis and strike placement do not match."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": action_when_blocked,
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
+        if structure_context.get("continuation_window_late") is True and continuation_message:
+            reason = continuation_message
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": action_when_blocked,
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
+        hold_progress_message = _continuation_hold_progress_message(continuation_context)
+        if _continuation_family_detected(structure_context.get("continuation_context")) and (hold_progress_message or continuation_message):
+            continuation_exact_reason = str(continuation_context.get("exact_reason") or "").strip().lower()
+            continuation_main_blocker = str(continuation_context.get("main_blocker") or "").strip().lower()
+            if hold_progress_message or continuation_exact_reason in {"early", "late"} or continuation_main_blocker in {"no_proven_hold", "no_valid_trigger", "move_too_extended"}:
+                reason = hold_progress_message or continuation_message
+                if market_closed_context:
+                    reason = f"After-hours structural read: {reason}"
+                return {
+                    "good_idea_now": "NO",
+                    "ticker": ticker,
+                    "action": action_when_blocked,
+                    "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                    "setup_state": "NO TRADE",
+                    "why": reason,
+                }
+        if structure_context.get("extension_state") == "extended":
+            reason = "Move is extended versus the RTH 1H 50 EMA or too late relative to the first wall."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": action_when_blocked,
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
+        if structure_context.get("chop_risk") is True:
+            reason = "1H structure around the 50 EMA is not clean."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": action_when_blocked,
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
+
+    if market_closed_context:
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": "wait for next session",
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "CONTEXT ONLY",
+            "why": "Market is closed. This is context only; any live entry must wait for the next regular session.",
+        }
+
+    if final_verdict == "TRADE":
+        trade_why = continuation_message if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message else "Trigger is live and the current SAFE-FAST gates pass."
+        trade_action = "enter"
+        if trigger_state.get("why") == "completed_candle_trigger_approved":
+            trade_action = "enter from completed-candle approval"
+        return {
+            "good_idea_now": "YES",
+            "ticker": ticker,
+            "action": trade_action,
+            "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+            "setup_state": "TRADE",
+            "why": trade_why,
+        }
+
+    if final_verdict == "NO_TRADE":
+        why = continuation_message if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message else "Best ticker failed the 1H EMA alignment check."
+        if chart_check_error:
+            why = "Chart check failed in this run."
+        return {
+            "good_idea_now": "NO",
+            "ticker": ticker,
+            "action": action_when_blocked,
+            "invalidation": "No valid new entry from the current combined read.",
+            "setup_state": "NO TRADE",
+            "why": why,
+        }
+
+    if str(trigger_state.get("why") or "").strip().lower() == "pending_completed_candle_approval":
+        pending_why = "Intrabar shelf break is visible. SAFE-FAST is pending the completed 1H close for approval."
+        pending_action = "wait for completed 1H close"
+    else:
+        pending_why = continuation_message if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message else "Structure is acceptable, but trigger/entry timing still needs confirmation."
+        pending_action = "wait for live trigger"
+        if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_context.get("shelf_proven") is not True:
+            pending_action = "wait for hold to prove"
+    return {
+        "good_idea_now": "NO",
+        "ticker": ticker,
+        "action": pending_action,
+        "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+        "setup_state": "PENDING",
+        "why": pending_why,
+    }
+
+
+def _build_breakout_hold_context(
+    option_type: str,
+    current_close: Optional[float],
+    trigger_level: Optional[float],
+    structure_context: Optional[Dict[str, Any]],
+    breakout_candle: Optional[Dict[str, Any]] = None,
+    follow_through_candle: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    first_wall = _to_float((structure_context or {}).get("first_wall"))
+    candidates = [level for level in [trigger_level, first_wall] if level is not None]
+    hold_reference_level: Optional[float] = None
+    hold_confirmed = False
+    hold_style = "close_only"
+    reclaim_limit_level: Optional[float] = None
+
+    if candidates:
+        if option_type == "C":
+            hold_reference_level = max(candidates)
+        else:
+            hold_reference_level = min(candidates)
+
+    breakout_open = _to_float((breakout_candle or {}).get("open"))
+    breakout_high = _to_float((breakout_candle or {}).get("high"))
+    breakout_low = _to_float((breakout_candle or {}).get("low"))
+    breakout_close = _to_float((breakout_candle or {}).get("close"))
+
+    follow_open = _to_float((follow_through_candle or {}).get("open"))
+    follow_low = _to_float((follow_through_candle or {}).get("low"))
+    follow_close = _to_float((follow_through_candle or {}).get("close"))
+
+    if hold_reference_level is not None and breakout_candle and follow_through_candle:
+        hold_style = "next_bar_hold"
+        breakout_range = None
+        if breakout_high is not None and breakout_low is not None:
+            breakout_range = abs(breakout_high - breakout_low)
+
+        if option_type == "C":
+            reclaim_limit_level = hold_reference_level
+            if breakout_range is not None and breakout_close is not None:
+                reclaim_limit_level = max(hold_reference_level, breakout_close - (breakout_range / 3.0))
+            hold_confirmed = bool(
+                breakout_close is not None
+                and breakout_close > hold_reference_level
+                and follow_open is not None
+                and follow_open >= hold_reference_level
+                and follow_close is not None
+                and follow_close > hold_reference_level
+                and follow_low is not None
+                and follow_low >= reclaim_limit_level
+            )
+        else:
+            reclaim_limit_level = hold_reference_level
+            if breakout_range is not None and breakout_close is not None:
+                reclaim_limit_level = min(hold_reference_level, breakout_close + (breakout_range / 3.0))
+            hold_confirmed = bool(
+                breakout_close is not None
+                and breakout_close < hold_reference_level
+                and follow_open is not None
+                and follow_open <= hold_reference_level
+                and follow_close is not None
+                and follow_close < hold_reference_level
+                and follow_low is not None
+                and follow_low <= reclaim_limit_level
+            )
+    elif hold_reference_level is not None:
+        if option_type == "C":
+            hold_confirmed = bool(current_close is not None and current_close > hold_reference_level)
+        else:
+            hold_confirmed = bool(current_close is not None and current_close < hold_reference_level)
+
+    if hold_reference_level is None:
+        reason = "hold_reference_unavailable"
+    elif hold_confirmed and hold_style == "next_bar_hold":
+        reason = "next_bar_hold_confirmed"
+    elif hold_confirmed:
+        reason = "breakout_hold_confirmed"
+    elif hold_style == "next_bar_hold":
+        reason = "next_bar_hold_not_confirmed"
+    else:
+        reason = "breakout_hold_not_confirmed"
+
+    return {
+        "hold_reference_level": _round_or_none(hold_reference_level, 4),
+        "hold_confirmed": hold_confirmed,
+        "hold_style": hold_style,
+        "reclaim_limit_level": _round_or_none(reclaim_limit_level, 4),
+        "reason": reason,
+    }
+
+
+def _build_trigger_state(
+    option_type: str,
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    continuation_context = structure_context.get("continuation_context") or {}
+    continuation_mode = _continuation_family_detected(structure_context.get("continuation_context"))
+    trigger_style = "close_above_recent_high" if option_type == "C" else "close_below_recent_low"
+    if continuation_mode:
+        trigger_style = "first_close_above_shelf_high" if option_type == "C" else "first_close_below_shelf_low"
+
+    market_open = bool(market_context.get("is_open"))
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed"))
+    time_gate_reason = str(time_day_gate.get("reason") or "").strip() or "time_day_gate_blocked"
+
+    if not chart_check or not chart_check.get("ok"):
+        return {
+            "ok": False,
+            "trigger_present": False,
+            "structural_trigger_present": False,
+            "current_bar_trigger_present": False,
+            "completed_candle_trigger_present": False,
+            "trigger_style": trigger_style,
+            "trigger_level": None,
+            "current_close": None,
+            "price_vs_ema50_1h": None,
+            "structure_ready": None,
+            "live_entry_requires_market_open": not market_open,
+            "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
+            "why": "chart_unavailable",
+        }
+
+    recent = chart_check.get("recent_candles") or []
+    current_close = _to_float(chart_check.get("latest_close"))
+    price_side = chart_check.get("price_vs_ema50_1h")
+    ema50_1h = _to_float(chart_check.get("ema50_1h"))
+
+    if len(recent) < 2 or current_close is None:
+        return {
+            "ok": False,
+            "trigger_present": False,
+            "structural_trigger_present": False,
+            "current_bar_trigger_present": False,
+            "completed_candle_trigger_present": False,
+            "trigger_style": trigger_style,
+            "trigger_level": None,
+            "current_close": current_close,
+            "price_vs_ema50_1h": price_side,
+            "structure_ready": None,
+            "live_entry_requires_market_open": not market_open,
+            "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
+            "why": "insufficient_recent_candles",
+        }
+
+    if continuation_mode and continuation_context:
+        trigger_level = _to_float(continuation_context.get("trigger_level"))
+        current_bar_candle = recent[-1] if recent else None
+        completed_candle = recent[-2] if len(recent) >= 2 else None
+        completed_close = _to_float((completed_candle or {}).get("close"))
+        current_side_ok = bool(
+            (option_type == "C" and current_close is not None and (ema50_1h is None or current_close > ema50_1h))
+            or (option_type == "P" and current_close is not None and (ema50_1h is None or current_close < ema50_1h))
+        )
+        completed_side_ok = bool(
+            (option_type == "C" and completed_close is not None and (ema50_1h is None or completed_close > ema50_1h))
+            or (option_type == "P" and completed_close is not None and (ema50_1h is None or completed_close < ema50_1h))
+        )
+
+        if option_type == "C":
+            current_crossed = bool(trigger_level is not None and current_close is not None and current_close > trigger_level)
+            completed_crossed = bool(trigger_level is not None and completed_close is not None and completed_close > trigger_level)
+        else:
+            current_crossed = bool(trigger_level is not None and current_close is not None and current_close < trigger_level)
+            completed_crossed = bool(trigger_level is not None and completed_close is not None and completed_close < trigger_level)
+
+        effective_chop_block = bool(
+            structure_context.get("noisy_chop_explicit") is True
+            or (
+                structure_context.get("chop_risk") is True
+                and structure_context.get("valid_post_impulse_shelf_not_chop") is not True
+            )
+        )
+
+        hard_trap_block = bool(
+            structure_context.get("hidden_left_cluster_found") is True
+            or structure_context.get("parabolic_exhaustion") is True
+            or structure_context.get("room_hard_fail") is True
+        )
+
+        soft_extension_only = bool(
+            structure_context.get("extension_blocks_now") is True
+            and structure_context.get("extension_soft_flag") is True
+            and hard_trap_block is False
+            and effective_chop_block is False
+        )
+
+        structure_ok = bool(
+            structure_context.get("allowed_setup") is True
+            and structure_context.get("wall_pass") is True
+            and structure_context.get("room_hard_fail") is not True
+            and structure_context.get("room_pass") is not False
+            and effective_chop_block is False
+            and continuation_context.get("shelf_proven") is True
+            and continuation_context.get("reclaim_hold_proven") is True
+            and continuation_context.get("exact_reason") != "late"
+            and (
+                structure_context.get("extension_blocks_now") is not True
+                or soft_extension_only
+            )
+        )
+
+        pending_completed_candle_approval = bool(
+            current_crossed
+            and current_side_ok
+            and not completed_crossed
+            and structure_context.get("allowed_setup") is True
+            and structure_context.get("wall_pass") is True
+            and structure_context.get("room_hard_fail") is not True
+            and structure_context.get("room_pass") is not False
+            and effective_chop_block is False
+            and continuation_context.get("exact_reason") != "late"
+            and (
+                continuation_context.get("reclaim_hold_proven") is True
+                or continuation_context.get("breakout_completed") is True
+                or continuation_context.get("current_breakout_without_completed_confirmation") is True
+            )
+            and soft_extension_only
+        )
+
+        completed_candle_window_ready = bool(
+            continuation_context.get("inside_tradeable_window") is True
+            or continuation_context.get("current_break_is_first_completed_break") is True
+            or continuation_context.get("breakout_completed") is True
+        )
+
+        completed_candle_structural_trigger_present = bool(
+            structure_ok
+            and completed_crossed
+            and completed_side_ok
+            and completed_candle_window_ready
+        )
+        current_bar_structural_trigger_present = False
+        structural_trigger_present = bool(completed_candle_structural_trigger_present)
+        live_trigger_present = bool(structural_trigger_present and market_open and fresh_entry_allowed)
+
+        if continuation_context.get("exact_reason") == "late":
+            why = "too_late_from_hold"
+        elif completed_candle_structural_trigger_present and market_open and fresh_entry_allowed:
+            why = "completed_candle_trigger_approved"
+        elif completed_candle_structural_trigger_present and not market_open:
+            why = "completed_candle_trigger_market_closed"
+        elif completed_candle_structural_trigger_present and not fresh_entry_allowed:
+            why = time_gate_reason
+        elif pending_completed_candle_approval:
+            why = "pending_completed_candle_approval"
+        elif continuation_context.get("shelf_proven") is not True:
+            why = "too_early_hold_not_proven"
+        elif current_crossed and current_side_ok and not completed_crossed:
+            why = "waiting_for_completed_shelf_break_close"
+        elif continuation_context.get("breakout_completed") is not True:
+            why = "no_valid_continuation_trigger"
+        elif not structure_ok:
+            why = "structure_not_ready"
+        else:
+            why = "no_valid_continuation_trigger"
+
+        return {
+            "ok": True,
+            "trigger_present": live_trigger_present,
+            "structural_trigger_present": structural_trigger_present,
+            "current_bar_trigger_present": False,
+            "completed_candle_trigger_present": bool(completed_candle_structural_trigger_present and market_open and fresh_entry_allowed),
+            "pending_completed_candle_approval": pending_completed_candle_approval,
+            "trigger_style": trigger_style,
+            "trigger_level": _round_or_none(trigger_level, 4),
+            "current_close": _round_or_none(current_close, 4),
+            "price_vs_ema50_1h": price_side,
+            "structure_ready": structure_ok,
+            "live_entry_requires_market_open": not market_open,
+            "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
+            "breakout_hold_current_confirmed": continuation_context.get("shelf_proven"),
+            "breakout_hold_completed_confirmed": continuation_context.get("shelf_proven"),
+            "breakout_hold_reference_current": continuation_context.get("trigger_level"),
+            "breakout_hold_reference_completed": continuation_context.get("trigger_level"),
+            "continuation_exact_reason": continuation_context.get("exact_reason"),
+            "continuation_status_message": continuation_context.get("status_message"),
+            "why": why,
+        }
+
+    prior = recent[:-1] if len(recent) >= 2 else recent
+    current_window = prior[-3:] if len(prior) >= 3 else prior
+
+    if option_type == "C":
+        current_trigger_level = max((c.get("high") for c in current_window if c.get("high") is not None), default=None)
+        current_crossed = bool(current_trigger_level is not None and current_close > current_trigger_level)
+        current_side_ok = price_side == "above"
+    else:
+        current_trigger_level = min((c.get("low") for c in current_window if c.get("low") is not None), default=None)
+        current_crossed = bool(current_trigger_level is not None and current_close < current_trigger_level)
+        current_side_ok = price_side == "below"
+
+    completed_candle = prior[-1] if prior else None
+    completed_window = prior[:-1]
+    completed_window = completed_window[-3:] if len(completed_window) >= 3 else completed_window
+
+    completed_close = _to_float(completed_candle.get("close")) if completed_candle else None
+    completed_side_ok = False
+    completed_crossed = False
+    completed_trigger_level = current_trigger_level
+
+    if option_type == "C":
+        completed_trigger_level = max((c.get("high") for c in completed_window if c.get("high") is not None), default=current_trigger_level)
+        completed_side_ok = bool(
+            completed_close is not None
+            and (
+                (ema50_1h is not None and completed_close > ema50_1h)
+                or price_side == "above"
+            )
+        )
+        completed_crossed = bool(completed_trigger_level is not None and completed_close is not None and completed_close > completed_trigger_level)
+    else:
+        completed_trigger_level = min((c.get("low") for c in completed_window if c.get("low") is not None), default=current_trigger_level)
+        completed_side_ok = bool(
+            completed_close is not None
+            and (
+                (ema50_1h is not None and completed_close < ema50_1h)
+                or price_side == "below"
+            )
+        )
+        completed_crossed = bool(completed_trigger_level is not None and completed_close is not None and completed_close < completed_trigger_level)
+
+    current_bar_candle = recent[-1] if recent else None
+
+    current_breakout_hold = _build_breakout_hold_context(
+        option_type=option_type,
+        current_close=current_close,
+        trigger_level=completed_trigger_level,
+        structure_context=structure_context,
+        breakout_candle=completed_candle,
+        follow_through_candle=current_bar_candle,
+    )
+    completed_breakout_hold = _build_breakout_hold_context(
+        option_type=option_type,
+        current_close=current_close,
+        trigger_level=completed_trigger_level,
+        structure_context=structure_context,
+        breakout_candle=completed_candle,
+        follow_through_candle=current_bar_candle,
+    )
+
+    structure_ok = bool(
+        structure_context.get("allowed_setup") is True
+        and structure_context.get("wall_pass") is True
+        and structure_context.get("room_hard_fail") is not True
+        and structure_context.get("extension_blocks_now") is not True
+        and structure_context.get("chop_risk") is False
+        and structure_context.get("noisy_chop_explicit") is not True
+    )
+
+    current_bar_structural_trigger_present = bool(
+        completed_crossed and current_side_ok and structure_ok and current_breakout_hold.get("hold_confirmed") is True
+    )
+    completed_candle_structural_trigger_present = bool(
+        completed_crossed and completed_side_ok and structure_ok and completed_breakout_hold.get("hold_confirmed") is True
+    )
+    structural_trigger_present = bool(current_bar_structural_trigger_present or completed_candle_structural_trigger_present)
+    live_trigger_present = bool(structural_trigger_present and market_open and fresh_entry_allowed)
+
+    why = "trigger_present" if current_bar_structural_trigger_present else "close_trigger_not_hit"
+    if not structure_ok:
+        why = "structure_not_ready"
+    elif completed_crossed and completed_side_ok and completed_breakout_hold.get("hold_confirmed") is not True:
+        hold_failed_back_through_level = bool(
+            (option_type == "C" and current_close is not None and completed_trigger_level is not None and current_close <= completed_trigger_level)
+            or (option_type == "P" and current_close is not None and completed_trigger_level is not None and current_close >= completed_trigger_level)
+        )
+        if hold_failed_back_through_level:
+            why = "next_bar_hold_failed"
+        else:
+            why = completed_breakout_hold.get("reason") or "next_bar_hold_not_confirmed"
+    elif current_crossed and current_side_ok and not completed_crossed:
+        why = "waiting_for_completed_breakout_close"
+    elif current_bar_structural_trigger_present and not market_open:
+        why = "structural_trigger_present_market_closed"
+    elif current_bar_structural_trigger_present and not fresh_entry_allowed:
+        why = time_gate_reason
+    elif completed_candle_structural_trigger_present and market_open and fresh_entry_allowed:
+        why = "completed_candle_trigger_approved"
+    elif completed_candle_structural_trigger_present and not market_open:
+        why = "completed_candle_trigger_market_closed"
+    elif completed_candle_structural_trigger_present and not fresh_entry_allowed:
+        why = time_gate_reason
+    elif not current_side_ok and not completed_side_ok:
+        why = "wrong_side_of_ema"
+    elif not current_crossed and not completed_crossed:
+        why = "close_trigger_not_hit"
+
+    return {
+        "ok": True,
+        "trigger_present": live_trigger_present,
+        "structural_trigger_present": structural_trigger_present,
+        "current_bar_trigger_present": bool(current_bar_structural_trigger_present and market_open and fresh_entry_allowed),
+        "completed_candle_trigger_present": bool(completed_candle_structural_trigger_present and market_open and fresh_entry_allowed),
+        "trigger_style": trigger_style,
+        "trigger_level": _round_or_none(current_trigger_level, 4),
+        "current_close": _round_or_none(current_close, 4),
+        "price_vs_ema50_1h": price_side,
+        "structure_ready": structure_ok,
+        "live_entry_requires_market_open": not market_open,
+        "live_entry_waiting_on": "market_open" if not market_open else (time_gate_reason if not fresh_entry_allowed else None),
+        "breakout_hold_current_confirmed": current_breakout_hold.get("hold_confirmed"),
+        "breakout_hold_completed_confirmed": completed_breakout_hold.get("hold_confirmed"),
+        "breakout_hold_reference_current": current_breakout_hold.get("hold_reference_level"),
+        "breakout_hold_reference_completed": completed_breakout_hold.get("hold_reference_level"),
+        "why": why,
+    }
+
+
+def _build_targets_block(primary_candidate: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not primary_candidate:
+        return {
+            "ok": False,
+            "debit": None,
+            "max_loss_dollars_1lot": None,
+            "target_40_pct_value": None,
+            "target_50_pct_value": None,
+            "target_60_pct_value": None,
+            "target_70_pct_value": None,
+        }
+
+    debit = _to_float(primary_candidate.get("est_debit"))
+    max_loss = _to_float(primary_candidate.get("max_loss_dollars_1lot"))
+    if debit is None:
+        return {
+            "ok": False,
+            "debit": None,
+            "max_loss_dollars_1lot": max_loss,
+            "target_40_pct_value": None,
+            "target_50_pct_value": None,
+            "target_60_pct_value": None,
+            "target_70_pct_value": None,
+        }
+
+    return {
+        "ok": True,
+        "debit": debit,
+        "max_loss_dollars_1lot": max_loss,
+        "target_40_pct_value": round(debit * 1.40, 4),
+        "target_50_pct_value": round(debit * 1.50, 4),
+        "target_60_pct_value": round(debit * 1.60, 4),
+        "target_70_pct_value": round(debit * 1.70, 4),
+    }
+
+
+
+
+def _build_checklist_block(
+    request: OnDemandRequest,
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+    liquidity_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    ema_value = chart_check.get("ema50_1h") if chart_check else None
+    price_side = chart_check.get("price_vs_ema50_1h") if chart_check else None
+    continuation_context = structure_context.get("continuation_context") or {}
+    continuation_mode = _continuation_family_detected(structure_context.get("continuation_context"))
+    continuation_late = bool(continuation_context.get("exact_reason") == "late")
+
+    clear_trigger_yes = bool(trigger_state.get("trigger_present") is True)
+    early_enough_yes = bool(structure_context.get("extension_blocks_now") is not True and structure_context.get("ath_open_air_blocks_now") is not True)
+
+    if continuation_mode:
+        clear_trigger_yes = bool(trigger_state.get("trigger_present") is True)
+        early_enough_yes = bool(
+            structure_context.get("extension_blocks_now") is not True
+            and structure_context.get("ath_open_air_blocks_now") is not True
+            and not continuation_late
+        )
+
+    continuation_open_air_room_pass = bool(
+        continuation_mode
+        and structure_context.get("room_pass") is True
+        and structure_context.get("first_wall") is None
+        and structure_context.get("price_vs_ema50_1h", price_side) == "above"
+    )
+    clear_room_yes = bool(
+        structure_context.get("room_hard_fail") is not True
+        and (
+            continuation_open_air_room_pass
+            or (
+                structure_context.get("ath_open_air_blocks_now") is not True
+                and (
+                    structure_context.get("room_pass") is not False
+                    or (
+                        structure_context.get("first_wall") is None
+                        and structure_context.get("price_vs_ema50_1h", price_side) == "above"
+                    )
+                )
+            )
+        )
+    )
+
+    items = [
+        {"item": "allowed_setup_type", "yes": bool(_is_allowed_setup_type_name(structure_context.get("setup_type")) or continuation_mode)},
+        {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is not False)},
+        {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False and structure_context.get("noisy_chop_explicit") is not True)},
+        {"item": "clear_room", "yes": clear_room_yes},
+        {"item": "early_enough", "yes": early_enough_yes},
+        {"item": "clear_trigger", "yes": clear_trigger_yes},
+        {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
+        {"item": "invalidation_clear", "yes": bool(ema_value is not None)},
+        {"item": "fits_risk", "yes": bool(primary_candidate and primary_candidate.get("fits_risk_budget") is True)},
+        {"item": "open_trade_already", "yes": bool(request.open_positions > 0)},
+    ]
+
+    failed_items = [row["item"] for row in items if not row["yes"] and row["item"] != "open_trade_already"]
+
+    priority_order = [
+        "allowed_setup_type",
+        "twentyfour_hour_supportive",
+        "one_hour_clean_around_ema",
+        "clear_room",
+        "early_enough",
+        "clear_trigger",
+        "liquidity_ok",
+        "invalidation_clear",
+        "fits_risk",
+        "open_trade_already",
+    ]
+    priority_rank = {name: idx for idx, name in enumerate(priority_order)}
+    decision_blockers_priority = sorted(failed_items, key=lambda item: (priority_rank.get(item, 999), item))
+
+    continuation_blocker_override = None
+    continuation_blocker_overrides: List[str] = []
+    continuation_override_allowed = bool(
+        continuation_mode
+        and not any(item in failed_items for item in {"allowed_setup_type", "twentyfour_hour_supportive"})
+    )
+    if continuation_override_allowed:
+        if continuation_context.get("exact_reason") == "late":
+            continuation_blocker_override = continuation_context.get("main_blocker") or "move_too_extended"
+        elif continuation_context.get("exact_reason") == "early":
+            continuation_blocker_override = continuation_context.get("main_blocker") or "no_valid_trigger"
+        if continuation_blocker_override:
+            continuation_blocker_overrides = [continuation_blocker_override] + [
+                item for item in decision_blockers_priority if item != continuation_blocker_override
+            ]
+            decision_blockers_priority = continuation_blocker_overrides
+
+    global_gate_failures: List[str] = []
+    wall_thesis_fit_status = (wall_thesis_fit_context or {}).get("wall_thesis_fit_status")
+    if wall_thesis_fit_status == "fail":
+        global_gate_failures.append("wall_thesis_fit")
+
+    effective_failed_items = list(failed_items)
+    for item in global_gate_failures:
+        if item not in effective_failed_items:
+            effective_failed_items.append(item)
+
+    effective_decision_blockers_priority = list(decision_blockers_priority)
+    for item in global_gate_failures:
+        if item not in effective_decision_blockers_priority:
+            effective_decision_blockers_priority.insert(0, item)
+
+    live_entry_now_available = bool(
+        market_context.get("is_open")
+        and time_day_gate.get("fresh_entry_allowed")
+        and not effective_failed_items
+        and trigger_state.get("trigger_present") is True
+    )
+
+    return {
+        "ok": True,
+        "items": items,
+        "failed_items": failed_items,
+        "decision_blockers_priority": decision_blockers_priority,
+        "effective_failed_items": effective_failed_items,
+        "effective_decision_blockers_priority": effective_decision_blockers_priority,
+        "global_gate_failures": global_gate_failures,
+        "live_entry_now_available": live_entry_now_available,
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "continuation_blocker_override": continuation_blocker_override,
+        "continuation_blocker_overrides": continuation_blocker_overrides,
+    }
+
+
+
+
+def _continuation_one_more_hold_needed(continuation_context: Optional[Dict[str, Any]]) -> bool:
+    continuation_context = continuation_context or {}
+    if str(continuation_context.get("main_blocker") or "").strip().lower() != "no_proven_hold":
+        return False
+    if str(continuation_context.get("exact_reason") or "").strip().lower() != "early":
+        return False
+    if continuation_context.get("shelf_proven") is True:
+        return False
+    if continuation_context.get("breakout_completed") is not True:
+        return False
+    return int(continuation_context.get("hold_closes_above_reclaim_count") or 0) == 1
+
+
+def _continuation_hold_progress_message(continuation_context: Optional[Dict[str, Any]]) -> Optional[str]:
+    continuation_context = continuation_context or {}
+    hold_count = int(continuation_context.get("hold_closes_above_reclaim_count") or 0)
+    main_blocker = str(continuation_context.get("main_blocker") or "").strip().lower()
+    if _continuation_one_more_hold_needed(continuation_context):
+        return (
+            "One completed 1H candle has held above the break area. "
+            "SAFE-FAST still needs 1 more completed 1H candle to prove the hold."
+        )
+    if main_blocker == "no_valid_trigger" and continuation_context.get("reclaim_hold_proven") is True:
+        trigger_level = _round_or_none(_to_float(continuation_context.get("trigger_level")), 4)
+        if trigger_level is not None:
+            return (
+                f"Hold above the break area is proven with {hold_count} completed 1H closes. "
+                f"SAFE-FAST is now waiting for the first completed 1H close above the shelf high {trigger_level}."
+            )
+        return (
+            f"Hold above the break area is proven with {hold_count} completed 1H closes. "
+            "SAFE-FAST is now waiting for the first completed 1H close above the shelf high."
+        )
+    return None
+
+
+def _failed_reason_messages(
+    checklist: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    market_context: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    reasons: List[str] = []
+    continuation_context = structure_context.get("continuation_context") or {}
+
+    mapping = {
+        "allowed_setup_type": "setup type is not allowed",
+        "twentyfour_hour_supportive": "24H context is not supportive",
+        "one_hour_clean_around_ema": "1H structure around the 50 EMA is not clean",
+        "clear_room": "room to the first wall fails",
+        "early_enough": "entry is too late or overextended for SAFE-FAST",
+        "clear_trigger": "no valid live trigger is present",
+        "liquidity_ok": "options liquidity is too wide for a clean debit spread entry",
+        "invalidation_clear": "invalidation is not clear",
+        "fits_risk": "risk does not fit the SAFE-FAST budget",
+        "open_trade_already": "an open trade already exists",
+        "wall_thesis_fit": (wall_thesis_fit_context or {}).get("why_wall_thesis_fit_passes_or_fails") or "Wall thesis and strike placement do not match.",
+        "no_proven_hold": "no proven hold",
+        "no_valid_trigger": "no valid trigger",
+        "move_too_extended": "move too extended",
+    }
+
+    continuation_family = _continuation_family_detected(continuation_context)
+
+    for item in checklist.get("decision_blockers_priority", checklist.get("failed_items", [])):
+        if item == "allowed_setup_type" and continuation_family:
+            continue
+        if item == "twentyfour_hour_supportive" and structure_context.get("twentyfour_hour_supportive") is not False:
+            continue
+        if item == "clear_trigger" and continuation_family and continuation_context.get("main_blocker") in {"no_proven_hold", "move_too_extended"}:
+            continue
+        if item == "clear_room" and continuation_family and structure_context.get("room_pass") is True and structure_context.get("first_wall") is None:
+            continue
+        msg = mapping.get(item)
+        if msg:
+            reasons.append(msg)
+
+    hold_progress_message = _continuation_hold_progress_message(continuation_context)
+    if continuation_family and hold_progress_message:
+        reasons.insert(0, hold_progress_message)
+    elif continuation_family and continuation_context.get("status_message"):
+        reasons.insert(0, continuation_context.get("status_message"))
+    if structure_context.get("extension_state") == "extended":
+        reasons.append("move is extended versus the 1H 50 EMA")
+    if liquidity_context.get("liquidity_pass") is False and liquidity_context.get("why"):
+        reasons.append(liquidity_context.get("why"))
+
+    out: List[str] = []
+    seen = set()
+    for reason in reasons:
+        if reason not in seen:
+            seen.add(reason)
+            out.append(reason)
+    return out
+
+
+def _screened_sort_key(item: Dict[str, Any]) -> Any:
+    structure = item.get("structure_context", {})
+    primary = item.get("primary_candidate") or {}
+    liquidity = item.get("liquidity_context") or {}
+    trigger_state = item.get("trigger_state") or {}
+    checklist = item.get("checklist") or {}
+    continuation_context = structure.get("continuation_context") or {}
+    final_verdict = item.get("final_verdict", "NO_TRADE")
+
+    verdict_rank = {"TRADE": 0, "PENDING": 1, "NO_TRADE": 2}.get(final_verdict, 3)
+    setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
+
+    continuation_main_blocker = str(continuation_context.get("main_blocker") or "").strip().lower()
+    continuation_waiting_for_first_break_close = (
+        continuation_main_blocker == "no_valid_trigger"
+        and continuation_context.get("reclaim_hold_proven") is True
+        and continuation_context.get("breakout_completed") is True
+        and structure.get("room_pass") is True
+    )
+    continuation_progress_rank = (
+        0 if continuation_waiting_for_first_break_close
+        else 1 if _continuation_one_more_hold_needed(continuation_context)
+        else 2 if continuation_main_blocker == "no_proven_hold"
+        else 3
+    )
+
+    room_quality = structure.get("room_quality")
+    room_rank_map = {"pass": 0, "caution": 1, "fail": 2}
+    room_rank = room_rank_map.get(room_quality, 3)
+
+    wall_rank = 0 if structure.get("wall_pass") is True else 1
+
+    ext_state = structure.get("extension_state")
+    ext_rank_map = {"acceptable": 0, "caution": 1, "extended": 2}
+    ext_rank = ext_rank_map.get(ext_state, 3)
+
+    trend_rank = 0 if structure.get("trend_label") == "Trend-aligned" else 1 if structure.get("trend_label") == "Countertrend" else 2
+    liquidity_rank = 0 if liquidity.get("liquidity_pass") is True else 1
+    trigger_rank = 0 if trigger_state.get("trigger_present") is True else 1
+    failed_count = len(checklist.get("failed_items", []))
+    room_ratio = -(structure.get("room_ratio") or -999999)
+    risk_mid = primary.get("distance_from_target_risk_mid", 999999)
+    ticker_rank = SYMBOL_ORDER.index(item["symbol"]) if item.get("symbol") in SYMBOL_ORDER else 999999
+
+    return (
+        verdict_rank,
+        setup_rank,
+        continuation_progress_rank,
+        room_rank,
+        wall_rank,
+        ext_rank,
+        liquidity_rank,
+        trigger_rank,
+        trend_rank,
+        failed_count,
+        room_ratio,
+        risk_mid,
+        ticker_rank,
+    )
+
+
+def _screened_other_candidates(
+    screened: List[Dict[str, Any]],
+    best_ticker: Optional[str],
+    request: OnDemandRequest,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in screened:
+        if item.get("symbol") == best_ticker:
+            continue
+        structure_context = item.get("structure_context") or {"ok": False, "why": "structure_context_unavailable"}
+        out.append(
+            {
+                "symbol": item.get("symbol"),
+                "engine_verdict": item.get("engine_verdict"),
+                "final_verdict": item.get("final_verdict"),
+                "reason": item.get("reason"),
+                "primary_candidate": item.get("primary_candidate"),
+                "chart_check": _compact_chart_check_summary(item.get("chart_check")),
+                "chart_confirmation": _build_chart_confirmation_block(
+                    request=request,
+                    chart_check=item.get("chart_check"),
+                    chart_check_error=item.get("chart_check_error"),
+                    structure_context=structure_context,
+                ),
+                "structure_context": structure_context,
+                "trap_check_context": _build_trap_check_context(structure_context),
+                "liquidity_context": item.get("liquidity_context"),
+                "trigger_state": item.get("trigger_state"),
+                "checklist_failed_items": item.get("checklist", {}).get("failed_items", []),
+            }
+        )
+    return out
+
+
+_COMPACT_TICKER_UNIVERSE_ORDER: Dict[str, int] = {
+    "SPY": 0,
+    "QQQ": 1,
+    "IWM": 2,
+    "GLD": 3,
+}
+
+
+def _compact_ticker_summary_entry(
+    item: Dict[str, Any],
+    *,
+    time_day_gate: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    structure_context = item.get("structure_context") or {}
+    chart_check = item.get("chart_check") or {}
+    trigger_state = item.get("trigger_state") or {}
+    checklist = item.get("checklist") or {}
+    screened_reason = item.get("reason")
+
+    effective_blockers = _effective_blockers(
+        checklist,
+        screened_reason=screened_reason,
+    )
+    effective_primary_blocker = _effective_primary_blocker(
+        checklist,
+        screened_reason=screened_reason,
+    )
+
+    human_primary_blocker = _humanize_blocker_key(effective_primary_blocker) if effective_primary_blocker else None
+    blocker_keys = effective_blockers[:4]
+    human_blockers = [
+        _humanize_blocker_key(blocker) if blocker else blocker
+        for blocker in blocker_keys
+    ]
+    raw_reason = screened_reason
+    human_reason = _humanize_reason_text(raw_reason)
+    raw_trigger_reason = trigger_state.get("why")
+    human_trigger_reason = _humanize_trigger_reason_key(raw_trigger_reason)
+
+    return {
+        "ticker": item.get("symbol"),
+        "engine_verdict": item.get("engine_verdict"),
+        "final_verdict": item.get("final_verdict"),
+        "primary_blocker": human_primary_blocker or effective_primary_blocker,
+        "primary_blocker_key": effective_primary_blocker if human_primary_blocker and human_primary_blocker != effective_primary_blocker else None,
+        "blockers": human_blockers,
+        "blocker_keys": blocker_keys if human_blockers != blocker_keys else None,
+        "reason": human_reason or raw_reason,
+        "reason_key": raw_reason if human_reason and human_reason != raw_reason else None,
+        "setup_type": structure_context.get("setup_type"),
+        "trend_label": structure_context.get("trend_label"),
+        "room_to_first_wall": structure_context.get("room_to_first_wall"),
+        "first_wall": structure_context.get("first_wall"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_state": structure_context.get("extension_state"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": human_trigger_reason or raw_trigger_reason,
+        "trigger_reason_key": raw_trigger_reason if human_trigger_reason and human_trigger_reason != raw_trigger_reason else None,
+        "ema50_1h": chart_check.get("ema50_1h"),
+        "latest_close": chart_check.get("latest_close"),
+        "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h"),
+    }
+
+
+def _build_compact_ticker_summaries(
+    screened_candidates: List[Dict[str, Any]],
+    *,
+    time_day_gate: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    ordered_candidates = sorted(
+        screened_candidates,
+        key=lambda item: (
+            _COMPACT_TICKER_UNIVERSE_ORDER.get(str(item.get("symbol")), 99),
+            str(item.get("symbol") or ""),
+        ),
+    )
+    return [
+        _compact_ticker_summary_entry(item, time_day_gate=time_day_gate)
+        for item in ordered_candidates
+    ]
+
+
+def _should_freeze_winner_to_raw_engine(
+    *,
+    summary_payload: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+) -> bool:
+    raw_best_ticker = summary_payload.get("best_ticker")
+    if not raw_best_ticker:
+        return False
+
+    # Do not blindly freeze to the raw engine winner after screening.
+    # Closed-session reads still need the screened winner to reflect the
+    # cleanest remaining SAFE-FAST structure rather than the raw options ranking.
+    return False
+
+
+def _select_screened_best_candidate(
+    screened_candidates: List[Dict[str, Any]],
+    *,
+    raw_engine_best_ticker: Optional[str] = None,
+    freeze_to_raw_engine: bool = False,
+) -> Optional[Dict[str, Any]]:
+    if not screened_candidates:
+        return None
+
+    if freeze_to_raw_engine and raw_engine_best_ticker:
+        for item in screened_candidates:
+            if item.get("symbol") == raw_engine_best_ticker:
+                return item
+
+    ranked_pool = [item for item in screened_candidates if item.get("primary_candidate")]
+    if not ranked_pool:
+        ranked_pool = list(screened_candidates)
+
+    live_pool = [
+        item for item in ranked_pool
+        if item.get("final_verdict") in {"TRADE", "PENDING"}
+    ]
+    if live_pool:
+        return live_pool[0]
+
+    return ranked_pool[0] if ranked_pool else None
+
+
+
+def _format_trade_day_level(value: Any) -> Optional[str]:
+    numeric = _to_float(value)
+    if numeric is None:
+        if value is None:
+            return None
+        text_value = str(value).strip()
+        return text_value or None
+    text_value = f"{round(numeric, 4):.4f}".rstrip("0").rstrip(".")
+    return text_value or "0"
+
+
+def _normalize_trade_day_action(
+    action: Optional[str],
+    setup_state: Optional[str],
+    good_idea_now: Optional[str],
+) -> str:
+    text_value = str(action or "").strip().lower()
+    state_value = str(setup_state or "").strip().upper()
+    idea_value = str(good_idea_now or "").strip().upper()
+
+    if idea_value == "YES" or state_value == "TRADE":
+        return "enter"
+    if "live trigger" in text_value:
+        return "wait for live trigger"
+    if text_value in {"wait", "stand down", "context only"}:
+        return text_value
+    if "review for next regular session" in text_value or "market is closed" in text_value:
+        return "context only"
+    if "enter" in text_value:
+        return "enter"
+    return "stand down"
+
+
+
+def _derive_trade_day_acceptability_condition(
+    user_facing: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+) -> Optional[str]:
+    setup_state = str(user_facing.get("setup_state") or "").strip().upper()
+    if setup_state != "PENDING":
+        return None
+
+    trigger_level_text = _format_trade_day_level(trigger_state.get("trigger_level"))
+    trigger_reason = str(trigger_state.get("why") or "").strip()
+    waiting_on = str(trigger_state.get("live_entry_waiting_on") or "").strip()
+
+    if waiting_on == "market_open" or "Market is closed" in str(user_facing.get("why") or ""):
+        if trigger_level_text:
+            return f"Next regular session opens and price still confirms through {trigger_level_text}."
+        return "Next regular session opens and the live trigger is still valid."
+
+    if trigger_reason in {"too_early_hold_not_proven"}:
+        return "Let the hold/base prove itself with at least 2 completed 1H candles near the highs."
+    if trigger_reason in {"no_valid_continuation_trigger", "waiting_for_completed_shelf_break_close"}:
+        if trigger_level_text:
+            return f"Get the first completed 1H close through the shelf break at {trigger_level_text} while price stays in range."
+        return "Get the first completed 1H shelf break while price stays in range."
+    if trigger_reason in {"too_late_from_hold"}:
+        return "Wait for a new shelf to form before looking for another continuation entry."
+
+    if trigger_reason in {"waiting_for_completed_breakout_close", "close_trigger_not_hit"} and trigger_level_text:
+        return f"Get a valid 1H close through the trigger at {trigger_level_text}."
+
+    if trigger_reason == "wrong_side_of_ema":
+        return "Reclaim the 1H 50 EMA and confirm the trigger."
+
+    if trigger_reason == "next_bar_hold_not_confirmed":
+        return "Hold correctly on the next 1H bar after the breakout candle."
+
+    return "Get a live SAFE-FAST trigger with structure still clean."
+
+
+def _strip_after_hours_prefix(reason: Any) -> str:
+    text = str(reason or "").strip()
+    prefix = "After-hours structural read: "
+    if text.startswith(prefix):
+        return text[len(prefix):].strip()
+    return text
+
+
+def _humanize_blocker_key(blocker: Any) -> str:
+    key = str(blocker or "").strip()
+    mapping = {
+        "one_hour_clean_around_ema": "clean 1H structure around the 50 EMA",
+        "clear_room": "clear room to the next level",
+        "early_enough": "early entry quality",
+        "clear_trigger": "a valid trigger",
+        "wall_thesis_fit": "wall-thesis fit",
+        "time_day_gate": "market open / live-entry window",
+        "time_gate_context": "market open / live-entry window",
+        "failed_breakout_hold": "a confirmed breakout hold",
+        "next_bar_hold_failed": "a confirmed breakout hold",
+        "ath_open_air": "rebuilt 1H structure near all-time highs",
+        "no_proven_hold": "proven hold / base",
+        "no_valid_trigger": "the first clean break from the hold",
+        "move_too_extended": "move too extended from the hold",
+    }
+    return mapping.get(key, key.replace("_", " "))
+
+
+def _humanize_next_step(blocker: Any) -> str:
+    key = str(blocker or "").strip()
+    mapping = {
+        "one_hour_clean_around_ema": "Get clean 1H structure around the 50 EMA.",
+        "clear_room": "Get clear room to the next level.",
+        "early_enough": "Wait for a reset that restores early entry quality.",
+        "clear_trigger": "Wait for a valid trigger.",
+        "wall_thesis_fit": "Fix wall-thesis fit.",
+        "time_day_gate": "Wait for the market to open.",
+        "time_gate_context": "Wait for the market to open.",
+        "failed_breakout_hold": "Rebuild the breakout hold.",
+        "next_bar_hold_failed": "Rebuild the breakout hold.",
+        "ath_open_air": "Rebuild 1H structure near the highs.",
+        "no_proven_hold": "Wait for the hold/base to prove itself.",
+        "no_valid_trigger": "Wait for the first completed break from the hold.",
+        "move_too_extended": "Wait for a new hold to form before looking for another continuation entry.",
+    }
+    if key in mapping:
+        return mapping[key]
+    human = _humanize_blocker_key(key)
+    if human:
+        human = human[0].upper() + human[1:]
+        return f"Clear {human}."
+    return "Wait for a cleaner SAFE-FAST state."
+
+
+def _humanize_surface_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    mapping = {
+        "one_hour_clean_around_ema": "clean 1H structure around the 50 EMA",
+        "clear_room": "clear room to the next level",
+        "early_enough": "early entry quality",
+        "clear_trigger": "a valid trigger",
+        "wall_thesis_fit": "wall-thesis fit",
+        "time_day_gate": "market open / live-entry window",
+        "time_gate_context": "market open / live-entry window",
+        "failed_breakout_hold": "a confirmed breakout hold",
+        "next_bar_hold_failed": "a confirmed breakout hold",
+        "ath_open_air": "rebuilt 1H structure near all-time highs",
+        "no_proven_hold": "a proven hold",
+        "no_valid_trigger": "the first clean break",
+        "move_too_extended": "move too extended from the hold",
+    }
+
+    for raw_key, human_text in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+        text = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(raw_key)}(?![A-Za-z0-9_])", human_text, text)
+
+    return text
+
+
+
+
+def _humanize_trigger_reason_key(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    mapping = {
+        "structure_not_ready": "structure not ready",
+        "chart_unavailable": "chart unavailable",
+        "market_closed": "market closed",
+        "not_present": "not present",
+        "not_applicable": "not applicable",
+        "too_early_hold_not_proven": "too early - hold not proven",
+        "no_valid_continuation_trigger": "no valid continuation trigger",
+        "waiting_for_completed_shelf_break_close": "waiting for completed shelf break close",
+        "pending_completed_candle_approval": "pending completed-candle approval",
+        "too_late_from_hold": "too late from the hold",
+    }
+    return mapping.get(text, text.replace("_", " "))
+
+
+def _humanize_state_reason_key(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    blocker_keys = {
+        "one_hour_clean_around_ema",
+        "clear_room",
+        "early_enough",
+        "clear_trigger",
+        "wall_thesis_fit",
+        "time_day_gate",
+        "time_gate_context",
+        "failed_breakout_hold",
+        "next_bar_hold_failed",
+        "ath_open_air",
+        "no_proven_hold",
+        "no_valid_trigger",
+        "move_too_extended",
+    }
+    if text in blocker_keys:
+        return _humanize_blocker_key(text)
+
+    mapping = {
+        "market_closed": "market closed",
+        "market_open_no_hard_time_cutoff": "market open / no hard cutoff",
+        "exit_now": "exit now",
+        "trade": "trade ready",
+        "high": "high IV",
+        "through_the_wall_next_pocket_not_clear": "through-the-wall next pocket not clear",
+        "no_candidate_available": "no candidate available",
+        "approval_ready": "approval ready",
+        "approval_ready_now": "approval ready now",
+        "pending_completed_candle_approval": "pending completed-candle approval",
+        "pending_trigger_confirmation": "pending trigger confirmation",
+        "chart_unavailable": "chart unavailable",
+    }
+    if text in mapping:
+        return mapping[text]
+
+    trigger_reason = _humanize_trigger_reason_key(text)
+    if trigger_reason and trigger_reason != text:
+        return trigger_reason
+
+    surface_text = _humanize_surface_text(text)
+    if surface_text and surface_text != text:
+        return surface_text
+
+    return text.replace("_", " ")
+
+
+def _humanize_reason_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    mapping = {
+        "chart_unavailable": "chart unavailable",
+        "no_candidate_available": "no candidate available",
+    }
+    if text in mapping:
+        return mapping[text]
+
+    trigger_reason = _humanize_trigger_reason_key(text)
+    if trigger_reason and trigger_reason != text:
+        return trigger_reason
+
+    surface_text = _humanize_surface_text(text)
+    if surface_text and surface_text != text:
+        return surface_text
+
+    return text
+
+
+def _derive_also_failing_line(
+    failed_reasons: Optional[List[Any]],
+    primary_reason: Any,
+    max_items: int = 2,
+) -> Optional[str]:
+    primary_clean = _strip_after_hours_prefix(primary_reason).strip().rstrip(".").lower()
+    items: List[str] = []
+    for reason in failed_reasons or []:
+        clean = str(reason or "").strip().rstrip(".")
+        if not clean:
+            continue
+        if primary_clean and clean.lower() == primary_clean:
+            continue
+        if clean not in items:
+            items.append(clean)
+        if len(items) >= max_items:
+            break
+    if not items:
+        return None
+    return "; ".join(items) + "."
+
+
+def _derive_trap_line(
+    trap_check_context: Optional[Dict[str, Any]],
+    max_items: int = 2,
+) -> Optional[str]:
+    trap_check_context = trap_check_context or {}
+    if trap_check_context.get("trap_check_status") != "fail":
+        return None
+
+    checks = trap_check_context.get("checks") or {}
+    ordered_keys = [
+        "hidden_left_structure",
+        "noisy_chop",
+        "overextension_vs_ema",
+        "volume_climax_exhaustion",
+        "parabolic_exhaustion",
+    ]
+    label_map = {
+        "hidden_left_structure": "hidden left structure",
+        "noisy_chop": "noisy chop",
+        "overextension_vs_ema": "overextension vs 1H 50 EMA",
+        "volume_climax_exhaustion": "volume climax / exhaustion",
+        "parabolic_exhaustion": "parabolic exhaustion",
+    }
+
+    items: List[str] = []
+    for key in ordered_keys:
+        check = checks.get(key) or {}
+        if check.get("status") != "fail":
+            continue
+        label = label_map.get(key) or _humanize_blocker_key(key)
+        if not label:
+            continue
+        if label not in items:
+            items.append(label)
+        if len(items) >= max_items:
+            break
+
+    if not items:
+        primary_trap = str(trap_check_context.get("primary_trap") or "").strip()
+        if primary_trap:
+            label = label_map.get(primary_trap) or _humanize_blocker_key(primary_trap)
+            if label:
+                items.append(label)
+
+    if not items:
+        return None
+
+    return "; ".join(items) + "."
+
+
+def _surface_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _surface_item_list(*chunks: Any, max_items: int = 4) -> List[str]:
+    items: List[str] = []
+    seen = set()
+    for chunk in chunks:
+        text = _surface_text(chunk)
+        if not text:
+            continue
+        parts = re.split(r"[;\n]+", text)
+        for part in parts:
+            clean = str(part or "").strip().rstrip(".")
+            if not clean:
+                continue
+            normalized = clean.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            items.append(clean)
+            if len(items) >= max_items:
+                return items
+    return items
+
+
+def _build_decisive_response_surface(
+    *,
+    ticker: Any,
+    action: Any,
+    good_idea_now: Any,
+    reason: Any,
+    next_step: Any,
+    invalidation: Any,
+    market_closed_context_only: bool = False,
+    also_failing: Optional[str] = None,
+    trap_line: Optional[str] = None,
+) -> Dict[str, Any]:
+    ticker_text = _surface_text(ticker)
+    action_text = _surface_text(action)
+    reason_source = _strip_after_hours_prefix(reason) if market_closed_context_only else reason
+    reason_text = _surface_text(reason_source) or "No clear summary available."
+    next_step_text = _surface_text(next_step)
+    invalidation_text = _surface_text(invalidation)
+
+    if next_step_text and invalidation_text:
+        normalized_next_step = next_step_text.rstrip(".").strip().lower()
+        normalized_invalidation = invalidation_text.rstrip(".").strip().lower()
+        if normalized_next_step == normalized_invalidation:
+            next_step_text = None
+
+    watchout_items = _surface_item_list(also_failing, trap_line)
+    watchouts = "; ".join(watchout_items) + "." if watchout_items else None
+
+    if market_closed_context_only:
+        headline = "Market is closed. Context only."
+        next_label = "Next session"
+    else:
+        headline = "Trade now." if str(good_idea_now or "").strip().upper() == "YES" else "No trade now."
+        next_label = "Next"
+
+    response_lines: List[str] = [headline]
+    if ticker_text:
+        response_lines.append(f"Ticker: {ticker_text}")
+    if action_text:
+        response_lines.append(f"Action: {action_text}")
+    response_lines.append(f"Reason: {reason_text}")
+    if watchouts:
+        response_lines.append(f"Watchouts: {watchouts}")
+    if next_step_text:
+        response_lines.append(f"{next_label}: {next_step_text}")
+    if invalidation_text:
+        response_lines.append(f"Invalidation: {invalidation_text}")
+
+    return {
+        "headline": headline,
+        "watchouts": watchouts,
+        "next_step": next_step_text,
+        "response_lines": response_lines,
+        "response_text": "\n".join(response_lines),
+    }
+
+
+def _build_trade_day_response_lines(
+    *,
+    good_idea_now: Any,
+    ticker: Any,
+    action: Any,
+    why: Any,
+    invalidation: Any,
+    what_would_make_it_acceptable: Optional[str] = None,
+    also_failing: Optional[str] = None,
+    trap_line: Optional[str] = None,
+) -> List[str]:
+    surface = _build_decisive_response_surface(
+        ticker=ticker,
+        action=action,
+        good_idea_now=good_idea_now,
+        reason=why,
+        next_step=what_would_make_it_acceptable,
+        invalidation=invalidation,
+        market_closed_context_only=False,
+        also_failing=also_failing,
+        trap_line=trap_line,
+    )
+    return surface.get("response_lines") or []
+
+
+
+
+def _build_simple_output_block(
+    user_facing: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    macro_context: Optional[Dict[str, Any]] = None,
+    failed_reasons: Optional[List[Any]] = None,
+    trap_check_context: Optional[Dict[str, Any]] = None,
+    next_flip_needed: Optional[str] = None,
+    primary_blocker: Optional[str] = None,
+    decision_blockers: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    signal_present = bool(trigger_state.get("trigger_present") is True)
+    macro_brief = user_facing.get("macro_brief")
+    if macro_brief is None and macro_context is not None:
+        macro_brief = _build_macro_brief(macro_context)
+
+    why_text = str(user_facing.get("why") or "").strip()
+    market_closed_context = why_text.startswith("After-hours structural read:")
+
+    normalized_action = _normalize_trade_day_action(
+        user_facing.get("action"),
+        user_facing.get("setup_state"),
+        user_facing.get("good_idea_now"),
+    )
+    if market_closed_context:
+        normalized_action = "wait for next session"
+
+    acceptable_condition = _derive_trade_day_acceptability_condition(user_facing, trigger_state)
+    also_failing = _derive_also_failing_line(
+        failed_reasons,
+        user_facing.get("why"),
+    )
+    trap_line = _derive_trap_line(trap_check_context)
+    next_step = acceptable_condition or _humanize_next_step(next_flip_needed)
+
+    blocker_keys = _ordered_unique_strings(decision_blockers or [])
+    top_blocker_keys: List[str] = []
+    effective_primary_blocker = str(primary_blocker or next_flip_needed or "").strip() or None
+    if effective_primary_blocker:
+        top_blocker_keys.append(effective_primary_blocker)
+    for blocker in blocker_keys:
+        if blocker not in top_blocker_keys:
+            top_blocker_keys.append(blocker)
+        if len(top_blocker_keys) >= 3:
+            break
+
+    human_primary_blocker = _humanize_blocker_key(effective_primary_blocker) if effective_primary_blocker else None
+    human_next_flip_needed = _humanize_blocker_key(next_flip_needed) if next_flip_needed else None
+    human_top_blockers: List[str] = []
+    for blocker in top_blocker_keys:
+        human_blocker = _humanize_blocker_key(blocker)
+        if human_blocker and human_blocker not in human_top_blockers:
+            human_top_blockers.append(human_blocker)
+
+    surface = _build_decisive_response_surface(
+        ticker=user_facing.get("ticker"),
+        action=normalized_action,
+        good_idea_now=user_facing.get("good_idea_now"),
+        reason=user_facing.get("why"),
+        next_step=next_step,
+        invalidation=user_facing.get("invalidation"),
+        market_closed_context_only=market_closed_context,
+        also_failing=also_failing,
+        trap_line=trap_line,
+    )
+
+    return {
+        "design_goal": "complex_inputs_simple_outputs",
+        "good_idea_now": user_facing.get("good_idea_now"),
+        "ticker": user_facing.get("ticker"),
+        "action": normalized_action,
+        "invalidation": user_facing.get("invalidation"),
+        "setup_state": user_facing.get("setup_state"),
+        "why": user_facing.get("why"),
+        "what_would_make_it_acceptable": acceptable_condition,
+        "macro_brief": macro_brief,
+        "signal_present": signal_present,
+        "primary_blocker": human_primary_blocker,
+        "next_flip_needed": human_next_flip_needed,
+        "top_blockers": human_top_blockers,
+        "primary_blocker_key": effective_primary_blocker,
+        "next_flip_needed_key": next_flip_needed,
+        "top_blocker_keys": top_blocker_keys,
+        "also_failing": also_failing,
+        "trap_line": trap_line,
+        "watchouts": surface.get("watchouts"),
+        "headline": surface.get("headline"),
+        "next_step": surface.get("next_step") or next_step,
+        "what_matters_next_session": (surface.get("next_step") or next_step) if market_closed_context else None,
+        "response_lines": surface.get("response_lines") or [],
+        "response_text": surface.get("response_text") or "",
+    }
+
+
+
+
+
+def _build_engine_context_block(
+    summary_payload: Dict[str, Any],
+    selected: Optional[Dict[str, Any]],
+    engine_status: str,
+    final_verdict: str,
+    best_ticker: Optional[str],
+) -> Dict[str, Any]:
+    raw_best_ticker = summary_payload.get("best_ticker")
+    raw_status = summary_payload.get("verdict")
+    raw_reason = summary_payload.get("reason")
+    normalized_reason = selected.get("reason", raw_reason) if selected else raw_reason
+
+    return {
+        "ok": True,
+        "raw_best_ticker": raw_best_ticker,
+        "raw_status": raw_status,
+        "raw_reason": raw_reason,
+        "normalized_best_ticker": best_ticker,
+        "normalized_status": engine_status,
+        "normalized_final_verdict": final_verdict,
+        "normalized_reason": normalized_reason,
+        "changed_from_raw_engine": (
+            raw_best_ticker != best_ticker
+            or raw_status != engine_status
+        ),
+    }
+
+
+def _build_candidate_engine_normalized_block(
+    summary_payload: Dict[str, Any],
+    selected: Optional[Dict[str, Any]],
+    engine_status: str,
+    final_verdict: str,
+    best_ticker: Optional[str],
+) -> Dict[str, Any]:
+    normalized_reason = selected.get("reason", summary_payload.get("reason")) if selected else summary_payload.get("reason")
+    selected_summary = selected.get("summary") if selected else None
+
+    return {
+        "ok": summary_payload.get("ok", True),
+        "raw_best_ticker": summary_payload.get("best_ticker"),
+        "raw_verdict": summary_payload.get("verdict"),
+        "raw_reason": summary_payload.get("reason"),
+        "normalized_best_ticker": best_ticker,
+        "normalized_verdict": engine_status,
+        "normalized_final_verdict": final_verdict,
+        "normalized_reason": normalized_reason,
+        "selection_mode": (
+            selected_summary.get("selection_mode")
+            if selected_summary else summary_payload.get("selection_mode")
+        ),
+    }
+
+
+
+
+def _resolve_global_gate_primary_blocker(
+    screened_reason: Optional[str] = None,
+    time_gate_reason: Optional[str] = None,
+) -> Optional[str]:
+    gate_reason = str(time_gate_reason or screened_reason or "").strip().lower()
+    if gate_reason in {"outside_time_window", "outside_day_window"}:
+        return "time_gate_context"
+    return None
+
+
+def _effective_blockers(
+    checklist_block: Dict[str, Any],
+    screened_reason: Optional[str] = None,
+    time_gate_reason: Optional[str] = None,
+) -> List[str]:
+    blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
+    gate_blocker = _resolve_global_gate_primary_blocker(
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+    if gate_blocker:
+        blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    return blockers
+
+
+def _effective_primary_blocker(
+    checklist_block: Dict[str, Any],
+    screened_reason: Optional[str] = None,
+    time_gate_reason: Optional[str] = None,
+) -> Optional[str]:
+    blockers = _effective_blockers(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+    return blockers[0] if blockers else None
+
+
+def _build_decision_context_block(
+    summary_payload: Dict[str, Any],
+    selected: Optional[Dict[str, Any]],
+    engine_status: str,
+    final_verdict: str,
+    best_ticker: Optional[str],
+    checklist_block: Dict[str, Any],
+    failed_reasons: List[str],
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    raw_reason = summary_payload.get("reason")
+    normalized_reason = selected.get("reason", raw_reason) if selected else raw_reason
+
+    effective_blockers = _effective_blockers(
+        checklist_block,
+        screened_reason=normalized_reason,
+    )
+    effective_primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        screened_reason=normalized_reason,
+    )
+
+    return {
+        "ok": True,
+        "ticker": best_ticker,
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
+        "raw_engine": {
+            "ticker": summary_payload.get("best_ticker"),
+            "status": summary_payload.get("verdict"),
+            "reason": raw_reason,
+        },
+        "normalized_engine": {
+            "ticker": best_ticker,
+            "status": engine_status,
+            "final_verdict": final_verdict,
+            "reason": normalized_reason,
+        },
+        "screened": {
+            "ticker": best_ticker,
+            "final_verdict": final_verdict,
+            "reason": normalized_reason,
+        },
+        "primary_blocker": effective_primary_blocker,
+        "blockers": effective_blockers,
+        "failed_reasons": failed_reasons,
+        "changed_from_raw_engine": (
+            summary_payload.get("best_ticker") != best_ticker
+            or summary_payload.get("verdict") != engine_status
+        ),
+    }
+
+
+
+def _build_blocker_context_block(
+    checklist_block: Dict[str, Any],
+    failed_reasons: List[str],
+    trigger_state: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    engine_status: str,
+    final_verdict: str,
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    blocker_items = _effective_blockers(
+        checklist_block,
+        screened_reason=trigger_state.get("why"),
+    )
+    primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        screened_reason=trigger_state.get("why"),
+    )
+
+    return {
+        "ok": True,
+        "primary_blocker": primary_blocker,
+        "blockers": blocker_items,
+        "failed_reasons": failed_reasons,
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "structure_ready": trigger_state.get("structure_ready"),
+        "setup_type": structure_context.get("setup_type"),
+        "allowed_setup": structure_context.get("allowed_setup"),
+        "setup_eligible_now": structure_context.get("setup_eligible_now"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "engine_status": engine_status,
+        "final_verdict": final_verdict,
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
+    }
+
+
+
+def _build_trigger_context_block(
+    trigger_state: Dict[str, Any],
+    live_map: Dict[str, Any],
+) -> Dict[str, Any]:
+    trigger_scan = live_map.get("trigger_scan") or {}
+    current_bar = trigger_scan.get("current_bar") or {}
+    completed_candle = trigger_scan.get("most_recent_completed_candle") or {}
+
+    return {
+        "ok": True,
+        "trigger_present": trigger_state.get("trigger_present"),
+        "structural_trigger_present": trigger_state.get("structural_trigger_present"),
+        "current_bar_trigger_present": trigger_state.get("current_bar_trigger_present"),
+        "completed_candle_trigger_present": trigger_state.get("completed_candle_trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "structure_ready": trigger_state.get("structure_ready"),
+        "trigger_style": trigger_state.get("trigger_style"),
+        "trigger_level": trigger_state.get("trigger_level"),
+        "current_close": trigger_state.get("current_close"),
+        "live_entry_requires_market_open": trigger_state.get("live_entry_requires_market_open"),
+        "live_entry_waiting_on": trigger_state.get("live_entry_waiting_on"),
+        "current_bar_raw_trigger_pass": current_bar.get("raw_chart_trigger_pass"),
+        "current_bar_gated_trigger_pass": current_bar.get("gated_trigger_pass"),
+        "completed_candle_raw_trigger_pass": completed_candle.get("raw_chart_trigger_pass"),
+        "completed_candle_gated_trigger_pass": completed_candle.get("gated_trigger_pass"),
+        "current_bar_relation_to_trigger_level": current_bar.get("relation_to_trigger_level"),
+        "current_bar_relation_to_ema50_1h": current_bar.get("relation_to_ema50_1h"),
+        "trigger_scan_status": trigger_scan.get("trigger_scan_status"),
+        "why_trigger_scan_passes_or_fails": trigger_scan.get("why_trigger_scan_passes_or_fails"),
+    }
+
+
+
+
+def _derive_global_gate_primary_blocker(trigger_reason: Any) -> Optional[str]:
+    return None
+
+
+def _derive_global_gate_next_flip(trigger_reason: Any) -> Optional[str]:
+    return None
+
+
+def _build_entry_context_block(
+    trigger_state: Dict[str, Any],
+    live_map: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    trigger_scan = live_map.get("trigger_scan") or {}
+    current_bar = trigger_scan.get("current_bar") or {}
+    completed_candle = trigger_scan.get("most_recent_completed_candle") or {}
+    blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
+    if gate_blocker:
+        blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    primary_blocker = blockers[0] if blockers else None
+
+    current_bar_raw_trigger_pass = bool(current_bar.get("raw_chart_trigger_pass") is True)
+    current_bar_gated_trigger_pass = bool(current_bar.get("gated_trigger_pass") is True)
+    completed_candle_raw_trigger_pass = bool(completed_candle.get("raw_chart_trigger_pass") is True)
+    completed_candle_gated_trigger_pass = bool(completed_candle.get("gated_trigger_pass") is True)
+
+    pending_completed_candle_approval = bool(trigger_state.get("pending_completed_candle_approval") is True)
+
+    if current_bar_gated_trigger_pass:
+        mid_candle_entry_state = "APPROVED_NOW"
+    elif pending_completed_candle_approval and current_bar_raw_trigger_pass:
+        mid_candle_entry_state = "PENDING_ON_COMPLETED_CANDLE"
+    elif current_bar_raw_trigger_pass:
+        mid_candle_entry_state = "BLOCKED_NOW"
+    else:
+        mid_candle_entry_state = "NOT_PRESENT"
+
+    if completed_candle_gated_trigger_pass:
+        completed_candle_entry_state = "APPROVED_ON_COMPLETED_CANDLE"
+    elif completed_candle_raw_trigger_pass:
+        completed_candle_entry_state = "BLOCKED_ON_COMPLETED_CANDLE"
+    else:
+        completed_candle_entry_state = "NOT_PRESENT_ON_COMPLETED_CANDLE"
+
+    return {
+        "ok": True,
+        "live_entry_available_now": bool(current_bar_gated_trigger_pass and not trigger_state.get("live_entry_requires_market_open") and not trigger_state.get("live_entry_waiting_on")),
+        "live_entry_requires_market_open": bool(trigger_state.get("live_entry_requires_market_open")),
+        "live_entry_waiting_on": trigger_state.get("live_entry_waiting_on"),
+        "mid_candle_trade_available_now": current_bar_gated_trigger_pass,
+        "pending_completed_candle_approval": pending_completed_candle_approval,
+        "mid_candle_entry_state": mid_candle_entry_state,
+        "mid_candle_raw_trigger_detected_now": current_bar_raw_trigger_pass,
+        "mid_candle_block_reason": None if current_bar_gated_trigger_pass else trigger_state.get("why"),
+        "completed_candle_trade_available": completed_candle_gated_trigger_pass,
+        "completed_candle_entry_state": completed_candle_entry_state,
+        "completed_candle_raw_trigger_detected": completed_candle_raw_trigger_pass,
+        "completed_candle_block_reason": None if completed_candle_gated_trigger_pass else completed_candle.get("why"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "structure_ready": trigger_state.get("structure_ready"),
+        "trigger_style": trigger_state.get("trigger_style"),
+        "trigger_level": trigger_state.get("trigger_level"),
+        "current_close": trigger_state.get("current_close"),
+        "current_bar_relation_to_trigger_level": current_bar.get("relation_to_trigger_level"),
+        "current_bar_relation_to_ema50_1h": current_bar.get("relation_to_ema50_1h"),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "allowed_setup": structure_context.get("allowed_setup"),
+        "setup_type": structure_context.get("setup_type"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
+    }
+
+
+def _build_intrabar_signal_context_block(
+    entry_context: Dict[str, Any],
+    live_map: Dict[str, Any],
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    trigger_scan = live_map.get("trigger_scan") or {}
+    current_bar = trigger_scan.get("current_bar") or {}
+    completed_candle = trigger_scan.get("most_recent_completed_candle") or {}
+
+    intrabar_trade_available_now = bool(entry_context.get("mid_candle_trade_available_now") is True)
+    intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
+    completed_trade_available = bool(entry_context.get("completed_candle_trade_available") is True)
+    completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
+
+    pending_completed_candle_approval = bool(entry_context.get("pending_completed_candle_approval") is True)
+
+    if intrabar_trade_available_now:
+        intrabar_signal_status = "APPROVED_NOW"
+    elif pending_completed_candle_approval and intrabar_raw_signal_detected:
+        intrabar_signal_status = "PENDING_COMPLETED_CANDLE_APPROVAL"
+    elif intrabar_raw_signal_detected:
+        intrabar_signal_status = "RAW_SIGNAL_BLOCKED_NOW"
+    else:
+        intrabar_signal_status = "NO_INTRABAR_SIGNAL"
+
+    if completed_trade_available:
+        completed_signal_status = "APPROVED_ON_COMPLETED_CANDLE"
+    elif completed_raw_signal_detected:
+        completed_signal_status = "RAW_SIGNAL_BLOCKED_ON_COMPLETED_CANDLE"
+    else:
+        completed_signal_status = "NO_COMPLETED_CANDLE_SIGNAL"
+
+    if intrabar_trade_available_now:
+        signal_note = "Intrabar SAFE-FAST entry is approved right now."
+    elif pending_completed_candle_approval and intrabar_raw_signal_detected:
+        signal_note = "Intrabar shelf break is visible. SAFE-FAST is pending the completed 1H close for approval."
+    elif intrabar_raw_signal_detected:
+        signal_note = "Intrabar signal is visible, but SAFE-FAST approval still blocks entry."
+    elif completed_trade_available:
+        signal_note = "Completed-candle SAFE-FAST entry is approved."
+    elif completed_raw_signal_detected:
+        signal_note = "Completed-candle signal is visible, but SAFE-FAST approval still blocks entry."
+    else:
+        signal_note = "No live intrabar or completed-candle signal is currently available."
+
+    return {
+        "ok": True,
+        "ticker": live_map.get("ticker"),
+        "intrabar_signal_status": intrabar_signal_status,
+        "intrabar_trade_available_now": intrabar_trade_available_now,
+        "intrabar_raw_signal_detected": intrabar_raw_signal_detected,
+        "intrabar_block_reason": entry_context.get("mid_candle_block_reason"),
+        "intrabar_time_iso": current_bar.get("time_iso"),
+        "intrabar_close": current_bar.get("close"),
+        "intrabar_trigger_level_relation": current_bar.get("relation_to_trigger_level"),
+        "intrabar_ema_relation": current_bar.get("relation_to_ema50_1h"),
+        "completed_signal_status": completed_signal_status,
+        "completed_trade_available": completed_trade_available,
+        "completed_raw_signal_detected": completed_raw_signal_detected,
+        "completed_block_reason": entry_context.get("completed_candle_block_reason"),
+        "completed_time_iso": completed_candle.get("time_iso"),
+        "completed_close": completed_candle.get("close"),
+        "primary_blocker": entry_context.get("primary_blocker"),
+        "blockers": entry_context.get("blockers"),
+        "trigger_present": entry_context.get("trigger_present"),
+        "trigger_reason": entry_context.get("trigger_reason"),
+        "structure_ready": entry_context.get("structure_ready"),
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
+        "signal_note": signal_note,
+    }
+
+
+
+def _build_approval_context_block(
+    entry_context: Dict[str, Any],
+    intrabar_signal_context: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    user_facing: Dict[str, Any],
+) -> Dict[str, Any]:
+    blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
+    if gate_blocker:
+        blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+    primary_blocker = blockers[0] if blockers else None
+    next_flip_needed = _derive_global_gate_next_flip(trigger_state.get("why")) or primary_blocker
+    intrabar_raw_signal_detected = bool(entry_context.get("mid_candle_raw_trigger_detected_now") is True)
+    intrabar_trade_available_now = bool(entry_context.get("mid_candle_trade_available_now") is True)
+    completed_raw_signal_detected = bool(entry_context.get("completed_candle_raw_trigger_detected") is True)
+    completed_trade_available = bool(entry_context.get("completed_candle_trade_available") is True)
+
+    pending_completed_candle_approval = bool(entry_context.get("pending_completed_candle_approval") is True)
+
+    if intrabar_trade_available_now:
+        approval_status = "APPROVED_NOW"
+    elif pending_completed_candle_approval and intrabar_raw_signal_detected:
+        approval_status = "PENDING_COMPLETED_CANDLE_APPROVAL"
+    elif intrabar_raw_signal_detected:
+        approval_status = "RAW_SIGNAL_WAITING_FOR_APPROVAL"
+    elif completed_trade_available:
+        approval_status = "APPROVED_ON_COMPLETED_CANDLE"
+    elif completed_raw_signal_detected:
+        approval_status = "COMPLETED_SIGNAL_WAITING_FOR_APPROVAL"
+    else:
+        approval_status = "NO_SIGNAL_TO_APPROVE"
+
+    if intrabar_trade_available_now:
+        approval_note = "All SAFE-FAST approval gates pass right now."
+    elif pending_completed_candle_approval and intrabar_raw_signal_detected:
+        approval_note = "Raw intrabar signal is in range. Pending the completed 1H close for SAFE-FAST approval."
+    elif intrabar_raw_signal_detected:
+        approval_note = "Raw intrabar signal exists, but SAFE-FAST approval gates still block entry."
+    elif completed_trade_available:
+        approval_note = "Completed-candle signal is approved."
+    elif completed_raw_signal_detected:
+        approval_note = "Completed-candle raw signal exists, but SAFE-FAST approval gates still block entry."
+    else:
+        approval_note = "No raw signal is currently waiting for approval."
+
+    return {
+        "ok": True,
+        "ticker": intrabar_signal_context.get("ticker"),
+        "live_entry_requires_market_open": bool(trigger_state.get("live_entry_requires_market_open")),
+        "live_entry_waiting_on": trigger_state.get("live_entry_waiting_on"),
+        "approval_status": approval_status,
+        "approval_ready_now": intrabar_trade_available_now,
+        "approval_ready_on_completed_candle": completed_trade_available,
+        "intrabar_raw_signal_detected": intrabar_raw_signal_detected,
+        "completed_raw_signal_detected": completed_raw_signal_detected,
+        "structure_ready": trigger_state.get("structure_ready"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "allowed_setup": structure_context.get("allowed_setup"),
+        "setup_type": structure_context.get("setup_type"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "next_flip_needed": next_flip_needed,
+        "action": user_facing.get("action"),
+        "setup_state": user_facing.get("setup_state"),
+        "good_idea_now": user_facing.get("good_idea_now"),
+        "approval_note": approval_note,
+    }
+
+
+
+def _build_approval_requirements_context_block(
+    checklist_block: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+    approval_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    checklist_items = {row.get("item"): bool(row.get("yes")) for row in checklist_block.get("items", [])}
+    blockers = list(checklist_block.get("decision_blockers_priority") or checklist_block.get("failed_items") or [])
+    gate_blocker = _derive_global_gate_primary_blocker(trigger_state.get("why"))
+    if gate_blocker:
+        blockers = [gate_blocker] + [item for item in blockers if item != gate_blocker]
+
+    gate_statuses = [
+        {
+            "gate": "allowed_setup_type",
+            "ready": bool(checklist_items.get("allowed_setup_type") is True),
+            "current_value": structure_context.get("setup_type"),
+            "needed_state": "one of the 3 allowed SAFE-FAST setup types",
+        },
+        {
+            "gate": "one_hour_clean_around_ema",
+            "ready": bool(checklist_items.get("one_hour_clean_around_ema") is True),
+            "current_value": checklist_items.get("one_hour_clean_around_ema"),
+            "needed_state": True,
+        },
+        {
+            "gate": "clear_room",
+            "ready": bool(checklist_items.get("clear_room") is True),
+            "current_value": checklist_items.get("clear_room"),
+            "needed_state": True,
+        },
+        {
+            "gate": "early_enough",
+            "ready": bool(checklist_items.get("early_enough") is True),
+            "current_value": checklist_items.get("early_enough"),
+            "needed_state": True,
+        },
+        {
+            "gate": "clear_trigger",
+            "ready": bool(checklist_items.get("clear_trigger") is True),
+            "current_value": checklist_items.get("clear_trigger"),
+            "needed_state": True,
+        },
+        {
+            "gate": "structure_ready",
+            "ready": bool(trigger_state.get("structure_ready") is True),
+            "current_value": trigger_state.get("structure_ready"),
+            "needed_state": True,
+        },
+        {
+            "gate": "trigger_present",
+            "ready": bool(trigger_state.get("trigger_present") is True),
+            "current_value": trigger_state.get("trigger_present"),
+            "needed_state": True,
+        },
+        {
+            "gate": "liquidity_ok",
+            "ready": bool(liquidity_context.get("liquidity_pass") is True),
+            "current_value": liquidity_context.get("liquidity_pass"),
+            "needed_state": True,
+        },
+        {
+            "gate": "market_open",
+            "ready": bool(market_context.get("is_open") is True),
+            "current_value": market_context.get("is_open"),
+            "needed_state": True,
+        },
+        {
+            "gate": "fresh_entry_allowed",
+            "ready": bool(time_day_gate.get("fresh_entry_allowed") is True),
+            "current_value": time_day_gate.get("fresh_entry_allowed"),
+            "needed_state": True,
+        },
+        {
+            "gate": "macro_event_clear",
+            "ready": bool(
+                not macro_context.get("has_major_event_today")
+                and not macro_context.get("has_major_event_tomorrow")
+            ),
+            "current_value": {
+                "has_major_event_today": macro_context.get("has_major_event_today"),
+                "has_major_event_tomorrow": macro_context.get("has_major_event_tomorrow"),
+            },
+            "needed_state": {
+                "has_major_event_today": False,
+                "has_major_event_tomorrow": False,
+            },
+        },
+    ]
+
+    missing_gates = [row["gate"] for row in gate_statuses if not row["ready"]]
+
+    actionable_blocker_order = [
+        "allowed_setup_type",
+        "one_hour_clean_around_ema",
+        "clear_room",
+        "early_enough",
+        "clear_trigger",
+        "structure_ready",
+        "trigger_present",
+        "liquidity_ok",
+        "market_open",
+        "fresh_entry_allowed",
+        "macro_event_clear",
+    ]
+    next_flip_needed = None
+    continuation_override = checklist_block.get("continuation_blocker_override")
+    if continuation_override:
+        next_flip_needed = continuation_override
+    else:
+        for gate_name in actionable_blocker_order:
+            if gate_name in missing_gates:
+                next_flip_needed = gate_name
+                break
+        if next_flip_needed is None:
+            next_flip_needed = blockers[0] if blockers else None
+        if next_flip_needed is None and trigger_state.get("live_entry_requires_market_open"):
+            next_flip_needed = "market_open"
+
+    if approval_context.get("approval_ready_now") is True:
+        approval_path_status = "APPROVED_NOW"
+    elif approval_context.get("approval_status") == "PENDING_COMPLETED_CANDLE_APPROVAL":
+        approval_path_status = "PENDING_COMPLETED_CANDLE_APPROVAL"
+    elif approval_context.get("intrabar_raw_signal_detected") is True:
+        approval_path_status = "WAITING_FOR_GATES"
+    elif approval_context.get("completed_raw_signal_detected") is True:
+        approval_path_status = "COMPLETED_SIGNAL_WAITING_FOR_GATES"
+    else:
+        approval_path_status = "NO_SIGNAL_YET"
+
+    return {
+        "ok": True,
+        "approval_path_status": approval_path_status,
+        "approval_ready_now": approval_context.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
+        "intrabar_raw_signal_detected": approval_context.get("intrabar_raw_signal_detected"),
+        "completed_raw_signal_detected": approval_context.get("completed_raw_signal_detected"),
+        "next_flip_needed": next_flip_needed,
+        "missing_gates": missing_gates,
+        "gate_statuses": gate_statuses,
+        "checklist_failed_items": checklist_block.get("effective_failed_items", checklist_block.get("failed_items", [])),
+        "raw_checklist_failed_items": checklist_block.get("failed_items", []),
+        "global_gate_failures": checklist_block.get("global_gate_failures", []),
+        "blockers": blockers,
+        "allowed_setup": structure_context.get("allowed_setup"),
+        "setup_type": structure_context.get("setup_type"),
+        "room_pass": structure_context.get("room_pass"),
+        "extension_blocks_now": structure_context.get("extension_blocks_now"),
+        "structure_ready": trigger_state.get("structure_ready"),
+        "trigger_present": trigger_state.get("trigger_present"),
+        "trigger_reason": trigger_state.get("why"),
+        "liquidity_ok": liquidity_context.get("liquidity_pass"),
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "macro_event_clear": bool(
+            not macro_context.get("has_major_event_today")
+            and not macro_context.get("has_major_event_tomorrow")
+        ),
+    }
+
+def _build_screened_best_context(
+    selected: Optional[Dict[str, Any]],
+    engine_best_ticker: Optional[str],
+    screened_candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not selected:
+        return {"ok": False, "why": "no screened candidates"}
+
+    engine_pick = next(
+        (item for item in screened_candidates if item.get("symbol") == engine_best_ticker),
+        None,
+    )
+
+    selected_checklist = selected.get("checklist") or {}
+    selected_reason = selected.get("reason")
+    effective_failed_items = _effective_blockers(
+        selected_checklist,
+        screened_reason=selected_reason,
+    )
+    effective_primary_blocker = (
+        effective_failed_items[0] if effective_failed_items else None
+    )
+    engine_pick_reason = engine_pick.get("reason") if engine_pick else None
+    engine_pick_verdict = engine_pick.get("final_verdict") if engine_pick else None
+
+    normalized_engine_best_ticker = selected.get("symbol")
+    return {
+        "ok": True,
+        "screened_best_ticker": selected.get("symbol"),
+        "raw_engine_best_ticker": engine_best_ticker,
+        "normalized_engine_best_ticker": normalized_engine_best_ticker,
+        "engine_best_ticker": normalized_engine_best_ticker,
+        "changed_from_engine_best": selected.get("symbol") != engine_best_ticker,
+        "screened_final_verdict": selected.get("final_verdict"),
+        "screened_reason": selected_reason,
+        "screened_primary_blocker": effective_primary_blocker,
+        "screened_checklist_failed_items": effective_failed_items,
+        "engine_best_final_verdict_after_screen": engine_pick_verdict,
+        "engine_best_reason_after_screen": engine_pick_reason,
+    }
+
+
+async def _screen_ticker_candidate(
+    summary: Dict[str, Any],
+    option_type: str,
+    token: str,
+    request: OnDemandRequest,
+    market_context: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    include_chart_checks: bool,
+) -> Dict[str, Any]:
+    symbol = summary.get("symbol")
+    primary_candidate = summary.get("primary_candidate")
+    chart_check: Optional[Dict[str, Any]] = None
+    chart_check_error: Optional[str] = None
+
+    if include_chart_checks and symbol:
+        try:
+            chart_check = await _build_chart_check_payload(symbol, token)
+        except Exception as e:
+            chart_check_error = str(e)
+
+    structure_context = _build_structure_context(
+        symbol=symbol or "UNKNOWN",
+        option_type=option_type,
+        chart_check=chart_check,
+        primary_candidate=primary_candidate,
+    ) if symbol else {"ok": False, "why": "no symbol"}
+
+    if (
+        option_type == "C"
+        and structure_context.get("first_wall") is None
+        and chart_check
+        and chart_check.get("price_vs_ema50_1h") == "above"
+    ):
+        structure_context["room_pass"] = True
+        structure_context["room_hard_fail"] = False
+        if structure_context.get("room_quality") in {None, "fail", "unconfirmed"}:
+            structure_context["room_quality"] = "pass"
+        if structure_context.get("room_ratio") is None:
+            structure_context["room_ratio"] = 999.0
+        if structure_context.get("room_ratio_current") is None:
+            structure_context["room_ratio_current"] = 999.0
+        if structure_context.get("wall_pass") in {None, False}:
+            structure_context["wall_pass"] = True
+
+    liquidity_context = _build_liquidity_block(primary_candidate)
+    iv_context = _build_iv_context(primary_candidate)
+    structure_context["iv_state"] = iv_context.get("status")
+    wall_thesis_fit = _build_wall_thesis_fit_context(
+        option_type=option_type,
+        structure_context=structure_context,
+        primary_candidate=primary_candidate,
+    )
+    trigger_state = _build_trigger_state(
+        option_type=option_type,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+        chart_check=chart_check,
+    )
+
+    chart_alignment = _chart_alignment_ok(option_type, chart_check)
+    final_verdict = _final_verdict(
+        request=request,
+        engine_status=summary.get("verdict", "NO_TRADE"),
+        chart_alignment=chart_alignment,
+        market_context=market_context,
+        macro_context=macro_context,
+        structure_context=structure_context,
+        time_day_gate=time_day_gate,
+        liquidity_context=liquidity_context,
+        iv_context=iv_context,
+        trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit,
+    )
+
+    checklist = _build_checklist_block(
+        request=request,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+        chart_check=chart_check,
+        primary_candidate=primary_candidate,
+        liquidity_context=liquidity_context,
+        trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit,
+    )
+
+    reason = summary.get("reason", "No summary available.")
+    failed_items = checklist.get("failed_items", [])
+    continuation_context = structure_context.get("continuation_context") or {}
+    if "liquidity_ok" in failed_items:
+        reason = liquidity_context.get("why") or "Options liquidity is too wide for a clean debit spread entry."
+    elif structure_context.get("ok"):
+        continuation_reason = None
+        if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_context.get("status_message"):
+            continuation_reason = continuation_context.get("status_message")
+        if structure_context.get("setup_type_allowed") is False:
+            reason = f"Setup type not allowed: {structure_context.get('setup_type')}"
+        elif continuation_context.get("main_blocker") in {"no_proven_hold", "no_valid_trigger", "move_too_extended"} and continuation_reason:
+            reason = continuation_reason
+        elif structure_context.get("continuation_window_late") is True and continuation_reason:
+            reason = continuation_reason
+        elif structure_context.get("chop_risk") is True:
+            reason = "1H structure around the 50 EMA is not clean."
+        elif structure_context.get("room_hard_fail") is True or structure_context.get("room_pass") is False:
+            reason = "Room to first wall is too tight for SAFE-FAST."
+        elif structure_context.get("wall_pass") is False:
+            reason = "Wall thesis and strike placement do not match."
+        elif wall_thesis_fit.get("wall_thesis_fit_status") == "fail":
+            reason = wall_thesis_fit.get("why_wall_thesis_fit_passes_or_fails") or "Wall thesis and strike placement do not match."
+        elif structure_context.get("ath_open_air_blocks_now") is True:
+            reason = "Open-air price discovery near highs still lacks rebuilt 1H structure."
+        elif structure_context.get("extension_state") == "extended":
+            reason = "Move is too extended from the 1H 50 EMA."
+        elif chart_alignment is False:
+            reason = "Price is on the wrong side of the 1H 50 EMA."
+        elif continuation_reason:
+            reason = continuation_reason
+        elif "clear_trigger" in failed_items:
+            trigger_reason = str(trigger_state.get("why") or "").strip().lower()
+            if trigger_reason == "market_closed":
+                reason = "After-hours review only. No live trigger can be approved until the next regular session."
+            elif trigger_reason == "next_bar_hold_failed":
+                reason = "Breakout hold failed back through the trigger / reclaim area."
+            else:
+                reason = trigger_state.get("why") or "No valid live trigger is present."
+    elif "clear_trigger" in failed_items:
+        trigger_reason = str(trigger_state.get("why") or "").strip().lower()
+        if trigger_reason == "market_closed":
+            reason = "After-hours review only. No live trigger can be approved until the next regular session."
+        else:
+            reason = trigger_state.get("why") or "No valid live trigger is present."
+
+    return {
+        "symbol": symbol,
+        "engine_verdict": summary.get("verdict"),
+        "final_verdict": final_verdict,
+        "reason": reason,
+        "primary_candidate": primary_candidate,
+        "backup_candidate": summary.get("backup_candidate"),
+        "summary": summary,
+        "chart_check": chart_check,
+        "chart_check_error": chart_check_error,
+        "structure_context": structure_context,
+        "liquidity_context": liquidity_context,
+        "iv_context": iv_context,
+        "wall_thesis_fit": wall_thesis_fit,
+        "trigger_state": trigger_state,
+        "checklist": checklist,
+    }
+
+
+def _build_candidate_context(
+    best_ticker: Optional[str],
+    option_type: str,
+    selected_summary: Optional[Dict[str, Any]],
+    primary_candidate: Optional[Dict[str, Any]],
+    backup_candidate: Optional[Dict[str, Any]],
+    chart_check: Optional[Dict[str, Any]],
+    structure_context: Dict[str, Any],
+    trigger_state: Dict[str, Any],
+    checklist: Dict[str, Any],
+    user_facing: Dict[str, Any],
+    targets: Dict[str, Any],
+    invalidation_level_1h_ema50: Optional[float],
+    two_path: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+    liquidity_context: Dict[str, Any],
+    request: OnDemandRequest,
+) -> Dict[str, Any]:
+    active = bool(best_ticker and primary_candidate)
+
+    options_block = None
+    levels_block = None
+    targets_block = None
+    primary_entry_zone = None
+    backup_entry_zone = None
+    trigger_candle = None
+    current_bar_behavior = None
+    setup_route = None
+    room_wall = None
+    extension_quality = None
+    execution_quality = None
+    event_gate = None
+    options_structure = None
+    wall_thesis_fit = None
+    adx_filter = None
+    trap_check_context = None
+    trigger_scan = None
+
+    if active:
+        entry_zones = _derive_entry_zones(
+            option_type=option_type,
+            chart_check=chart_check,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+        )
+        trigger_detail = _build_trigger_detail_context(
+            option_type=option_type,
+            chart_check=chart_check,
+            trigger_state=trigger_state,
+            structure_context=structure_context,
+        )
+        setup_route = _build_setup_route_context(
+            option_type=option_type,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+            chart_check=chart_check,
+        )
+        room_wall = _build_room_wall_context(structure_context)
+        extension_quality = _build_extension_quality_context(structure_context)
+        execution_quality = _build_execution_quality_context(
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+            macro_context=macro_context,
+            iv_context=iv_context,
+            liquidity_context=liquidity_context,
+        )
+        event_gate = _build_event_gate_context(
+            macro_context=macro_context,
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+        )
+        options_structure = _build_options_structure_context(
+            request=request,
+            selected_summary=selected_summary,
+            primary_candidate=primary_candidate,
+            liquidity_context=liquidity_context,
+        )
+        wall_thesis_fit = _build_wall_thesis_fit_context(
+            option_type=option_type,
+            structure_context=structure_context,
+            primary_candidate=primary_candidate,
+        )
+        adx_filter = _build_adx_filter_context(structure_context)
+        trap_check_context = _build_trap_check_context(structure_context)
+        trigger_scan = _build_trigger_scan_context(
+            option_type=option_type,
+            chart_check=chart_check,
+            trigger_state=trigger_state,
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+        )
+        primary_entry_zone = entry_zones.get("primary_entry_zone")
+        backup_entry_zone = entry_zones.get("backup_entry_zone")
+        trigger_candle = trigger_detail.get("trigger_candle")
+        current_bar_behavior = trigger_detail.get("current_bar_behavior")
+        options_block = {
+            "expiration_date": selected_summary.get("expiration_date") if selected_summary else None,
+            "days_to_expiration": selected_summary.get("days_to_expiration") if selected_summary else None,
+            "underlying_price": selected_summary.get("underlying_price") if selected_summary else None,
+            "long_strike": primary_candidate.get("long_strike"),
+            "short_strike": primary_candidate.get("short_strike"),
+            "width": primary_candidate.get("width"),
+            "est_debit": primary_candidate.get("est_debit"),
+            "max_loss_dollars_1lot": primary_candidate.get("max_loss_dollars_1lot"),
+            "max_profit_dollars_1lot": primary_candidate.get("max_profit_dollars_1lot"),
+        }
+        levels_block = {
+            "latest_close": chart_check.get("latest_close") if chart_check else None,
+            "ema50_1h": chart_check.get("ema50_1h") if chart_check else None,
+            "price_vs_ema50_1h": chart_check.get("price_vs_ema50_1h") if chart_check else None,
+            "first_wall": structure_context.get("first_wall"),
+            "next_pocket": structure_context.get("next_pocket"),
+            "room_to_first_wall": structure_context.get("room_to_first_wall"),
+            "room_ratio": structure_context.get("room_ratio"),
+            "wall_thesis": structure_context.get("wall_thesis"),
+            "invalidation_1h_ema50": invalidation_level_1h_ema50,
+            "shelf_low": structure_context.get("continuation_context", {}).get("shelf_low"),
+            "shelf_high": structure_context.get("continuation_context", {}).get("shelf_high"),
+            "break_line": structure_context.get("continuation_context", {}).get("break_line"),
+        }
+        targets_block = {
+            "target_40_pct_value": targets.get("target_40_pct_value"),
+            "target_50_pct_value": targets.get("target_50_pct_value"),
+            "target_60_pct_value": targets.get("target_60_pct_value"),
+            "target_70_pct_value": targets.get("target_70_pct_value"),
+        }
+
+    availability_reason = (
+        (selected_summary or {}).get("reason")
+        or structure_context.get("why")
+        or trigger_state.get("why")
+        or ("Candidate present." if active else "No feasible candidates found for the current filters.")
+    )
+
+    gate_reason = time_day_gate.get("reason") or trigger_state.get("why")
+    effective_blockers = _effective_blockers(
+        checklist,
+        screened_reason=gate_reason,
+        time_gate_reason=time_day_gate.get("reason"),
+    )
+    effective_primary_blocker = _effective_primary_blocker(
+        checklist,
+        screened_reason=gate_reason,
+        time_gate_reason=time_day_gate.get("reason"),
+    )
+
+    return {
+        "active": active,
+        "ticker": best_ticker,
+        "availability_reason": availability_reason,
+        "primary_blocker": effective_primary_blocker if active else None,
+        "blockers": effective_blockers if active else [],
+        "good_idea_now": user_facing.get("good_idea_now") if active else "NO",
+        "action": user_facing.get("action") if active else "stand down",
+        "setup_state": user_facing.get("setup_state") if active else "NO TRADE",
+        "setup_type": structure_context.get("setup_type") if active else None,
+        "trend_label": structure_context.get("trend_label") if active else None,
+        "trigger_state": trigger_state.get("why") if active else None,
+        "trigger_style": trigger_state.get("trigger_style") if active else None,
+        "trigger_level": trigger_state.get("trigger_level") if active else None,
+        "trigger_candle": trigger_candle if active else None,
+        "current_bar_behavior": current_bar_behavior if active else None,
+        "setup_route": setup_route if active else None,
+        "room_wall": room_wall if active else None,
+        "extension_quality": extension_quality if active else None,
+        "execution_quality": execution_quality if active else None,
+        "event_gate": event_gate if active else None,
+        "options_structure": options_structure if active else None,
+        "wall_thesis_fit": wall_thesis_fit if active else None,
+        "adx_filter": adx_filter if active else None,
+        "trap_check_context": trap_check_context if active else None,
+        "trigger_scan": trigger_scan if active else None,
+        "continuation": structure_context.get("continuation_context") if active and _continuation_family_detected(structure_context.get("continuation_context")) else None,
+        "primary_entry_zone": primary_entry_zone if active else None,
+        "backup_entry_zone": backup_entry_zone if active else None,
+        "options": options_block,
+        "levels": levels_block,
+        "targets": targets_block,
+        "primary_candidate": primary_candidate if active else None,
+        "backup_candidate": backup_candidate if active else None,
+        "invalidation": invalidation_level_1h_ema50 if active else None,
+        "checklist_failed_items": effective_blockers if active else [],
+        "decision_blockers_priority": effective_blockers if active else [],
+        "execution": {
+            "ideal_path": two_path.get("ideal_path"),
+            "acceptable_path": two_path.get("acceptable_path"),
+            "invalidation_1h_ema50": two_path.get("invalidation_1h_ema50"),
+            "market_open": market_context.get("is_open"),
+            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+            "macro_risk_level": macro_context.get("risk_level"),
+            "major_event_today": macro_context.get("has_major_event_today"),
+            "major_event_tomorrow": macro_context.get("has_major_event_tomorrow"),
+        },
+        "note": (
+            "Candidate context restored in a compact form. Use it as the structured handoff block for the current best ticker."
+            if active else None
+        ),
+    }
+
+
+
+def _build_two_path_block(
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    checklist: Dict[str, Any],
+    chart_check: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ema = chart_check.get("ema50_1h") if chart_check else None
+
+    if market_context.get("is_open") is False:
+        return {
+            "ideal_path": "Wait for next regular session. Re-check before entry.",
+            "acceptable_path": "No entry while market is closed.",
+            "invalidation_1h_ema50": ema,
+        }
+
+    if not time_day_gate.get("fresh_entry_allowed"):
+        return {
+            "ideal_path": "Wait for a valid SAFE-FAST entry window before considering a new trade.",
+            "acceptable_path": "Stand down until the time/day gate reopens.",
+            "invalidation_1h_ema50": ema,
+        }
+
+    failed_items = set(checklist.get("failed_items", []))
+    if failed_items:
+        labels = []
+        label_map = {
+            "allowed_setup_type": "allowed setup type",
+            "twentyfour_hour_supportive": "24H support",
+            "one_hour_clean_around_ema": "clean 1H structure",
+            "no_proven_hold": "proven hold / base",
+            "no_valid_trigger": "first clean break from the hold",
+            "move_too_extended": "move too extended from the hold",
+            "clear_room": "room pass",
+            "early_enough": "early enough / not overextended",
+            "clear_trigger": "live trigger",
+            "liquidity_ok": "liquidity pass",
+            "invalidation_clear": "clear invalidation",
+            "fits_risk": "risk fit",
+        }
+        order = [
+            "allowed_setup_type",
+            "twentyfour_hour_supportive",
+            "one_hour_clean_around_ema",
+            "no_proven_hold",
+            "no_valid_trigger",
+            "move_too_extended",
+            "clear_room",
+            "early_enough",
+            "clear_trigger",
+            "liquidity_ok",
+            "invalidation_clear",
+            "fits_risk",
+        ]
+        for key in order:
+            if key in failed_items:
+                labels.append(label_map[key])
+
+        return {
+            "ideal_path": "Need " + ", ".join(labels) + " before entry." if labels else "Need full gate pass before entry.",
+            "acceptable_path": "Stand down until all failed gates pass.",
+            "invalidation_1h_ema50": ema,
+        }
+
+    caution_text = ""
+    if structure_context.get("extension_caution_0_40_pct"):
+        caution_text = " 0.40%+ from the 1H EMA is present as a caution, not a blocker."
+
+    return {
+        "ideal_path": "Setup passes. Enter only if current bar behavior still confirms the trigger." + caution_text,
+        "acceptable_path": "Take only the mapped entry with the 1H EMA invalidation active.",
+        "invalidation_1h_ema50": ema,
+    }
+
+
+def _build_python_validation(
+    request: OnDemandRequest,
+    best_ticker: Optional[str],
+    primary_candidate: Optional[Dict[str, Any]],
+    targets: Dict[str, Any],
+    invalidation_level_1h_ema50: Optional[float],
+) -> Dict[str, Any]:
+    max_loss = _to_float((primary_candidate or {}).get("max_loss_dollars_1lot"))
+    return {
+        "ok": True,
+        "ticker": best_ticker,
+        "ticker_allowed": best_ticker in ALLOWED_SYMBOLS if best_ticker else False,
+        "risk_preferred_band_ok": bool(max_loss is not None and request.risk_min_dollars <= max_loss <= request.risk_max_dollars),
+        "risk_hard_max_ok": bool(max_loss is not None and max_loss <= request.hard_max_dollars),
+        "open_positions_ok_for_new_trade": request.open_positions == 0,
+        "max_one_open_position_rule": request.open_positions <= 1,
+        "max_loss_dollars_1lot": max_loss,
+        "targets_confirmed": bool(targets.get("ok")),
+        "target_40_pct_value": targets.get("target_40_pct_value"),
+        "target_50_pct_value": targets.get("target_50_pct_value"),
+        "target_60_pct_value": targets.get("target_60_pct_value"),
+        "target_70_pct_value": targets.get("target_70_pct_value"),
+        "exit_price_1h_ema50": invalidation_level_1h_ema50,
+    }
+
+
+def _normalize_top_level_status(final_verdict: Optional[str]) -> str:
+    if final_verdict in {"TRADE", "ACTIVE_NOW", "PENDING", "NO_TRADE", "INVALIDATED"}:
+        return str(final_verdict)
+    return "NO_TRADE"
+
+
+def _build_ten_second_checklist(
+    request: OnDemandRequest,
+    checklist_block: Dict[str, Any],
+    structure_context: Dict[str, Any],
+    iv_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    item_map = {row.get("item"): bool(row.get("yes")) for row in checklist_block.get("items", [])}
+    questions = [
+        ("allowed_setup_type", "Is this one of the 3 allowed setup types?", item_map.get("allowed_setup_type")),
+        ("twentyfour_hour_supportive", "Is 24H trend/context supportive?", item_map.get("twentyfour_hour_supportive")),
+        ("one_hour_clean_around_ema", "Is 1H structure clean around 50 EMA?", item_map.get("one_hour_clean_around_ema")),
+        ("clear_room", "Do we have clear room to next level?", item_map.get("clear_room")),
+        ("early_enough", "Are we early enough, not overextended?", item_map.get("early_enough") and structure_context.get("extension_blocks_now") is not True),
+        ("iv_acceptable", "Is IV acceptable for a debit spread?", None if iv_context.get("status") == "unconfirmed" else bool(iv_context.get("ok"))),
+        ("clear_trigger", "Is there a clear entry trigger?", item_map.get("clear_trigger")),
+        ("invalidation_clear", "Is invalidation clear: 1H close beyond 50 EMA?", item_map.get("invalidation_clear")),
+        ("fits_risk", "Does this fit risk budget?", item_map.get("fits_risk")),
+        ("open_trade_already", "Do we already have an open trade?", request.open_positions > 0),
+    ]
+    failed_items = checklist_block.get("failed_items", [])
+    effective_failed_items = checklist_block.get("effective_failed_items", failed_items)
+    global_gate_failures = checklist_block.get(
+        "global_gate_failures",
+        [item for item in effective_failed_items if item not in failed_items],
+    )
+    return {
+        "ok": True,
+        "answers": [
+            {
+                "item": item,
+                "question": question,
+                "answer": "YES" if value is True else "NO" if value is False else "UNCONFIRMED",
+            }
+            for item, question, value in questions
+        ],
+        "failed_items": failed_items,
+        "effective_failed_items": effective_failed_items,
+        "global_gate_failures": global_gate_failures,
+    }
+
+
+def _build_approval_flip_context_block(
+    approval_requirements_context: Dict[str, Any],
+    approval_context: Dict[str, Any],
+    entry_context: Dict[str, Any],
+    intrabar_signal_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    gate_statuses = approval_requirements_context.get("gate_statuses") or []
+    ready_gates = [row.get("gate") for row in gate_statuses if row.get("ready")]
+    missing_gates = approval_requirements_context.get("missing_gates") or [
+        row.get("gate") for row in gate_statuses if not row.get("ready")
+    ]
+    next_flip_needed = approval_requirements_context.get("next_flip_needed")
+    approval_ready_now = bool(approval_context.get("approval_ready_now") is True)
+    approval_ready_on_completed_candle = bool(approval_context.get("approval_ready_on_completed_candle") is True)
+    intrabar_raw_signal_detected = bool(approval_context.get("intrabar_raw_signal_detected") is True)
+    completed_raw_signal_detected = bool(approval_context.get("completed_raw_signal_detected") is True)
+
+    if approval_ready_now:
+        flip_status = "APPROVED_NOW"
+    elif approval_ready_on_completed_candle:
+        flip_status = "APPROVED_ON_COMPLETED_CANDLE"
+    elif intrabar_raw_signal_detected:
+        flip_status = "NEXT_GATE_BLOCKING_INTRABAR_ENTRY"
+    elif completed_raw_signal_detected:
+        flip_status = "NEXT_GATE_BLOCKING_COMPLETED_ENTRY"
+    else:
+        flip_status = "NO_SIGNAL_TO_APPROVE"
+
+    return {
+        "ok": True,
+        "flip_status": flip_status,
+        "next_flip_needed": next_flip_needed,
+        "ready_gate_count": len([gate for gate in ready_gates if gate]),
+        "remaining_gate_count": len([gate for gate in missing_gates if gate]),
+        "ready_gates": [gate for gate in ready_gates if gate],
+        "missing_gates": [gate for gate in missing_gates if gate],
+        "intrabar_raw_signal_detected": intrabar_raw_signal_detected,
+        "completed_raw_signal_detected": completed_raw_signal_detected,
+        "approval_ready_now": approval_ready_now,
+        "approval_ready_on_completed_candle": approval_ready_on_completed_candle,
+        "mid_candle_trade_available_now": bool(entry_context.get("mid_candle_trade_available_now") is True),
+        "completed_candle_trade_available": bool(entry_context.get("completed_candle_trade_available") is True),
+        "intrabar_signal_status": intrabar_signal_context.get("intrabar_signal_status"),
+        "approval_status": approval_context.get("approval_status"),
+        "primary_blocker": approval_context.get("primary_blocker"),
+        "blockers": approval_context.get("blockers", []),
+        "approval_note": (
+            "Flip the next required gate before any raw signal can become an approved SAFE-FAST entry."
+            if next_flip_needed
+            else "No remaining approval gate is blocking right now."
+        ),
+    }
+
+
+def _build_setup_eligibility_context_block(
+    structure_context: Dict[str, Any],
+    live_map: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+    approval_requirements_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    setup_type = structure_context.get("setup_type")
+    allowed_setup_type = _is_allowed_setup_type_name(setup_type)
+    setup_type_allowed = bool(structure_context.get("setup_type_allowed") is True)
+    setup_eligible_now = bool(structure_context.get("setup_eligible_now") is True)
+    route = live_map.get("setup_route") or {}
+    blockers = list(
+        approval_requirements_context.get("blockers")
+        or checklist_block.get("decision_blockers_priority")
+        or checklist_block.get("failed_items")
+        or []
+    )
+    primary_blocker = blockers[0] if blockers else None
+
+    if not setup_type:
+        setup_type_status = "NO_SETUP_TYPE_DETECTED"
+    elif setup_eligible_now:
+        setup_type_status = "ELIGIBLE_NOW"
+    else:
+        setup_type_status = "DETECTED_BUT_NOT_ELIGIBLE"
+
+    return {
+        "ok": True,
+        "setup_type_detected": setup_type,
+        "setup_type_status": setup_type_status,
+        "allowed_setup": setup_type_allowed,
+        "setup_eligible_now": setup_eligible_now,
+        "ten_second_check_answer": "YES" if allowed_setup_type else "NO",
+        "setup_route_status": route.get("setup_route_status"),
+        "setup_route_reason": route.get("why_setup_route_passes_or_fails"),
+        "next_flip_needed": approval_requirements_context.get("next_flip_needed") or primary_blocker,
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "approval_path_status": approval_requirements_context.get("approval_path_status"),
+        "note": "A setup label can be detected while SAFE-FAST still marks the setup as not eligible."
+    }
+
+def _build_setup_check_context_block(
+
+    structure_context: Dict[str, Any],
+    ten_second_checklist_block: Dict[str, Any],
+    setup_eligibility_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    setup_type = structure_context.get("setup_type")
+    setup_type_allowed = bool(structure_context.get("setup_type_allowed") is True)
+    setup_eligible_now = bool(structure_context.get("setup_eligible_now") is True)
+    answers = ten_second_checklist_block.get("answers") or []
+    allowed_setup_answer = None
+    for row in answers:
+        if row.get("item") == "allowed_setup_type":
+            allowed_setup_answer = row.get("answer")
+            break
+
+    setup_type_status = setup_eligibility_context.get("setup_type_status")
+    primary_blocker = setup_eligibility_context.get("primary_blocker")
+    blockers = setup_eligibility_context.get("blockers") or []
+
+    return {
+        "ok": True,
+        "setup_type_detected": setup_type,
+        "setup_type_status": setup_type_status,
+        "allowed_setup": setup_type_allowed,
+        "setup_eligible_now": setup_eligible_now,
+        "ten_second_check_item": "allowed_setup_type",
+        "ten_second_check_answer": allowed_setup_answer,
+        "detected_but_not_eligible": bool(_is_allowed_setup_type_name(setup_type) and not setup_eligible_now),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "note": (
+            "Setup detection and setup eligibility are separate. "
+            "A route can be labeled while the checklist still says NO."
+        ),
+    }
+
+
+def _build_time_gate_check_context_block(
+    time_day_gate: Dict[str, Any],
+    ten_second_checklist_block: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+) -> Dict[str, Any]:
+    answers = ten_second_checklist_block.get("answers") or []
+    early_enough_answer = None
+    for row in answers:
+        if row.get("item") == "early_enough":
+            early_enough_answer = row.get("answer")
+            break
+
+    fresh_entry_allowed = bool(time_day_gate.get("fresh_entry_allowed") is True)
+    reason = time_day_gate.get("reason")
+    cutoff_et = time_day_gate.get("cutoff_et")
+    blockers = _effective_blockers(
+        checklist_block,
+        time_gate_reason=reason,
+    )
+    primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        time_gate_reason=reason,
+    )
+
+    return {
+        "ok": True,
+        "entry_window_status": "OPEN" if fresh_entry_allowed else "CLOSED",
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "time_gate_reason": reason,
+        "cutoff_et": cutoff_et,
+        "ten_second_check_item": "early_enough",
+        "ten_second_check_answer": early_enough_answer,
+        "early_enough_fails_from_time_gate": bool(
+            early_enough_answer == "NO" and not fresh_entry_allowed and str(reason or "").lower() not in {"market_closed"}
+        ),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "note": (
+            "The early_enough checklist item can fail from late extension, "
+            "the closed entry window, or both."
+        ),
+    }
+
+def _build_final_reason_context_block(
+
+    user_facing: Dict[str, Any],
+    screened_best_context: Dict[str, Any],
+    time_gate_check_context: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+) -> Dict[str, Any]:
+    screened_reason = screened_best_context.get("screened_reason")
+    time_gate_reason = time_gate_check_context.get("time_gate_reason")
+    blockers = _effective_blockers(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+    primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+
+    return {
+        "ok": True,
+        "final_reason": user_facing.get("why"),
+        "screened_reason": screened_reason,
+        "time_gate_reason": time_gate_reason,
+        "entry_window_status": time_gate_check_context.get("entry_window_status"),
+        "fresh_entry_allowed": time_gate_check_context.get("fresh_entry_allowed"),
+        "early_enough_fails_from_time_gate": time_gate_check_context.get("early_enough_fails_from_time_gate"),
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "note": (
+            "The final NO_TRADE reason can come from the time/day gate, "
+            "structural blockers, or both."
+        ),
+    }
+
+
+
+def _build_reason_stack_context_block(
+    final_reason_context: Dict[str, Any],
+    checklist_block: Dict[str, Any],
+    failed_reasons: List[str],
+) -> Dict[str, Any]:
+    screened_reason = final_reason_context.get("screened_reason")
+    time_gate_reason = final_reason_context.get("time_gate_reason")
+    blockers = _effective_blockers(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+    primary_blocker = _effective_primary_blocker(
+        checklist_block,
+        screened_reason=screened_reason,
+        time_gate_reason=time_gate_reason,
+    )
+
+    return {
+        "ok": True,
+        "top_line_reason": final_reason_context.get("final_reason"),
+        "screened_reason": screened_reason,
+        "time_gate_reason": time_gate_reason,
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "failed_reasons": failed_reasons,
+        "reason_count": len(failed_reasons or []),
+        "note": (
+            "The top-line NO_TRADE reason is concise. "
+            "Use blockers and failed_reasons for the full rejection stack."
+        ),
+    }
+
+
+
+def _build_winner_shift_context_block(
+    *,
+    raw_engine_winner_ticker: Optional[str],
+    raw_engine_winner_status: Optional[str],
+    normalized_engine_winner_ticker: Optional[str],
+    normalized_engine_winner_status: Optional[str],
+    normalized_engine_winner_final_verdict: Optional[str],
+    screened_live_winner_ticker: Optional[str],
+    screened_live_winner_final_verdict: Optional[str],
+    screened_reason: Optional[str],
+) -> Dict[str, Any]:
+    raw_to_normalized_changed = raw_engine_winner_ticker != normalized_engine_winner_ticker
+    normalized_to_screened_changed = normalized_engine_winner_ticker != screened_live_winner_ticker
+    any_shift = raw_to_normalized_changed or normalized_to_screened_changed
+
+    if raw_to_normalized_changed and normalized_to_screened_changed:
+        shift_path = "RAW_TO_NORMALIZED_TO_SCREENED_SHIFT"
+    elif raw_to_normalized_changed:
+        shift_path = "RAW_TO_NORMALIZED_SHIFT"
+    elif normalized_to_screened_changed:
+        shift_path = "NORMALIZED_TO_SCREENED_SHIFT"
+    else:
+        shift_path = "NO_SHIFT"
+
+    return {
+        "ok": True,
+        "shift_path": shift_path,
+        "raw_engine_winner_ticker": raw_engine_winner_ticker,
+        "raw_engine_winner_status": raw_engine_winner_status,
+        "normalized_engine_winner_ticker": normalized_engine_winner_ticker,
+        "normalized_engine_winner_status": normalized_engine_winner_status,
+        "normalized_engine_winner_final_verdict": normalized_engine_winner_final_verdict,
+        "screened_live_winner_ticker": screened_live_winner_ticker,
+        "screened_live_winner_final_verdict": screened_live_winner_final_verdict,
+        "raw_to_normalized_changed": raw_to_normalized_changed,
+        "normalized_to_screened_changed": normalized_to_screened_changed,
+        "any_shift": any_shift,
+        "screened_reason": screened_reason,
+        "note": (
+            "Raw engine selection, normalized winner, and screened live winner can differ. "
+            "Use this block to track exactly where the handoff changed."
+        ),
+    }
+
+
+
+def _json_safe_for_response(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe_for_response(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_for_response(item) for item in value]
+    if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+        try:
+            return _json_safe_for_response(value.model_dump())
+        except Exception:
+            return str(value)
+    if hasattr(value, "dict") and callable(getattr(value, "dict")):
+        try:
+            return _json_safe_for_response(value.dict())
+        except Exception:
+            return str(value)
+    return str(value)
+
+def _coerce_error_reason(value: Any) -> str:
+    if value is None:
+        return "Candidate engine unavailable for this run."
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value)
+    except Exception:
+        return str(value)
+
+
+def _build_on_demand_unavailable_payload(
+    request: OnDemandRequest,
+    *,
+    market_context: Dict[str, Any],
+    macro_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    reason: str,
+    error_type: str,
+    status_code: int = 503,
+) -> Dict[str, Any]:
+    reason_text = _coerce_error_reason(reason)
+    build_tag = BUILD_TAG
+    failed_reasons = [reason_text]
+    primary_blocker = "data_unavailable"
+
+    simple_output = {
+    "design_goal": "complex_inputs_simple_outputs",
+    "good_idea_now": "NO",
+    "ticker": None,
+    "action": "stand down",
+    "invalidation": "Unavailable while candidate engine is down for this run.",
+    "setup_state": "NO TRADE",
+    "why": reason_text,
+    "what_would_make_it_acceptable": None,
+    "macro_brief": _build_macro_brief(macro_context),
+    "signal_present": False,
+    "response_lines": _build_trade_day_response_lines(
+        good_idea_now="NO",
+        ticker=None,
+        action="stand down",
+        why=reason_text,
+        invalidation="Unavailable while candidate engine is down for this run.",
+        what_would_make_it_acceptable=None,
+    ),
+    "response_text": "\n".join(
+        _build_trade_day_response_lines(
+            good_idea_now="NO",
+            ticker=None,
+            action="stand down",
+            why=reason_text,
+            invalidation="Unavailable while candidate engine is down for this run.",
+            what_would_make_it_acceptable=None,
+        )
+    ),
+}
+
+    ten_second_answers = [
+        {
+            "item": "allowed_setup_type",
+            "question": "Is this one of the 3 allowed setup types?",
+            "answer": "UNCONFIRMED",
+        },
+        {
+            "item": "twentyfour_hour_supportive",
+            "question": "Is 24H trend/context supportive?",
+            "answer": "UNCONFIRMED",
+        },
+        {
+            "item": "one_hour_clean_around_ema",
+            "question": "Is 1H structure clean around 50 EMA?",
+            "answer": "UNCONFIRMED",
+        },
+        {
+            "item": "clear_room",
+            "question": "Do we have clear room to next level?",
+            "answer": "UNCONFIRMED",
+        },
+        {
+            "item": "early_enough",
+            "question": "Are we early enough, not overextended?",
+            "answer": "UNCONFIRMED",
+        },
+        {
+            "item": "iv_acceptable",
+            "question": "Is IV acceptable for a debit spread?",
+            "answer": "UNCONFIRMED",
+        },
+        {
+            "item": "clear_trigger",
+            "question": "Is there a clear entry trigger?",
+            "answer": "UNCONFIRMED",
+        },
+        {
+            "item": "invalidation_clear",
+            "question": "Is invalidation clear: 1H close beyond 50 EMA?",
+            "answer": "UNCONFIRMED",
+        },
+        {
+            "item": "fits_risk",
+            "question": "Does this fit risk budget?",
+            "answer": "UNCONFIRMED",
+        },
+        {
+            "item": "open_trade_already",
+            "question": "Do we already have an open trade?",
+            "answer": "NO" if request.open_positions == 0 else "YES",
+        },
+    ]
+
+    checklist_items = [
+        {"item": "allowed_setup_type", "yes": None},
+        {"item": "twentyfour_hour_supportive", "yes": None},
+        {"item": "one_hour_clean_around_ema", "yes": None},
+        {"item": "clear_room", "yes": None},
+        {"item": "early_enough", "yes": None},
+        {"item": "clear_trigger", "yes": None},
+        {"item": "liquidity_ok", "yes": None},
+        {"item": "invalidation_clear", "yes": None},
+        {"item": "fits_risk", "yes": None},
+        {"item": "open_trade_already", "yes": request.open_positions > 0},
+    ]
+
+    winner_context = {
+        "raw_engine_winner_ticker": None,
+        "raw_engine_winner_status": "UNCONFIRMED",
+        "normalized_engine_winner_ticker": None,
+        "normalized_engine_winner_status": "UNCONFIRMED",
+        "normalized_engine_winner_final_verdict": "NO_TRADE",
+        "screened_live_winner_ticker": None,
+        "screened_live_winner_final_verdict": "NO_TRADE",
+        "changed_after_screening": False,
+        "why_changed_after_screening": error_type,
+    }
+
+    engine_context = {
+        "ok": False,
+        "raw_best_ticker": None,
+        "raw_status": "UNCONFIRMED",
+        "raw_reason": reason_text,
+        "normalized_best_ticker": None,
+        "normalized_status": "UNCONFIRMED",
+        "normalized_final_verdict": "NO_TRADE",
+        "normalized_reason": error_type,
+        "changed_from_raw_engine": False,
+    }
+
+    decision_context = {
+        "ok": True,
+        "ticker": None,
+        "action": "stand down",
+        "setup_state": "NO TRADE",
+        "good_idea_now": "NO",
+        "raw_engine": {"ticker": None, "status": "UNCONFIRMED", "reason": reason_text},
+        "normalized_engine": {
+            "ticker": None,
+            "status": "UNCONFIRMED",
+            "final_verdict": "NO_TRADE",
+            "reason": error_type,
+        },
+        "screened": {"ticker": None, "final_verdict": "NO_TRADE", "reason": error_type},
+        "primary_blocker": primary_blocker,
+        "blockers": [primary_blocker],
+        "failed_reasons": failed_reasons,
+        "changed_from_raw_engine": False,
+    }
+
+    blocker_context = {
+        "ok": True,
+        "primary_blocker": primary_blocker,
+        "blockers": [primary_blocker],
+        "failed_reasons": failed_reasons,
+        "trigger_present": False,
+        "trigger_reason": error_type,
+        "structure_ready": None,
+        "setup_type": "UNCONFIRMED",
+        "allowed_setup": False,
+        "room_pass": False,
+        "extension_blocks_now": None,
+        "engine_status": "UNCONFIRMED",
+        "final_verdict": "NO_TRADE",
+        "action": "stand down",
+        "setup_state": "NO TRADE",
+        "good_idea_now": "NO",
+    }
+
+    screened_best_context = {
+        "ok": False,
+        "screened_best_ticker": None,
+        "raw_engine_best_ticker": None,
+        "normalized_engine_best_ticker": None,
+        "engine_best_ticker": None,
+        "changed_from_engine_best": False,
+        "screened_final_verdict": "NO_TRADE",
+        "screened_reason": error_type,
+        "screened_checklist_failed_items": [primary_blocker],
+        "engine_best_final_verdict_after_screen": "NO_TRADE",
+        "engine_best_reason_after_screen": error_type,
+    }
+
+    trigger_state = {
+        "ok": False,
+        "trigger_present": False,
+        "trigger_style": "close_above_recent_high",
+        "trigger_level": None,
+        "current_close": None,
+        "why": error_type,
+    }
+
+    empty_context = {
+        "ok": False,
+        "reason": error_text if (error_text := reason_text) else error_type,
+    }
+
+    payload = {
+        "ok": True,
+        "mode": "on_demand",
+        "build_tag": build_tag,
+        "session_basis_context": _build_session_basis_context(),
+        "source_of_truth": "candidate_engine",
+        "read_this_first": "simple_output",
+        "engine_status": "UNCONFIRMED",
+        "candidate_engine_status": "UNCONFIRMED",
+        "final_verdict": "NO_TRADE",
+        "best_ticker": None,
+        "raw_engine_best_ticker": None,
+        "engine_best_ticker": None,
+        "winner_context": winner_context,
+        "engine_context": engine_context,
+        "decision_context": decision_context,
+        "blocker_context": blocker_context,
+        "live_map": {
+            "ticker": None,
+            "market_open": market_context.get("is_open"),
+            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+            "why": error_type,
+            "backend_error": reason_text,
+        },
+        "trigger_context": {
+            "ok": False,
+            "trigger_present": False,
+            "trigger_reason": error_type,
+            "structure_ready": None,
+            "trigger_style": "close_above_recent_high",
+            "trigger_level": None,
+            "current_close": None,
+            "current_bar_raw_trigger_pass": False,
+            "current_bar_gated_trigger_pass": False,
+            "completed_candle_raw_trigger_pass": False,
+            "completed_candle_gated_trigger_pass": False,
+            "current_bar_relation_to_trigger_level": None,
+            "current_bar_relation_to_ema50_1h": None,
+            "trigger_scan_status": "unconfirmed",
+            "why_trigger_scan_passes_or_fails": reason_text,
+        },
+        "entry_context": {
+            "ok": False,
+            "mid_candle_trade_available_now": False,
+            "mid_candle_entry_state": "UNCONFIRMED",
+            "mid_candle_raw_trigger_detected_now": False,
+            "mid_candle_block_reason": error_type,
+            "completed_candle_trade_available": False,
+            "completed_candle_entry_state": "UNCONFIRMED",
+            "completed_candle_raw_trigger_detected": False,
+            "completed_candle_block_reason": error_type,
+            "trigger_present": False,
+            "trigger_reason": error_type,
+            "structure_ready": None,
+            "trigger_style": "close_above_recent_high",
+            "trigger_level": None,
+            "current_close": None,
+            "current_bar_relation_to_trigger_level": None,
+            "current_bar_relation_to_ema50_1h": None,
+            "primary_blocker": primary_blocker,
+            "blockers": [primary_blocker],
+            "allowed_setup": False,
+            "setup_type": "UNCONFIRMED",
+            "room_pass": False,
+            "extension_blocks_now": None,
+            "action": "stand down",
+            "setup_state": "NO TRADE",
+            "good_idea_now": "NO",
+        },
+        "intrabar_signal_context": {
+            "ok": False,
+            "ticker": None,
+            "intrabar_signal_status": "UNCONFIRMED",
+            "intrabar_trade_available_now": False,
+            "intrabar_raw_signal_detected": False,
+            "intrabar_block_reason": error_type,
+            "intrabar_time_iso": None,
+            "intrabar_close": None,
+            "intrabar_trigger_level_relation": None,
+            "intrabar_ema_relation": None,
+            "completed_signal_status": "UNCONFIRMED",
+            "completed_trade_available": False,
+            "completed_raw_signal_detected": False,
+            "completed_block_reason": error_type,
+            "completed_time_iso": None,
+            "completed_close": None,
+            "primary_blocker": primary_blocker,
+            "blockers": [primary_blocker],
+            "trigger_present": False,
+            "trigger_reason": error_type,
+            "structure_ready": None,
+            "action": "stand down",
+            "setup_state": "NO TRADE",
+            "good_idea_now": "NO",
+            "signal_note": reason_text,
+        },
+        "approval_context": {
+            "ok": False,
+            "ticker": None,
+            "approval_status": "UNCONFIRMED",
+            "approval_ready_now": False,
+            "approval_ready_on_completed_candle": False,
+            "intrabar_raw_signal_detected": False,
+            "completed_raw_signal_detected": False,
+            "structure_ready": None,
+            "trigger_present": False,
+            "trigger_reason": error_type,
+            "allowed_setup": False,
+            "setup_type": "UNCONFIRMED",
+            "room_pass": False,
+            "extension_blocks_now": None,
+            "primary_blocker": primary_blocker,
+            "blockers": [primary_blocker],
+            "next_flip_needed": primary_blocker,
+            "action": "stand down",
+            "setup_state": "NO TRADE",
+            "good_idea_now": "NO",
+            "approval_note": reason_text,
+        },
+        "approval_requirements_context": {
+            "ok": False,
+            "approval_path_status": "UNCONFIRMED",
+            "approval_ready_now": False,
+            "approval_ready_on_completed_candle": False,
+            "intrabar_raw_signal_detected": False,
+            "completed_raw_signal_detected": False,
+            "next_flip_needed": primary_blocker,
+            "missing_gates": [primary_blocker],
+            "gate_statuses": [],
+            "checklist_failed_items": [primary_blocker],
+            "blockers": [primary_blocker],
+            "allowed_setup": False,
+            "setup_type": "UNCONFIRMED",
+            "room_pass": False,
+            "extension_blocks_now": None,
+            "structure_ready": None,
+            "trigger_present": False,
+            "trigger_reason": error_type,
+            "liquidity_ok": None,
+            "market_open": market_context.get("is_open"),
+            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+            "macro_event_clear": None,
+        },
+        "approval_flip_context": {
+            "ok": False,
+            "flip_status": "UNCONFIRMED",
+            "next_flip_needed": primary_blocker,
+            "ready_gate_count": 0,
+            "remaining_gate_count": 1,
+            "ready_gates": [],
+            "missing_gates": [primary_blocker],
+            "intrabar_raw_signal_detected": False,
+            "completed_raw_signal_detected": False,
+            "approval_ready_now": False,
+            "approval_ready_on_completed_candle": False,
+            "mid_candle_trade_available_now": False,
+            "completed_candle_trade_available": False,
+            "intrabar_signal_status": "UNCONFIRMED",
+            "approval_status": "UNCONFIRMED",
+            "primary_blocker": primary_blocker,
+            "blockers": [primary_blocker],
+            "approval_note": reason_text,
+        },
+        "setup_eligibility_context": {
+            "ok": False,
+            "setup_type_detected": None,
+            "setup_type_status": "UNCONFIRMED",
+            "allowed_setup": False,
+            "ten_second_check_answer": "UNCONFIRMED",
+            "setup_route_status": "unconfirmed",
+            "setup_route_reason": reason_text,
+            "next_flip_needed": primary_blocker,
+            "primary_blocker": primary_blocker,
+            "blockers": [primary_blocker],
+            "approval_path_status": "UNCONFIRMED",
+            "note": reason_text,
+        },
+        "setup_check_context": {
+            "ok": False,
+            "setup_type_detected": None,
+            "setup_type_status": "UNCONFIRMED",
+            "allowed_setup": False,
+            "ten_second_check_item": "allowed_setup_type",
+            "ten_second_check_answer": "UNCONFIRMED",
+            "detected_but_not_eligible": False,
+            "primary_blocker": primary_blocker,
+            "blockers": [primary_blocker],
+            "note": reason_text,
+        },
+        "time_gate_check_context": {
+            "ok": True,
+            "entry_window_status": "OPEN" if time_day_gate.get("fresh_entry_allowed") else "CLOSED",
+            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+            "time_gate_reason": time_day_gate.get("reason"),
+            "cutoff_et": time_day_gate.get("cutoff_et"),
+            "ten_second_check_item": "early_enough",
+            "ten_second_check_answer": "UNCONFIRMED",
+            "early_enough_fails_from_time_gate": False,
+            "primary_blocker": primary_blocker,
+            "blockers": [primary_blocker],
+            "note": reason_text,
+        },
+        "final_reason_context": {
+            "ok": True,
+            "final_reason": reason_text,
+            "screened_reason": error_type,
+            "time_gate_reason": time_day_gate.get("reason"),
+            "entry_window_status": "OPEN" if time_day_gate.get("fresh_entry_allowed") else "CLOSED",
+            "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+            "early_enough_fails_from_time_gate": False,
+            "primary_blocker": primary_blocker,
+            "blockers": [primary_blocker],
+            "note": reason_text,
+        },
+        "simple_output": simple_output,
+        "screened_best_context": screened_best_context,
+        "market_context": market_context,
+        "macro_context": macro_context,
+        "structure_context": {"ok": False, "why": reason_text},
+        "adx_context": {"ok": False, "why": reason_text},
+        "time_day_gate": time_day_gate,
+        "iv_context": {"ok": False, "status": "unconfirmed", "why": reason_text},
+        "python_validation": {
+            "ok": False,
+            "ticker": None,
+            "ticker_allowed": False,
+            "risk_preferred_band_ok": None,
+            "risk_hard_max_ok": None,
+            "open_positions_ok_for_new_trade": request.open_positions == 0,
+            "max_one_open_position_rule": request.open_positions <= 1,
+            "max_loss_dollars_1lot": None,
+            "targets_confirmed": False,
+            "target_40_pct_value": None,
+            "target_50_pct_value": None,
+            "target_60_pct_value": None,
+            "target_70_pct_value": None,
+            "exit_price_1h_ema50": None,
+        },
+        "ten_second_checklist": {
+            "ok": False,
+            "answers": ten_second_answers,
+            "failed_items": [primary_blocker],
+        },
+        "liquidity_context": {"ok": False, "status": "unconfirmed", "why": reason_text},
+        "trigger_state": trigger_state,
+        "targets": {
+            "ok": False,
+            "debit": None,
+            "max_loss_dollars_1lot": None,
+            "target_40_pct_value": None,
+            "target_50_pct_value": None,
+            "target_60_pct_value": None,
+            "target_70_pct_value": None,
+        },
+        "invalidation_level_1h_ema50": None,
+        "checklist": {
+            "ok": False,
+            "items": checklist_items,
+            "failed_items": [primary_blocker],
+            "decision_blockers_priority": [primary_blocker],
+        },
+        "failed_reasons": failed_reasons,
+        "other_ticker_candidates": [],
+        "request": request.model_dump(),
+        "candidate_engine": {
+            "ok": False,
+            "verdict": "UNCONFIRMED",
+            "best_ticker": None,
+            "reason": reason_text,
+            "selection_mode": "unconfirmed",
+            "primary_candidate": None,
+            "backup_candidate": None,
+            "ticker_summaries": [],
+        },
+        "candidate_engine_normalized": {
+            "ok": False,
+            "raw_best_ticker": None,
+            "raw_verdict": "UNCONFIRMED",
+            "raw_reason": reason_text,
+            "normalized_best_ticker": None,
+            "normalized_verdict": "UNCONFIRMED",
+            "normalized_final_verdict": "NO_TRADE",
+            "normalized_reason": error_type,
+            "selection_mode": "unconfirmed",
+        },
+        "chart_check": {"ok": False, "why": reason_text},
+        "chart_confirmation": {
+            "confirmed": False,
+            "message": reason_text,
+            "fields": {},
+        },
+        "universe_chart_confirmation": {
+            "ok": False,
+            "requested": False,
+            "all_tickers_confirmed": False,
+            "confirmed_tickers": [],
+            "unconfirmed_tickers": list(SYMBOL_ORDER),
+            "tickers": [],
+            "message": reason_text,
+        },
+        "user_facing": {
+            "good_idea_now": "NO",
+            "ticker": None,
+            "action": "stand down",
+            "invalidation": "Unavailable while candidate engine is down for this run.",
+            "setup_state": "NO TRADE",
+            "why": reason_text,
+        },
+        "candidate_context": {
+            "active": False,
+            "ticker": None,
+            "availability_reason": reason_text,
+            "good_idea_now": "NO",
+            "action": "stand down",
+            "setup_state": "NO TRADE",
+            "setup_type": "UNCONFIRMED",
+            "trend_label": "Unconfirmed",
+            "trigger_state": error_type,
+            "trigger_style": "close_above_recent_high",
+            "trigger_level": None,
+            "trigger_candle": None,
+            "current_bar_behavior": None,
+            "setup_route": {"setup_route_status": "unconfirmed", "why_setup_route_passes_or_fails": reason_text},
+            "room_wall": {"room_wall_status": "unconfirmed", "why_room_or_wall_passes_or_fails": reason_text},
+            "extension_quality": {"extension_quality_status": "unconfirmed", "why_extension_passes_or_fails": reason_text},
+            "execution_quality": {"execution_quality_status": "unconfirmed", "why_execution_quality_passes_or_fails": reason_text},
+            "event_gate": {"event_gate_status": "unconfirmed", "why_event_gate_passes_or_fails": reason_text},
+            "options_structure": {"options_structure_status": "unconfirmed", "why_options_structure_passes_or_fails": reason_text},
+            "wall_thesis_fit": {"wall_thesis_fit_status": "unconfirmed", "why_wall_thesis_fit_passes_or_fails": reason_text},
+            "adx_filter": {"adx_filter_status": "unconfirmed", "why_adx_passes_or_fails": reason_text},
+            "trigger_scan": {"trigger_scan_status": "unconfirmed", "why_trigger_scan_passes_or_fails": reason_text},
+            "primary_entry_zone": None,
+            "backup_entry_zone": None,
+            "options": None,
+            "levels": None,
+            "targets": None,
+            "primary_candidate": None,
+            "backup_candidate": None,
+            "invalidation": None,
+            "checklist_failed_items": [primary_blocker],
+            "decision_blockers_priority": [primary_blocker],
+            "execution": {
+                "ideal_path": "Retry when backend connectivity is restored.",
+                "acceptable_path": "Stand down until candidate engine is reachable again.",
+                "invalidation_1h_ema50": None,
+                "market_open": market_context.get("is_open"),
+                "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+                "macro_risk_level": macro_context.get("risk_level"),
+                "major_event_today": macro_context.get("has_major_event_today"),
+                "major_event_tomorrow": macro_context.get("has_major_event_tomorrow"),
+            },
+            "note": reason_text,
+        },
+        "two_path": {
+            "ideal_path": "Retry when backend connectivity is restored.",
+            "acceptable_path": "Stand down until candidate engine is reachable again.",
+            "invalidation_1h_ema50": None,
+        },
+        "service_status": {
+            "ok": False,
+            "error_type": error_type,
+            "status_code": status_code,
+            "reason": reason_text,
+        },
+    }
+    return payload
+
+
+
+
+async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
+
+    clean_option_type = _clean_option_type(request.option_type)
+    market_context = _market_context_now()
+    time_day_gate = _time_day_gate(market_context)
+    macro_context = await _build_macro_context(request.macro_context_requested)
+
+    if request.open_positions < 0 or request.open_positions > 1:
+        raise HTTPException(status_code=400, detail="open_positions must be 0 or 1")
+    if request.weekly_trade_count < 0:
+        raise HTTPException(status_code=400, detail="weekly_trade_count must be >= 0")
+
+    try:
+        token = await get_access_token()
+        summary_payload = await _build_summary_compact_payload(
+            option_type=clean_option_type,
+            min_dte=request.min_dte,
+            max_dte=request.max_dte,
+            near_limit=request.near_limit,
+            width_min=request.width_min,
+            width_max=request.width_max,
+            risk_min_dollars=request.risk_min_dollars,
+            risk_max_dollars=request.risk_max_dollars,
+            hard_max_dollars=request.hard_max_dollars,
+            allow_fallback=request.allow_fallback,
+            token=token,
+        )
+    except httpx.TimeoutException:
+        return _build_on_demand_unavailable_payload(
+            request,
+            market_context=market_context,
+            macro_context=macro_context,
+            time_day_gate=time_day_gate,
+            reason="Broker auth request timed out. Candidate engine unavailable for this run.",
+            error_type="broker_auth_timeout",
+            status_code=503,
+        )
+    except HTTPException as exc:
+        return _build_on_demand_unavailable_payload(
+            request,
+            market_context=market_context,
+            macro_context=macro_context,
+            time_day_gate=time_day_gate,
+            reason=_coerce_error_reason(getattr(exc, "detail", None) or str(exc)),
+            error_type="candidate_engine_http_error",
+            status_code=getattr(exc, "status_code", 503),
+        )
+    except httpx.HTTPError as exc:
+        return _build_on_demand_unavailable_payload(
+            request,
+            market_context=market_context,
+            macro_context=macro_context,
+            time_day_gate=time_day_gate,
+            reason=f"Broker request failed: {exc.__class__.__name__}",
+            error_type="candidate_engine_http_error",
+            status_code=503,
+        )
+    summary_payload = _normalize_engine_summary_for_session(
+        summary_payload=summary_payload,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+    )
+
+    screened_candidates = list(
+        await asyncio.gather(
+            *[
+                _screen_ticker_candidate(
+                    summary=summary,
+                    option_type=clean_option_type,
+                    token=token,
+                    request=request,
+                    market_context=market_context,
+                    macro_context=macro_context,
+                    time_day_gate=time_day_gate,
+                    include_chart_checks=request.include_chart_checks,
+                )
+                for summary in summary_payload.get("ticker_summaries", [])
+            ]
+        )
+    )
+
+    screened_candidates = sorted(screened_candidates, key=_screened_sort_key)
+    freeze_to_raw_engine = _should_freeze_winner_to_raw_engine(
+        summary_payload=summary_payload,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+    )
+    selected = _select_screened_best_candidate(
+        screened_candidates,
+        raw_engine_best_ticker=summary_payload.get("best_ticker"),
+        freeze_to_raw_engine=freeze_to_raw_engine,
+    )
+
+    best_ticker = selected.get("symbol") if selected else summary_payload.get("best_ticker")
+    raw_engine_status = summary_payload.get("verdict", "NO_TRADE")
+    final_verdict = selected.get("final_verdict", "NO_TRADE") if selected else "NO_TRADE"
+    engine_status = _normalize_top_level_status(final_verdict)
+    primary_candidate = selected.get("primary_candidate") if selected else summary_payload.get("primary_candidate")
+    chart_check = selected.get("chart_check") if selected else None
+    chart_check_error = selected.get("chart_check_error") if selected else None
+    structure_context = selected.get("structure_context") if selected else {"ok": False, "why": "no screened candidates"}
+    liquidity_context = selected.get("liquidity_context") if selected else _build_liquidity_block(primary_candidate)
+    iv_context = selected.get("iv_context") if selected else _build_iv_context(primary_candidate)
+    structure_context["iv_state"] = iv_context.get("status")
+    wall_thesis_fit_context = selected.get("wall_thesis_fit") if selected else _build_wall_thesis_fit_context(
+        option_type=clean_option_type,
+        structure_context=structure_context,
+        primary_candidate=primary_candidate,
+    )
+    trigger_state = selected.get("trigger_state") if selected else _build_trigger_state(
+        option_type=clean_option_type,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+        chart_check=chart_check,
+    )
+    checklist_block = selected.get("checklist") if selected else _build_checklist_block(
+        request=request,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+        chart_check=chart_check,
+        primary_candidate=primary_candidate,
+        liquidity_context=liquidity_context,
+        trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit_context,
+    )
+    selected_reason = selected.get("reason", summary_payload.get("reason", "No summary available.")) if selected else summary_payload.get("reason", "No summary available.")
+
+    if request.include_chart_checks:
+        chart_check_block: Dict[str, Any] = chart_check if chart_check else {
+            "ok": False,
+            "symbol": best_ticker,
+            "error": chart_check_error or "Chart check unavailable in this run.",
+        }
+    else:
+        chart_check_block = {
+            "ok": False,
+            "symbol": best_ticker,
+            "status": "skipped",
+            "message": "Chart checks were not requested.",
+        }
+
+    if chart_check_block.get("_all_candles") is not None:
+        chart_check_block = {k: v for k, v in chart_check_block.items() if k != "_all_candles"}
+
+    user_facing_block = _build_user_facing_block(
+        request=request,
+        engine_status=raw_engine_status,
+        final_verdict=final_verdict,
+        best_ticker=best_ticker,
+        chart_check=chart_check,
+        chart_check_error=chart_check_error,
+        engine_reason=selected_reason,
+        market_context=market_context,
+        macro_context=macro_context,
+        structure_context=structure_context,
+        time_day_gate=time_day_gate,
+        liquidity_context=liquidity_context,
+        iv_context=iv_context,
+        trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit_context,
+    )
+    user_facing_block["macro_brief"] = _build_macro_brief(macro_context)
+    two_path_block = _build_two_path_block(
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        structure_context=structure_context,
+        checklist=checklist_block,
+        chart_check=chart_check,
+    )
+    targets_block = _build_targets_block(primary_candidate)
+    python_validation_block = _build_python_validation(
+        request=request,
+        best_ticker=best_ticker,
+        primary_candidate=primary_candidate,
+        targets=targets_block,
+        invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
+    )
+    ten_second_checklist_block = _build_ten_second_checklist(
+        request=request,
+        checklist_block=checklist_block,
+        structure_context=structure_context,
+        iv_context=iv_context,
+    )
+
+    raw_engine_winner_ticker = summary_payload.get("best_ticker")
+    raw_engine_winner_status = summary_payload.get("verdict")
+    normalized_engine_winner_ticker = best_ticker
+    normalized_engine_winner_status = engine_status
+    normalized_engine_winner_final_verdict = final_verdict
+    screened_live_winner_ticker = best_ticker
+    screened_live_winner_final_verdict = final_verdict
+    changed_after_screening = raw_engine_winner_ticker != screened_live_winner_ticker
+    why_changed_after_screening = (
+        selected_reason if changed_after_screening else None
+    )
+    failed_reasons_block = _failed_reason_messages(
+        checklist=checklist_block,
+        time_day_gate=time_day_gate,
+        market_context=market_context,
+        structure_context=structure_context,
+        liquidity_context=liquidity_context,
+        trigger_state=trigger_state,
+        wall_thesis_fit_context=wall_thesis_fit_context,
+    )
+
+    live_map_block = _build_live_map_block(
+        ticker=best_ticker,
+        option_type=clean_option_type,
+        primary_entry_zone=_derive_entry_zones(
+            option_type=clean_option_type,
+            chart_check=chart_check,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+        ).get("primary_entry_zone") if best_ticker and primary_candidate else None,
+        backup_entry_zone=_derive_entry_zones(
+            option_type=clean_option_type,
+            chart_check=chart_check,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+        ).get("backup_entry_zone") if best_ticker and primary_candidate else None,
+        trigger_state=trigger_state,
+        chart_check=chart_check,
+        structure_context=structure_context,
+        invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        macro_context=macro_context,
+        iv_context=iv_context,
+        liquidity_context=liquidity_context,
+        selected_summary=selected.get("summary") if selected else None,
+        primary_candidate=primary_candidate,
+        request=request,
+    )
+    trap_check_context_block = live_map_block.get("trap_check_context") or _build_trap_check_context(structure_context)
+    entry_context_block = _build_entry_context_block(
+        trigger_state=trigger_state,
+        live_map=live_map_block,
+        checklist_block=checklist_block,
+        structure_context=structure_context,
+        user_facing=user_facing_block,
+    )
+    intrabar_signal_context_block = _build_intrabar_signal_context_block(
+        entry_context=entry_context_block,
+        live_map=live_map_block,
+        user_facing=user_facing_block,
+    )
+    approval_context_block = _build_approval_context_block(
+        entry_context=entry_context_block,
+        intrabar_signal_context=intrabar_signal_context_block,
+        checklist_block=checklist_block,
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        user_facing=user_facing_block,
+    )
+    approval_requirements_context_block = _build_approval_requirements_context_block(
+        checklist_block=checklist_block,
+        structure_context=structure_context,
+        trigger_state=trigger_state,
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        macro_context=macro_context,
+        liquidity_context=liquidity_context,
+        approval_context=approval_context_block,
+    )
+    approval_flip_context_block = _build_approval_flip_context_block(
+        approval_requirements_context=approval_requirements_context_block,
+        approval_context=approval_context_block,
+        entry_context=entry_context_block,
+        intrabar_signal_context=intrabar_signal_context_block,
+    )
+    universe_chart_confirmation_block = _build_universe_chart_confirmation_block(
+        request=request,
+        screened_candidates=screened_candidates,
+        include_chart_checks=request.include_chart_checks,
+    )
+    setup_eligibility_context_block = _build_setup_eligibility_context_block(
+        structure_context=structure_context,
+        live_map=live_map_block,
+        checklist_block=checklist_block,
+        approval_requirements_context=approval_requirements_context_block,
+    )
+    setup_check_context_block = _build_setup_check_context_block(
+        structure_context=structure_context,
+        ten_second_checklist_block=ten_second_checklist_block,
+        setup_eligibility_context=setup_eligibility_context_block,
+    )
+    time_gate_check_context_block = _build_time_gate_check_context_block(
+        time_day_gate=time_day_gate,
+        ten_second_checklist_block=ten_second_checklist_block,
+        checklist_block=checklist_block,
+    )
+    screened_best_context_block = _build_screened_best_context(
+        selected=selected,
+        engine_best_ticker=summary_payload.get("best_ticker"),
+        screened_candidates=screened_candidates,
+    )
+    final_reason_context_block = _build_final_reason_context_block(
+        user_facing=user_facing_block,
+        screened_best_context=screened_best_context_block,
+        time_gate_check_context=time_gate_check_context_block,
+        checklist_block=checklist_block,
+    )
+    reason_stack_context_block = _build_reason_stack_context_block(
+        final_reason_context=final_reason_context_block,
+        checklist_block=checklist_block,
+        failed_reasons=failed_reasons_block,
+    )
+    winner_shift_context_block = _build_winner_shift_context_block(
+        raw_engine_winner_ticker=raw_engine_winner_ticker,
+        raw_engine_winner_status=raw_engine_winner_status,
+        normalized_engine_winner_ticker=normalized_engine_winner_ticker,
+        normalized_engine_winner_status=normalized_engine_winner_status,
+        normalized_engine_winner_final_verdict=normalized_engine_winner_final_verdict,
+        screened_live_winner_ticker=screened_live_winner_ticker,
+        screened_live_winner_final_verdict=screened_live_winner_final_verdict,
+        screened_reason=screened_best_context_block.get("screened_reason"),
+    )
+    effective_payload_checklist_block = dict(checklist_block)
+    effective_payload_checklist_block["effective_failed_items"] = _effective_blockers(
+        checklist_block,
+        screened_reason=screened_best_context_block.get("screened_reason"),
+        time_gate_reason=time_day_gate.get("reason"),
+    )
+    effective_payload_checklist_block["effective_decision_blockers_priority"] = list(
+        effective_payload_checklist_block["effective_failed_items"]
+    )
+    effective_payload_checklist_block["global_gate_failures"] = [
+        item
+        for item in effective_payload_checklist_block["effective_failed_items"]
+        if item not in (checklist_block.get("failed_items") or [])
+    ]
+
+    response_payload = {
+        "ok": True,
+        "mode": "on_demand",
+        "build_tag": BUILD_TAG,
+        "session_basis_context": _build_session_basis_context(),
+        "source_of_truth": "candidate_engine",
+        "read_this_first": "simple_output",
+        "engine_status": engine_status,
+        "candidate_engine_status": engine_status,
+        "final_verdict": final_verdict,
+        "best_ticker": best_ticker,
+        "raw_engine_best_ticker": raw_engine_winner_ticker,
+        "engine_best_ticker": normalized_engine_winner_ticker,
+        "winner_context": {
+            "raw_engine_winner_ticker": raw_engine_winner_ticker,
+            "raw_engine_winner_status": raw_engine_winner_status,
+            "normalized_engine_winner_ticker": normalized_engine_winner_ticker,
+            "normalized_engine_winner_status": normalized_engine_winner_status,
+            "normalized_engine_winner_final_verdict": normalized_engine_winner_final_verdict,
+            "screened_live_winner_ticker": screened_live_winner_ticker,
+            "screened_live_winner_final_verdict": screened_live_winner_final_verdict,
+            "changed_after_screening": changed_after_screening,
+            "why_changed_after_screening": why_changed_after_screening,
+        },
+        "engine_context": _build_engine_context_block(
+            summary_payload=summary_payload,
+            selected=selected,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
+            best_ticker=best_ticker,
+        ),
+        "decision_context": _build_decision_context_block(
+            summary_payload=summary_payload,
+            selected=selected,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
+            best_ticker=best_ticker,
+            checklist_block=checklist_block,
+            failed_reasons=failed_reasons_block,
+            user_facing=user_facing_block,
+        ),
+        "blocker_context": _build_blocker_context_block(
+            checklist_block=checklist_block,
+            failed_reasons=failed_reasons_block,
+            trigger_state=trigger_state,
+            structure_context=structure_context,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
+            user_facing=user_facing_block,
+        ),
+        "live_map": live_map_block,
+        "wall_thesis_fit_context": wall_thesis_fit_context,
+        "trap_check_context": trap_check_context_block,
+        "trigger_context": _build_trigger_context_block(
+            trigger_state=trigger_state,
+            live_map=live_map_block,
+        ),
+        "entry_context": entry_context_block,
+        "intrabar_signal_context": intrabar_signal_context_block,
+        "approval_context": approval_context_block,
+        "approval_requirements_context": approval_requirements_context_block,
+        "approval_flip_context": approval_flip_context_block,
+        "setup_eligibility_context": setup_eligibility_context_block,
+        "setup_check_context": setup_check_context_block,
+        "time_gate_check_context": time_gate_check_context_block,
+        "final_reason_context": final_reason_context_block,
+        "reason_stack_context": reason_stack_context_block,
+        "winner_shift_context": winner_shift_context_block,
+        "simple_output": _build_simple_output_block(
+            user_facing=user_facing_block,
+            trigger_state=trigger_state,
+            macro_context=macro_context,
+            failed_reasons=failed_reasons_block,
+            trap_check_context=trap_check_context_block,
+            next_flip_needed=approval_context_block.get("next_flip_needed"),
+            primary_blocker=approval_context_block.get("primary_blocker"),
+            decision_blockers=approval_context_block.get("blockers"),
+        ),
+        "screened_best_context": screened_best_context_block,
+        "market_context": market_context,
+        "macro_context": macro_context,
+        "structure_context": structure_context,
+        "adx_context": _build_adx_filter_context(structure_context),
+        "time_day_gate": time_day_gate,
+        "iv_context": iv_context,
+        "python_validation": python_validation_block,
+        "ten_second_checklist": ten_second_checklist_block,
+        "liquidity_context": liquidity_context,
+        "trigger_state": trigger_state,
+        "targets": targets_block,
+        "invalidation_level_1h_ema50": chart_check.get("ema50_1h") if chart_check else None,
+        "checklist": effective_payload_checklist_block,
+        "failed_reasons": failed_reasons_block,
+        "compact_ticker_summaries": _build_compact_ticker_summaries(
+            screened_candidates,
+            time_day_gate=time_day_gate,
+        ),
+        "other_ticker_candidates": _screened_other_candidates(
+            screened_candidates,
+            best_ticker,
+            request=request,
+        ),
+        "request": request.model_dump(),
+        "candidate_engine": summary_payload,
+        "candidate_engine_normalized": _build_candidate_engine_normalized_block(
+            summary_payload=summary_payload,
+            selected=selected,
+            engine_status=engine_status,
+            final_verdict=final_verdict,
+            best_ticker=best_ticker,
+        ),
+        "chart_check": chart_check_block,
+        "chart_confirmation": _build_chart_confirmation_block(
+            request=request,
+            chart_check=chart_check,
+            chart_check_error=chart_check_error,
+            structure_context=structure_context,
+        ),
+        "universe_chart_confirmation": universe_chart_confirmation_block,
+        "user_facing": user_facing_block,
+        "candidate_context": _build_candidate_context(
+            best_ticker=best_ticker,
+            option_type=clean_option_type,
+            selected_summary=selected.get("summary") if selected else None,
+            primary_candidate=primary_candidate,
+            backup_candidate=selected.get("backup_candidate") if selected else summary_payload.get("backup_candidate"),
+            chart_check=chart_check,
+            structure_context=structure_context,
+            trigger_state=trigger_state,
+            checklist=checklist_block,
+            user_facing=user_facing_block,
+            targets=targets_block,
+            invalidation_level_1h_ema50=chart_check.get("ema50_1h") if chart_check else None,
+            two_path=two_path_block,
+            market_context=market_context,
+            time_day_gate=time_day_gate,
+            macro_context=macro_context,
+            iv_context=iv_context,
+            liquidity_context=liquidity_context,
+            request=request,
+        ),
+        "two_path": two_path_block,
+    }
+    response_payload["state_contract"] = _build_on_demand_state_contract(
+        final_verdict=final_verdict,
+        best_ticker=best_ticker,
+        user_facing=user_facing_block,
+        simple_output=response_payload.get("simple_output") or {},
+        decision_context=response_payload.get("decision_context") or {},
+        trigger_context=response_payload.get("trigger_context") or {},
+        approval_context=response_payload.get("approval_context") or {},
+        market_context=market_context,
+        time_day_gate=time_day_gate,
+        iv_context=iv_context,
+    )
+    response_payload["transition_contract"] = _build_transition_contract(
+        None,
+        response_payload,
+        {
+            "transition_type": "ON_DEMAND_EVALUATION",
+            "meaningful_transition": False,
+            "should_alert_candidate": False,
+            "summary": "On-demand evaluation snapshot created.",
+            "primary_event": None,
+            "changed_fields": {},
+        },
+    )
+    response_payload["alert_contract"] = _build_alert_contract(mode="on_demand")
+    response_payload["contracts"] = _build_contracts_bundle(
+        state_contract=response_payload.get("state_contract"),
+        transition_contract=response_payload.get("transition_contract"),
+        alert_contract=response_payload.get("alert_contract"),
+    )
+    response_payload["response_contract_marker"] = "safe_fast_state_contract_surface_v2"
+    response_payload["trader_chat_payload"] = _build_trader_chat_payload(
+        mode="on_demand",
+        summary=response_payload.get("simple_output") or {},
+        state_contract=response_payload.get("state_contract") or {},
+        targets=response_payload.get("targets") or {},
+    )
+    return response_payload
+
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {"status": "ok", "service": "safe-fast-backend"}
+
+
+@app.get("/health")
+def health() -> Dict[str, bool]:
+    return {"ok": True}
+
+
+@app.get("/tt/safe-fast-summary-compact", include_in_schema=False)
+async def tt_safe_fast_summary_compact(
+    option_type: str = Query("C"),
+    min_dte: int = Query(14),
+    max_dte: int = Query(30),
+    near_limit: int = Query(16),
+    width_min: float = Query(5.0),
+    width_max: float = Query(10.0),
+    risk_min_dollars: float = Query(250.0),
+    risk_max_dollars: float = Query(300.0),
+    hard_max_dollars: float = Query(400.0),
+    allow_fallback: bool = Query(True),
+) -> Any:
+    token = await get_access_token()
+    return await _build_summary_compact_payload(
+        option_type=option_type,
+        min_dte=min_dte,
+        max_dte=max_dte,
+        near_limit=near_limit,
+        width_min=width_min,
+        width_max=width_max,
+        risk_min_dollars=risk_min_dollars,
+        risk_max_dollars=risk_max_dollars,
+        hard_max_dollars=hard_max_dollars,
+        allow_fallback=allow_fallback,
+        token=token,
+    )
+
+
+@app.get("/tt/safe-fast-chart-check", include_in_schema=False)
+async def tt_safe_fast_chart_check(symbol: str = Query("SPY")) -> Any:
+    clean_symbol = _clean_symbol(symbol)
+    token = await get_access_token()
+    try:
+        return await _build_chart_check_payload(clean_symbol, token)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+
+class ContinuousShadowRequest(OnDemandRequest):
+    profile_name: str = "default"
+    persist_state: bool = True
+    replay_timestamp_et: Optional[str] = None
+    replay_label: Optional[str] = None
+
+
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
+def _sanitize_continuous_profile_name(profile_name: Optional[str]) -> str:
+    raw_name = (profile_name or "default").strip()
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_name).strip("._-")
+    return (cleaned or "default")[:64]
+
+
+def _continuous_state_dir() -> Path:
+    explicit_dir = os.getenv("SAFE_FAST_CONTINUOUS_STATE_DIR")
+    if explicit_dir:
+        state_dir = Path(explicit_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir
+
+    persistent_dir = (Path.cwd() / ".safe_fast_continuous").resolve()
+    legacy_dir = Path("/tmp/safe_fast_continuous")
+
+    if not persistent_dir.exists() and legacy_dir.exists():
+        try:
+            persistent_dir.mkdir(parents=True, exist_ok=True)
+            for legacy_file in legacy_dir.glob("*.json"):
+                target_file = persistent_dir / legacy_file.name
+                if not target_file.exists():
+                    target_file.write_text(legacy_file.read_text())
+        except Exception:
+            legacy_dir.mkdir(parents=True, exist_ok=True)
+            return legacy_dir
+
+    persistent_dir.mkdir(parents=True, exist_ok=True)
+    return persistent_dir
+
+
+def _continuous_shadow_to_on_demand_request(request: ContinuousShadowRequest) -> OnDemandRequest:
+    payload = _model_dump(request)
+    payload.pop("profile_name", None)
+    payload.pop("persist_state", None)
+    payload.pop("replay_timestamp_et", None)
+    payload.pop("replay_label", None)
+    return OnDemandRequest(**payload)
+
+
+def _continuous_profile_identity_payload(request: OnDemandRequest) -> Dict[str, Any]:
+    request_payload = _model_dump(request)
+    stable_payload = dict(request_payload)
+    stable_payload.pop("open_positions", None)
+    stable_payload.pop("weekly_trade_count", None)
+    return stable_payload
+
+
+def _continuous_profile_key(profile_name: str, request: OnDemandRequest) -> str:
+    stable_payload = _continuous_profile_identity_payload(request)
+    digest = hashlib.sha1(
+        json.dumps(stable_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{profile_name}__{digest}"
+
+
+def _continuous_state_path(profile_key: str) -> Path:
+    return _continuous_state_dir() / f"{profile_key}.json"
+
+
+def _load_continuous_state(profile_key: str) -> Dict[str, Any]:
+    state_path = _continuous_state_path(profile_key)
+    if not state_path.exists():
+        return {}
+    try:
+        return json.loads(state_path.read_text())
+    except Exception:
+        return {}
+
+
+def _save_continuous_state(profile_key: str, payload: Dict[str, Any]) -> None:
+    state_path = _continuous_state_path(profile_key)
+    temp_path = state_path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    temp_path.replace(state_path)
+
+
+_CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP: Dict[str, str] = {
+    "allowed_setup_type": "BLOCKED_SETUP_TYPE",
+    "twentyfour_hour_supportive": "BLOCKED_24H_CONTEXT",
+    "no_proven_hold": "BLOCKED_PROVEN_HOLD",
+    "one_hour_clean_around_ema": "BLOCKED_1H_STRUCTURE",
+    "clear_room": "BLOCKED_ROOM",
+    "early_enough": "BLOCKED_EXTENSION",
+    "clear_trigger": "BLOCKED_TRIGGER",
+    "liquidity_ok": "BLOCKED_LIQUIDITY",
+    "invalidation_clear": "BLOCKED_INVALIDATION",
+    "fits_risk": "BLOCKED_RISK",
+}
+
+_CONTINUOUS_STRUCTURE_FAILED_REASON_STATE_MAP: Dict[str, str] = {
+    "setup type is not allowed": "BLOCKED_SETUP_TYPE",
+    "24h context is not supportive": "BLOCKED_24H_CONTEXT",
+    "too early: hold is not proven yet.": "BLOCKED_PROVEN_HOLD",
+    "no proven hold": "BLOCKED_PROVEN_HOLD",
+    "1h structure around the 50 ema is not clean": "BLOCKED_1H_STRUCTURE",
+    "room to the first wall fails": "BLOCKED_ROOM",
+    "entry is too late or overextended for safe-fast": "BLOCKED_EXTENSION",
+    "no valid live trigger is present": "BLOCKED_TRIGGER",
+    "options liquidity is too wide for a clean debit spread entry": "BLOCKED_LIQUIDITY",
+    "invalidation is not clear": "BLOCKED_INVALIDATION",
+    "risk does not fit the safe-fast budget": "BLOCKED_RISK",
+}
+
+_CONTINUOUS_STATE_FAMILY_MAP: Dict[str, str] = {
+    "STALE_OR_UNCONFIRMED": "SYSTEM",
+    "EXIT_NOW": "EXIT",
+    "TRADE_READY": "SIGNAL",
+    "APPROVAL_READY": "SIGNAL",
+    "PENDING_COMPLETED_CANDLE_APPROVAL": "SIGNAL",
+    "PENDING_TRIGGER_CONFIRMATION": "SIGNAL",
+    "PENDING_THROUGH_WALL": "SIGNAL",
+    "BLOCKED_OPEN_POSITION": "ACCOUNT",
+    "BLOCKED_WEEKLY_CAP": "ACCOUNT",
+    "BLOCKED_IV_HIGH": "IV",
+    "WAIT_MARKET_OPEN": "TIME",
+    "BLOCKED_TIME_GATE": "TIME",
+    "BLOCKED_SETUP_TYPE": "STRUCTURE",
+    "BLOCKED_24H_CONTEXT": "STRUCTURE",
+    "BLOCKED_PROVEN_HOLD": "STRUCTURE",
+    "BLOCKED_1H_STRUCTURE": "STRUCTURE",
+    "BLOCKED_ROOM": "STRUCTURE",
+    "BLOCKED_EXTENSION": "STRUCTURE",
+    "BLOCKED_TRIGGER": "STRUCTURE",
+    "BLOCKED_LIQUIDITY": "STRUCTURE",
+    "BLOCKED_INVALIDATION": "STRUCTURE",
+    "BLOCKED_RISK": "STRUCTURE",
+    "NO_CANDIDATE": "CANDIDATE",
+    "BLOCKED_STRUCTURAL": "STRUCTURE",
+}
+
+
+def _continuous_time_gate_is_blocking(
+    time_gate_reason: Optional[str],
+    market_open: Any,
+    fresh_entry_allowed: Any,
+) -> bool:
+    reason = str(time_gate_reason or "").strip().lower()
+    if not reason:
+        return False
+
+    nonblocking_reasons = {
+        "market_open_no_hard_time_cutoff",
+        "within_time_window",
+    }
+    if reason in nonblocking_reasons:
+        return False
+
+    if reason == "market_closed":
+        return bool(market_open is False or fresh_entry_allowed is False)
+
+    return bool(fresh_entry_allowed is False or market_open is False)
+
+
+def _ordered_unique_strings(values: List[Any]) -> List[str]:
+    ordered: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ordered
+
+
+def _derive_continuous_structure_state(snapshot: Dict[str, Any]) -> Optional[str]:
+    primary_blocker = snapshot.get("primary_blocker")
+    decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
+    failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
+
+    blocker_priority: List[str] = []
+    if isinstance(primary_blocker, str) and primary_blocker.strip():
+        blocker_priority.append(primary_blocker.strip())
+    blocker_priority.extend(
+        blocker
+        for blocker in decision_blockers
+        if blocker not in blocker_priority
+    )
+
+    for blocker in blocker_priority:
+        mapped_state = _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP.get(blocker)
+        if mapped_state:
+            return mapped_state
+
+    for failed_reason in failed_reasons:
+        mapped_state = _CONTINUOUS_STRUCTURE_FAILED_REASON_STATE_MAP.get(
+            failed_reason.lower()
+        )
+        if mapped_state:
+            return mapped_state
+
+    return None
+
+
+def _continuous_state_family(state: Optional[str]) -> str:
+    if not state:
+        return "UNKNOWN"
+    return _CONTINUOUS_STATE_FAMILY_MAP.get(str(state), "UNKNOWN")
+
+
+def _derive_continuous_state_source(
+    snapshot: Dict[str, Any],
+    current_state: Optional[str],
+    latent_structure_state: Optional[str],
+) -> str:
+    if current_state in {"BLOCKED_OPEN_POSITION", "BLOCKED_WEEKLY_CAP"}:
+        return "account_gate"
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"}:
+        return "time_gate"
+    if current_state == "BLOCKED_IV_HIGH":
+        return "iv_gate"
+    if current_state == "TRADE_READY":
+        return "final_verdict"
+    if current_state in {"APPROVAL_READY", "PENDING_COMPLETED_CANDLE_APPROVAL", "PENDING_TRIGGER_CONFIRMATION"}:
+        return "signal_state"
+    if current_state == "PENDING_THROUGH_WALL":
+        return "thesis_gate"
+    if current_state == "EXIT_NOW":
+        return "exit_state"
+    if current_state == "NO_CANDIDATE":
+        return "candidate_engine"
+    if current_state == latent_structure_state and current_state is not None:
+        decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
+        primary_blocker = snapshot.get("primary_blocker")
+        if isinstance(primary_blocker, str) and primary_blocker in _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP:
+            return "primary_blocker"
+        for blocker in decision_blockers:
+            if blocker in _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP:
+                return "decision_blocker"
+        return "failed_reason"
+    if current_state == "BLOCKED_STRUCTURAL":
+        return "structural_fallback"
+    return "system"
+
+
+def _derive_continuous_state_reason(
+    snapshot: Dict[str, Any],
+    current_state: Optional[str],
+    latent_structure_state: Optional[str],
+) -> Optional[str]:
+    if current_state in {"BLOCKED_OPEN_POSITION", "BLOCKED_WEEKLY_CAP"}:
+        return snapshot.get("primary_blocker") or snapshot.get("next_flip_needed")
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"}:
+        return snapshot.get("time_gate_reason") or (snapshot.get("time_day_gate") or {}).get("reason")
+    if current_state == "BLOCKED_IV_HIGH":
+        return snapshot.get("iv_status")
+    if current_state == "EXIT_NOW":
+        return "exit_now"
+    if current_state == "TRADE_READY":
+        approval_status = snapshot.get("approval_status")
+        if approval_status:
+            return str(approval_status).lower()
+        return str(snapshot.get("final_verdict") or "trade").lower()
+    if current_state in {"APPROVAL_READY", "PENDING_COMPLETED_CANDLE_APPROVAL", "PENDING_TRIGGER_CONFIRMATION"}:
+        return current_state.lower()
+    if current_state == "PENDING_THROUGH_WALL":
+        return "through_the_wall_next_pocket_not_clear"
+    if current_state == "NO_CANDIDATE":
+        return snapshot.get("primary_blocker") or "no_candidate_available"
+    if current_state == latent_structure_state and current_state is not None:
+        primary_blocker = snapshot.get("primary_blocker")
+        if isinstance(primary_blocker, str) and primary_blocker in _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP:
+            return primary_blocker
+        for blocker in _ordered_unique_strings(snapshot.get("decision_blockers") or []):
+            if blocker in _CONTINUOUS_STRUCTURE_BLOCKER_STATE_MAP:
+                return blocker
+        for failed_reason in _ordered_unique_strings(snapshot.get("failed_reasons") or []):
+            if failed_reason.lower() in _CONTINUOUS_STRUCTURE_FAILED_REASON_STATE_MAP:
+                return failed_reason
+    if current_state == "BLOCKED_STRUCTURAL":
+        return snapshot.get("primary_blocker")
+    return None
+
+
+def _build_state_contract_from_snapshot(snapshot: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
+    current_state = snapshot.get("current_state")
+    latent_structure_state = snapshot.get("latent_structure_state")
+    state_family = snapshot.get("state_family") or _continuous_state_family(current_state)
+    state_source = snapshot.get("state_source") or _derive_continuous_state_source(
+        snapshot,
+        current_state,
+        latent_structure_state,
+    )
+    state_reason = snapshot.get("state_reason") or _derive_continuous_state_reason(
+        snapshot,
+        current_state,
+        latent_structure_state,
+    )
+    summary = snapshot.get("summary") or {}
+    contracts = snapshot.get("contracts") if isinstance(snapshot.get("contracts"), dict) else {}
+    state_contract = (
+        contracts.get("state")
+        if isinstance(contracts.get("state"), dict)
+        else snapshot.get("state_contract")
+    ) or {}
+    decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
+    human_decision_blockers = [
+        _humanize_blocker_key(blocker) if blocker else blocker
+        for blocker in decision_blockers
+    ]
+    trigger_reason = _bundle_first_value(state_contract, snapshot, "trigger_reason")
+    human_trigger_reason = _humanize_trigger_reason_key(trigger_reason) if trigger_reason else None
+    human_state_reason = _humanize_state_reason_key(state_reason) if state_reason else None
+    return {
+        "contract_version": "safe_fast_state_v1",
+        "contract_marker": "safe_fast_state_contract_surface_v2",
+        "mode": mode,
+        "ticker": summary.get("ticker") or snapshot.get("best_ticker"),
+        "good_idea_now": summary.get("good_idea_now"),
+        "action": summary.get("action"),
+        "setup_state": summary.get("setup_state") or state_contract.get("setup_state"),
+        "final_verdict": snapshot.get("final_verdict"),
+        "current_state": current_state,
+        "state_family": state_family,
+        "state_source": state_source,
+        "state_reason": state_reason,
+        "state_reason_human": human_state_reason or state_reason,
+        "state_reason_key": state_reason if human_state_reason and human_state_reason != state_reason else None,
+        "primary_blocker": snapshot.get("primary_blocker"),
+        "decision_blockers": decision_blockers,
+        "decision_blockers_human": human_decision_blockers,
+        "decision_blocker_keys": decision_blockers if human_decision_blockers != decision_blockers else None,
+        "failed_reasons": _ordered_unique_strings(snapshot.get("failed_reasons") or []),
+        "next_flip_needed": snapshot.get("next_flip_needed"),
+        "trigger_present": _bundle_first_value(state_contract, snapshot, "trigger_present"),
+        "trigger_reason": trigger_reason,
+        "trigger_reason_human": human_trigger_reason or trigger_reason,
+        "trigger_reason_key": trigger_reason if human_trigger_reason and human_trigger_reason != trigger_reason else None,
+        "structure_ready": _bundle_first_value(state_contract, snapshot, "structure_ready"),
+        "approval_ready_now": snapshot.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": snapshot.get("approval_ready_on_completed_candle"),
+        "approval_status": snapshot.get("approval_status"),
+        "breakout_hold_pending": snapshot.get("breakout_hold_pending"),
+        "thesis_gate_pending": snapshot.get("thesis_gate_pending"),
+        "market_open": snapshot.get("market_open"),
+        "fresh_entry_allowed": snapshot.get("fresh_entry_allowed"),
+        "time_gate_reason": snapshot.get("time_gate_reason"),
+        "invalidation_hit": snapshot.get("invalidation_hit"),
+        "invalidation": snapshot.get("invalidation"),
+    }
+
+
+def _build_on_demand_state_contract(
+    *,
+    final_verdict: Any,
+    best_ticker: Any,
+    user_facing: Dict[str, Any],
+    simple_output: Dict[str, Any],
+    decision_context: Dict[str, Any],
+    trigger_context: Dict[str, Any],
+    approval_context: Dict[str, Any],
+    market_context: Dict[str, Any],
+    time_day_gate: Dict[str, Any],
+    iv_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {
+        "on_demand_ok": True,
+        "best_ticker": best_ticker,
+        "final_verdict": final_verdict,
+        "primary_blocker": decision_context.get("primary_blocker"),
+        "decision_blockers": _ordered_unique_strings(decision_context.get("blockers") or []),
+        "failed_reasons": _ordered_unique_strings(decision_context.get("failed_reasons") or []),
+        "next_flip_needed": approval_context.get("next_flip_needed"),
+        "trigger_present": trigger_context.get("trigger_present"),
+        "trigger_reason": trigger_context.get("trigger_reason"),
+        "structure_ready": trigger_context.get("structure_ready"),
+        "approval_ready_now": approval_context.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
+        "approval_status": approval_context.get("approval_status"),
+        "breakout_hold_pending": bool(
+            str(trigger_context.get("why") or "").strip().lower() == "breakout_hold_not_confirmed"
+        ),
+        "thesis_gate_pending": bool(
+            str(approval_context.get("next_flip_needed") or "").strip().lower() == "through_the_wall_next_pocket_not_clear"
+        ),
+        "iv_status": iv_context.get("status"),
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "time_gate_reason": time_day_gate.get("reason"),
+        "summary": {
+            "ticker": simple_output.get("ticker") or user_facing.get("ticker"),
+            "action": simple_output.get("action") or user_facing.get("action"),
+            "setup_state": simple_output.get("setup_state") or user_facing.get("setup_state"),
+            "good_idea_now": simple_output.get("good_idea_now") or user_facing.get("good_idea_now"),
+        },
+        "invalidation": simple_output.get("invalidation") or user_facing.get("invalidation"),
+    }
+    snapshot["latent_structure_state"] = _derive_continuous_structure_state(snapshot)
+    snapshot["current_state"] = _derive_continuous_state_from_snapshot(snapshot)
+    snapshot["state_family"] = _continuous_state_family(snapshot.get("current_state"))
+    snapshot["state_source"] = _derive_continuous_state_source(
+        snapshot,
+        snapshot.get("current_state"),
+        snapshot.get("latent_structure_state"),
+    )
+    snapshot["state_reason"] = _derive_continuous_state_reason(
+        snapshot,
+        snapshot.get("current_state"),
+        snapshot.get("latent_structure_state"),
+    )
+    snapshot["invalidation_hit"] = snapshot.get("current_state") == "EXIT_NOW"
+    return _build_state_contract_from_snapshot(snapshot, mode="on_demand")
+
+
+
+def _derive_continuous_state_from_snapshot(snapshot: Dict[str, Any]) -> str:
+    if not snapshot.get("on_demand_ok", False):
+        return "STALE_OR_UNCONFIRMED"
+
+    primary_blocker = snapshot.get("primary_blocker")
+    next_flip_needed = snapshot.get("next_flip_needed")
+    decision_blockers = _ordered_unique_strings(snapshot.get("decision_blockers") or [])
+    failed_reasons = _ordered_unique_strings(snapshot.get("failed_reasons") or [])
+    summary = snapshot.get("summary") or {}
+    iv_status = snapshot.get("iv_status")
+    market_open = snapshot.get("market_open")
+    fresh_entry_allowed = snapshot.get("fresh_entry_allowed")
+    time_gate_reason = snapshot.get("time_gate_reason")
+    final_verdict = str(snapshot.get("final_verdict") or "").upper()
+    breakout_hold_pending = bool(snapshot.get("breakout_hold_pending"))
+    thesis_gate_pending = bool(snapshot.get("thesis_gate_pending"))
+
+    if primary_blocker == "open_trade_already" or next_flip_needed == "open_trade_already":
+        return "BLOCKED_OPEN_POSITION"
+    if primary_blocker == "weekly_trade_cap_reached" or next_flip_needed == "weekly_trade_cap_reached":
+        return "BLOCKED_WEEKLY_CAP"
+
+    if summary.get("setup_state") == "INVALIDATED" or str(summary.get("action", "")).lower() == "exit now":
+        return "EXIT_NOW"
+
+    if breakout_hold_pending:
+        return "PENDING_BREAKOUT_HOLD"
+
+    if thesis_gate_pending:
+        return "PENDING_THROUGH_WALL"
+
+    if final_verdict == "TRADE":
+        return "TRADE_READY"
+
+    if iv_status == "high":
+        return "BLOCKED_IV_HIGH"
+
+    structure_state = _derive_continuous_structure_state(snapshot)
+    if _continuous_time_gate_is_blocking(time_gate_reason, market_open, fresh_entry_allowed):
+        if str(time_gate_reason or "").strip().lower() == "market_closed":
+            if structure_state:
+                return structure_state
+            return "WAIT_MARKET_OPEN"
+        return "BLOCKED_TIME_GATE"
+
+    if final_verdict == "PENDING":
+        if snapshot.get("approval_ready_on_completed_candle"):
+            return "PENDING_COMPLETED_CANDLE_APPROVAL"
+        if snapshot.get("approval_ready_now") or snapshot.get("trigger_present"):
+            return "PENDING_TRIGGER_CONFIRMATION"
+        return "PENDING_TRIGGER_CONFIRMATION"
+
+    if structure_state:
+        return structure_state
+
+    if primary_blocker == "no_candidate_available":
+        return "NO_CANDIDATE"
+    if summary.get("ticker") == "UNKNOWN" and not primary_blocker and not decision_blockers and not failed_reasons:
+        return "NO_CANDIDATE"
+
+    if primary_blocker:
+        return "BLOCKED_STRUCTURAL"
+    return "STALE_OR_UNCONFIRMED"
+
+def _build_market_closed_tester_block(on_demand_payload: Dict[str, Any]) -> Dict[str, Any]:
+    market_context = on_demand_payload.get("market_context") or {}
+    time_day_gate = on_demand_payload.get("time_day_gate") or {}
+    approval_context = on_demand_payload.get("approval_context") or {}
+    approval_requirements_context = on_demand_payload.get("approval_requirements_context") or {}
+    decision_context = on_demand_payload.get("decision_context") or {}
+    trigger_context = on_demand_payload.get("trigger_context") or {}
+    structure_context = on_demand_payload.get("structure_context") or {}
+    final_verdict = str(on_demand_payload.get("final_verdict") or "unconfirmed").upper()
+
+    market_closed_context_only = bool(
+        market_context.get("is_open") is False
+        or time_day_gate.get("reason") == "market_closed"
+    )
+
+    structural_blockers = _ordered_unique_strings(
+        approval_requirements_context.get("raw_checklist_failed_items")
+        or decision_context.get("blockers")
+        or []
+    )
+    structural_blockers = [item for item in structural_blockers if item != "time_day_gate"]
+    structural_primary_blocker = structural_blockers[0] if structural_blockers else None
+
+    intrabar_raw_signal_detected = bool(approval_context.get("intrabar_raw_signal_detected") is True)
+    completed_raw_signal_detected = bool(approval_context.get("completed_raw_signal_detected") is True)
+    raw_signal_present_if_open = intrabar_raw_signal_detected or completed_raw_signal_detected
+
+    if structural_blockers:
+        underlying_structural_verdict = "NO_TRADE"
+        would_be_trade_if_open = False
+        testing_takeaway = (
+            "After-hours tester says structure still fails even if the market were open."
+        )
+    elif raw_signal_present_if_open or final_verdict == "TRADE":
+        underlying_structural_verdict = "TRADE"
+        would_be_trade_if_open = True
+        testing_takeaway = (
+            "After-hours tester says this would qualify as a live SAFE-FAST trade if the market were open."
+        )
+    else:
+        underlying_structural_verdict = "PENDING"
+        would_be_trade_if_open = False
+        testing_takeaway = (
+            "After-hours tester says structure is not failing on non-time gates, but no approved live trigger is present yet."
+        )
+
+    return {
+        "ok": True,
+        "market_closed_context_only": market_closed_context_only,
+        "underlying_structural_verdict": underlying_structural_verdict,
+        "underlying_structural_primary_blocker": structural_primary_blocker,
+        "underlying_structural_blockers": structural_blockers,
+        "would_be_trade_if_open": would_be_trade_if_open,
+        "raw_signal_present_if_open": raw_signal_present_if_open,
+        "intrabar_raw_signal_detected": intrabar_raw_signal_detected,
+        "completed_raw_signal_detected": completed_raw_signal_detected,
+        "setup_type": structure_context.get("setup_type"),
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "trigger_present_live": trigger_context.get("trigger_present"),
+        "trigger_reason_live": trigger_context.get("trigger_reason"),
+        "testing_takeaway": testing_takeaway,
+    }
+
+
+def _build_continuous_snapshot(
+    *,
+    on_demand_payload: Dict[str, Any],
+    request: OnDemandRequest,
+    profile_name: str,
+    profile_key: str,
+    shadow_request: Optional[ContinuousShadowRequest] = None,
+) -> Dict[str, Any]:
+    request_payload = _model_dump(request)
+    simple_output = on_demand_payload.get("simple_output") or {}
+    user_facing = on_demand_payload.get("user_facing") or {}
+    decision_context = on_demand_payload.get("decision_context") or {}
+    approval_context = on_demand_payload.get("approval_context") or {}
+    approval_requirements_context = on_demand_payload.get("approval_requirements_context") or {}
+    trigger_context = on_demand_payload.get("trigger_context") or {}
+    entry_context = on_demand_payload.get("entry_context") or {}
+    trigger_state = on_demand_payload.get("trigger_state") or {}
+    market_context = on_demand_payload.get("market_context") or {}
+    winner_shift_context = on_demand_payload.get("winner_shift_context") or {}
+    iv_context = on_demand_payload.get("iv_context") or {}
+    time_day_gate = on_demand_payload.get("time_day_gate") or {}
+    market_closed_tester = _build_market_closed_tester_block(on_demand_payload)
+    reason_display = simple_output.get("why") or user_facing.get("why")
+    if market_closed_tester.get("market_closed_context_only"):
+        reason_display = _strip_after_hours_prefix(reason_display)
+
+    breakout_hold_pending = bool(
+        str(trigger_state.get("why") or "").strip().lower() == "breakout_hold_not_confirmed"
+        or str(entry_context.get("completed_candle_block_reason") or "").strip().lower() == "breakout_hold_not_confirmed"
+        or str(entry_context.get("mid_candle_block_reason") or "").strip().lower() == "breakout_hold_not_confirmed"
+    )
+
+    shadow_request_profile = {
+        "profile_name": shadow_request.profile_name if shadow_request else profile_name,
+        "persist_state": shadow_request.persist_state if shadow_request else None,
+        "replay_timestamp_et": shadow_request.replay_timestamp_et if shadow_request else None,
+        "replay_label": shadow_request.replay_label if shadow_request else None,
+    }
+
+    snapshot: Dict[str, Any] = {
+        "timestamp_et": market_context.get("as_of_et") or datetime.now(NY_TZ).isoformat(),
+        "profile_name": profile_name,
+        "profile_key": profile_key,
+        "base_profile_key": profile_key.replace("__replay", "") if isinstance(profile_key, str) else profile_key,
+        "replay_profile_active": bool(shadow_request_profile.get("replay_timestamp_et") or shadow_request_profile.get("replay_label")),
+        "request_profile": request_payload,
+        "shadow_request_profile": shadow_request_profile,
+        "build_tag": BUILD_TAG,
+        "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
+        "on_demand_ok": bool(on_demand_payload.get("ok")),
+        "best_ticker": on_demand_payload.get("best_ticker"),
+        "final_verdict": on_demand_payload.get("final_verdict"),
+        "reason_display": reason_display,
+        "primary_blocker": decision_context.get("primary_blocker"),
+        "decision_blockers": decision_context.get("blockers") or [],
+        "failed_reasons": decision_context.get("failed_reasons") or [],
+        "next_flip_needed": approval_context.get("next_flip_needed")
+        or approval_requirements_context.get("next_flip_needed"),
+        "trigger_present": trigger_context.get("trigger_present"),
+        "trigger_reason": trigger_context.get("trigger_reason"),
+        "structure_ready": trigger_context.get("structure_ready"),
+        "approval_ready_now": approval_context.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": approval_context.get("approval_ready_on_completed_candle"),
+        "approval_status": approval_context.get("approval_status"),
+        "breakout_hold_pending": breakout_hold_pending,
+        "breakout_hold_current_confirmed": trigger_state.get("breakout_hold_current_confirmed"),
+        "breakout_hold_completed_confirmed": trigger_state.get("breakout_hold_completed_confirmed"),
+        "breakout_hold_reference_current": trigger_state.get("breakout_hold_reference_current"),
+        "breakout_hold_reference_completed": trigger_state.get("breakout_hold_reference_completed"),
+        "breakout_hold_block_reason": entry_context.get("completed_candle_block_reason")
+        if str(entry_context.get("completed_candle_block_reason") or "").strip().lower() == "breakout_hold_not_confirmed"
+        else (
+            entry_context.get("mid_candle_block_reason")
+            if str(entry_context.get("mid_candle_block_reason") or "").strip().lower() == "breakout_hold_not_confirmed"
+            else None
+        ),
+        "effective_wall_thesis": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("effective_wall_thesis"),
+        "breakout_path_required": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("breakout_path_required"),
+        "current_price_beyond_first_wall": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("current_price_beyond_first_wall"),
+        "next_pocket": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket"),
+        "next_pocket_room_ratio": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket_room_ratio"),
+        "thesis_gate_pending": bool(
+            (((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("effective_wall_thesis") == "THROUGH_THE_WALL")
+            and (
+                (((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("wall_thesis_fit_status") != "pass")
+                or (((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket") is None)
+                or (
+                    (((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket_room_ratio") is None)
+                    or float(((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("next_pocket_room_ratio") or 0) < 1.5
+                )
+            )
+        ),
+        "final_verdict": on_demand_payload.get("final_verdict"),
+        "global_gate_failures": _ordered_unique_strings((on_demand_payload.get("checklist") or {}).get("global_gate_failures") or (approval_requirements_context.get("global_gate_failures") or [])),
+        "wall_thesis_fit_status": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("wall_thesis_fit_status"),
+        "wall_thesis_fit_reason": ((on_demand_payload.get("live_map") or {}).get("wall_thesis_fit") or {}).get("why_wall_thesis_fit_passes_or_fails"),
+        "open_positions": request_payload.get("open_positions"),
+        "weekly_trade_count": request_payload.get("weekly_trade_count"),
+        "invalidation": simple_output.get("invalidation"),
+        "invalidation_level_1h_ema50": on_demand_payload.get("invalidation_level_1h_ema50"),
+        "macro_brief": ((on_demand_payload.get("simple_output") or {}).get("macro_brief")),
+        "targets": on_demand_payload.get("targets") or {},
+        "winner_shift_context": winner_shift_context,
+        "iv_context": iv_context,
+        "iv_status": iv_context.get("status"),
+        "market_context": market_context,
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "time_gate_reason": time_day_gate.get("reason"),
+        "time_day_gate": time_day_gate,
+        "setup_type": market_closed_tester.get("setup_type"),
+        "summary": {
+    "ticker": simple_output.get("ticker"),
+    "action": simple_output.get("action"),
+    "setup_state": simple_output.get("setup_state"),
+    "good_idea_now": simple_output.get("good_idea_now"),
+},
+        "market_closed_tester": market_closed_tester,
+        "trap_check_context": on_demand_payload.get("trap_check_context") or {},
+        "replay_test_context": {},
+        "compact_ticker_summaries": on_demand_payload.get("compact_ticker_summaries") or [],
+    }
+    snapshot["latent_structure_state"] = _derive_continuous_structure_state(snapshot)
+    snapshot["current_state"] = _derive_continuous_state_from_snapshot(snapshot)
+    snapshot["state_family"] = _continuous_state_family(snapshot.get("current_state"))
+    snapshot["state_source"] = _derive_continuous_state_source(
+        snapshot,
+        snapshot.get("current_state"),
+        snapshot.get("latent_structure_state"),
+    )
+    snapshot["state_reason"] = _derive_continuous_state_reason(
+        snapshot,
+        snapshot.get("current_state"),
+        snapshot.get("latent_structure_state"),
+    )
+    snapshot["invalidation_hit"] = snapshot.get("current_state") == "EXIT_NOW"
+    replay_test_context = _build_replay_test_context(snapshot, shadow_request)
+    snapshot["replay_test_context"] = replay_test_context
+    snapshot["replay_test_enabled"] = replay_test_context.get("enabled")
+    snapshot["replay_status"] = replay_test_context.get("status")
+    snapshot["replay_trade_allowed"] = replay_test_context.get("replay_trade_allowed")
+    snapshot["replay_timestamp_et"] = replay_test_context.get("resolved_replay_timestamp_et")
+    snapshot["replay_market_open"] = replay_test_context.get("replay_market_open")
+    snapshot["replay_fresh_entry_allowed"] = replay_test_context.get("replay_fresh_entry_allowed")
+    snapshot["state_contract"] = _build_state_contract_from_snapshot(snapshot, mode="continuous")
+    snapshot["contracts"] = _build_contracts_bundle(
+        state_contract=snapshot.get("state_contract"),
+    )
+    snapshot["response_contract_marker"] = "safe_fast_state_contract_surface_v2"
+    snapshot["alert_candidate_context"] = _derive_continuous_alert_candidate_context(snapshot)
+    snapshot["readable_summary"] = _build_continuous_readable_summary(snapshot)
+    return snapshot
+
+
+
+def _derive_continuous_alert_candidate_context(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    state_contract, _, _ = _contract_bundle_views(snapshot)
+    decision_blockers = [
+        str(item)
+        for item in (_bundle_first_value(state_contract, snapshot, "decision_blockers", []) or [])
+    ]
+    global_gate_failures = _ordered_unique_strings(snapshot.get("global_gate_failures") or [])
+    setup_type = snapshot.get("setup_type")
+    setup_allowed = _is_allowed_setup_type_name(setup_type)
+    trigger_present = bool(_bundle_first_value(state_contract, snapshot, "trigger_present", False))
+    approval_ready_now = bool(_bundle_first_value(state_contract, snapshot, "approval_ready_now", False))
+    approval_ready_on_completed_candle = bool(
+        _bundle_first_value(state_contract, snapshot, "approval_ready_on_completed_candle", False)
+    )
+    invalidation_hit = bool(_bundle_first_value(state_contract, snapshot, "invalidation_hit", False))
+    market_open = bool(_bundle_first_value(state_contract, snapshot, "market_open", False))
+    fresh_entry_allowed = bool(_bundle_first_value(state_contract, snapshot, "fresh_entry_allowed", False))
+    next_flip_needed = _bundle_first_value(state_contract, snapshot, "next_flip_needed")
+    final_verdict = str(_bundle_first_value(state_contract, snapshot, "final_verdict", "") or "").upper()
+    breakout_hold_pending = bool(_bundle_first_value(state_contract, snapshot, "breakout_hold_pending", False))
+    thesis_gate_pending = bool(_bundle_first_value(state_contract, snapshot, "thesis_gate_pending", False))
+
+    hard_blockers = {"allowed_setup_type", "clear_room", "early_enough", "one_hour_clean_around_ema"}
+    hard_blockers_active = [item for item in decision_blockers if item in hard_blockers]
+    wall_thesis_blocking = "wall_thesis_fit" in global_gate_failures
+    final_gate_blocking = bool(global_gate_failures)
+
+    if invalidation_hit:
+        alert_stage = "EXIT_NOW"
+        alert_reason = "Invalidation hit."
+        should_alert_candidate = True
+        alert_severity = "high"
+    elif breakout_hold_pending:
+        alert_stage = "PENDING_BREAKOUT_HOLD"
+        alert_reason = "Breakout crossed, but hold above resistance is not confirmed yet."
+        should_alert_candidate = False
+        alert_severity = "info"
+    elif thesis_gate_pending:
+        alert_stage = "PENDING_THROUGH_WALL"
+        alert_reason = "Breakout path requires a clear next pocket beyond the first wall."
+        should_alert_candidate = False
+        alert_severity = "info"
+    elif final_verdict == "TRADE":
+        if approval_ready_on_completed_candle:
+            alert_stage = "TRADE_READY_COMPLETED_CANDLE"
+            alert_reason = "SAFE-FAST trade is ready from completed-candle approval."
+        elif approval_ready_now:
+            alert_stage = "TRADE_READY_INTRABAR"
+            alert_reason = "SAFE-FAST trade is ready intrabar."
+        else:
+            alert_stage = "TRADE_READY"
+            alert_reason = "SAFE-FAST trade is ready."
+        should_alert_candidate = True
+        alert_severity = "high"
+    elif final_verdict == "PENDING":
+        alert_stage = "PENDING_TRIGGER_CONFIRMATION"
+        if next_flip_needed:
+            alert_reason = f"Setup is pending. Next flip needed: {next_flip_needed}."
+        else:
+            alert_reason = "Setup is pending trigger confirmation."
+        should_alert_candidate = True
+        alert_severity = "medium"
+    else:
+        alert_stage = "TRACK_ONLY"
+        if not market_open or not fresh_entry_allowed:
+            alert_reason = "Entry window is closed."
+        elif not setup_allowed:
+            alert_reason = "Setup type is not one of the 3 allowed SAFE-FAST routes."
+        elif wall_thesis_blocking:
+            alert_reason = "Wall-thesis fit is blocking the setup."
+        elif final_gate_blocking:
+            alert_reason = f"Final gate blocker active: {', '.join(global_gate_failures)}."
+        elif hard_blockers_active:
+            alert_reason = f"Hard blockers still active: {', '.join(hard_blockers_active)}."
+        else:
+            alert_reason = "No alert-worthy continuous setup state yet."
+        should_alert_candidate = False
+        alert_severity = "info"
+
+    return {
+        "ok": True,
+        "alert_stage": alert_stage,
+        "alert_reason": alert_reason,
+        "alert_severity": alert_severity,
+        "should_alert_candidate": should_alert_candidate,
+        "setup_allowed": setup_allowed,
+        "hard_blockers_active": hard_blockers_active,
+        "wall_thesis_blocking": wall_thesis_blocking,
+        "final_gate_blocking": final_gate_blocking,
+        "global_gate_failures": global_gate_failures,
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+        "trigger_present": trigger_present,
+        "approval_ready_now": approval_ready_now,
+        "approval_ready_on_completed_candle": approval_ready_on_completed_candle,
+        "next_flip_needed": next_flip_needed,
+        "final_verdict": final_verdict,
+        "breakout_hold_pending": breakout_hold_pending,
+    }
+
+
+
+def _transition_watch_payload(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    snapshot = snapshot or {}
+    contracts = _contracts_bundle_from_payload(snapshot)
+    state_contract = contracts.get("state") or snapshot.get("state_contract") or {}
+    transition_contract = contracts.get("transition") or snapshot.get("transition_contract") or {}
+    transition_current_state = transition_contract.get("current_state") or {}
+    return {
+        "final_verdict": state_contract.get("final_verdict", snapshot.get("final_verdict")),
+        "best_ticker": transition_current_state.get("best_ticker", snapshot.get("best_ticker")),
+        "primary_blocker": state_contract.get("primary_blocker", snapshot.get("primary_blocker")),
+        "next_flip_needed": state_contract.get("next_flip_needed", snapshot.get("next_flip_needed")),
+        "approval_ready_now": state_contract.get("approval_ready_now", snapshot.get("approval_ready_now")),
+        "approval_ready_on_completed_candle": state_contract.get(
+            "approval_ready_on_completed_candle",
+            snapshot.get("approval_ready_on_completed_candle"),
+        ),
+        "breakout_hold_pending": state_contract.get("breakout_hold_pending", snapshot.get("breakout_hold_pending")),
+        "thesis_gate_pending": state_contract.get("thesis_gate_pending", snapshot.get("thesis_gate_pending")),
+        "current_state": state_contract.get("current_state", snapshot.get("current_state")),
+        "global_gate_failures": transition_current_state.get("global_gate_failures", snapshot.get("global_gate_failures")),
+        "invalidation_hit": state_contract.get("invalidation_hit", snapshot.get("invalidation_hit")),
+        "open_positions": transition_current_state.get("open_positions", snapshot.get("open_positions")),
+        "weekly_trade_count": transition_current_state.get("weekly_trade_count", snapshot.get("weekly_trade_count")),
+    }
+
+
+def _build_transition_contract(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+    transition_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "contract_version": "safe_fast_transition_v1",
+        "contract_marker": "safe_fast_transition_contract_surface_v1",
+        "transition_type": transition_summary.get("transition_type"),
+        "meaningful_transition": bool(transition_summary.get("meaningful_transition")),
+        "should_alert_candidate": bool(transition_summary.get("should_alert_candidate")),
+        "summary": transition_summary.get("summary"),
+        "summary_key": transition_summary.get("summary_key"),
+        "primary_event": transition_summary.get("primary_event"),
+        "changed_fields": transition_summary.get("changed_fields") or {},
+        "previous_state": _transition_watch_payload(previous),
+        "current_state": _transition_watch_payload(current),
+    }
+
+
+
+def _build_contracts_bundle(
+    *,
+    state_contract: Optional[Dict[str, Any]] = None,
+    transition_contract: Optional[Dict[str, Any]] = None,
+    alert_contract: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "state": state_contract or {},
+        "transition": transition_contract or {},
+        "alert": alert_contract or {},
+    }
+
+
+def _contracts_bundle_from_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    payload = payload or {}
+    contracts = payload.get("contracts") or {}
+    if isinstance(contracts, dict) and (
+        contracts.get("state") or contracts.get("transition") or contracts.get("alert")
+    ):
+        return {
+            "state": contracts.get("state") or {},
+            "transition": contracts.get("transition") or {},
+            "alert": contracts.get("alert") or {},
+        }
+    return _build_contracts_bundle(
+        state_contract=payload.get("state_contract"),
+        transition_contract=payload.get("transition_contract"),
+        alert_contract=payload.get("alert_contract"),
+    )
+
+
 
 """
 SAFE-FAST pending-next-session carry-forward patch.
@@ -26,11 +10331,6 @@ Apply `apply_pending_next_session_patch(result)` after:
 
 The function mutates and returns the payload dict.
 """
-
-from __future__ import annotations
-
-from copy import deepcopy
-from typing import Any, Dict, Iterable, Optional
 
 
 HARD_TRAP_KEYS = {
@@ -388,10 +10688,1420 @@ def demo() -> None:
         "best_ticker": "QQQ",
         "invalidation_level_1h_ema50": 639.6553,
     }
-    patched = apply_pending_next_session_patch(deepcopy(sample))
+    patched = apply_pending_next_session_patch(copy.deepcopy(sample))
     import json
     print(json.dumps(patched, indent=2))
 
 
-if __name__ == "__main__":
-    demo()
+
+def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = payload or {}
+    payload = apply_pending_next_session_patch(payload)
+    contracts = _contracts_bundle_from_payload(payload)
+    if contracts.get("state") or contracts.get("transition") or contracts.get("alert"):
+        payload["contracts"] = contracts
+        if contracts.get("state") and not payload.get("state_contract"):
+            payload["state_contract"] = contracts.get("state")
+        if contracts.get("transition") and not payload.get("transition_contract"):
+            payload["transition_contract"] = contracts.get("transition")
+        if contracts.get("alert") and not payload.get("alert_contract"):
+            payload["alert_contract"] = contracts.get("alert")
+    return payload
+
+
+def _canonicalize_continuous_snapshot_contracts(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(snapshot, dict) or not snapshot:
+        return snapshot or {}
+
+    normalized = _ensure_contracts_surface(dict(snapshot))
+    state_contract, transition_contract, alert_contract = _contract_bundle_views(normalized)
+    watch = _transition_watch_payload(normalized)
+
+    for field, value in watch.items():
+        if value is not None:
+            normalized[field] = value
+
+    for field in [
+        "ticker",
+        "good_idea_now",
+        "action",
+        "setup_state",
+        "state_family",
+        "state_source",
+        "state_reason",
+        "trigger_present",
+        "trigger_reason",
+        "structure_ready",
+        "approval_status",
+        "market_open",
+        "fresh_entry_allowed",
+        "time_gate_reason",
+        "invalidation",
+    ]:
+        value = state_contract.get(field)
+        if value is not None:
+            normalized[field] = value
+
+    if state_contract:
+        normalized["state_contract"] = state_contract
+    if transition_contract:
+        normalized["transition_contract"] = transition_contract
+    if alert_contract:
+        normalized["alert_contract"] = alert_contract
+
+    normalized["contracts"] = _build_contracts_bundle(
+        state_contract=state_contract or normalized.get("state_contract"),
+        transition_contract=transition_contract or normalized.get("transition_contract"),
+        alert_contract=alert_contract or normalized.get("alert_contract"),
+    )
+    return normalized
+
+
+def _compact_continuous_persistence_snapshot(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = _canonicalize_continuous_snapshot_contracts(snapshot)
+    if not isinstance(normalized, dict) or not normalized:
+        return {}
+
+    state_contract, transition_contract, alert_contract = _contract_bundle_views(normalized)
+    compact = _transition_watch_payload(normalized)
+    compact["timestamp_et"] = normalized.get("timestamp_et")
+    compact["ticker"] = state_contract.get("ticker") or normalized.get("ticker")
+    compact["good_idea_now"] = state_contract.get("good_idea_now") or normalized.get("good_idea_now")
+    compact["action"] = state_contract.get("action") or normalized.get("action")
+    compact["setup_state"] = state_contract.get("setup_state") or normalized.get("setup_state")
+    compact["contracts"] = _build_contracts_bundle(
+        state_contract=state_contract or normalized.get("state_contract"),
+        transition_contract=transition_contract or normalized.get("transition_contract"),
+        alert_contract=alert_contract or normalized.get("alert_contract"),
+    )
+    if state_contract:
+        compact["state_contract"] = state_contract
+    if transition_contract:
+        compact["transition_contract"] = transition_contract
+    if alert_contract:
+        compact["alert_contract"] = alert_contract
+    return compact
+
+
+def _resolve_previous_continuous_snapshot(stored_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    stored_state = stored_state or {}
+    candidates = [
+        stored_state.get("latest_snapshot"),
+        stored_state.get("latest_snapshot_compact"),
+        stored_state.get("previous_snapshot"),
+        stored_state.get("previous_snapshot_compact"),
+    ]
+    for candidate in candidates:
+        normalized = _canonicalize_continuous_snapshot_contracts(candidate)
+        if isinstance(normalized, dict) and normalized:
+            return normalized
+
+    contracts = stored_state.get("contracts")
+    if isinstance(contracts, dict) and contracts:
+        normalized = _canonicalize_continuous_snapshot_contracts({"contracts": contracts})
+        if isinstance(normalized, dict) and normalized:
+            return normalized
+    return {}
+
+
+def _contract_bundle_views(payload: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    contracts = _contracts_bundle_from_payload(payload)
+    return (
+        contracts.get("state") or {},
+        contracts.get("transition") or {},
+        contracts.get("alert") or {},
+    )
+
+
+def _bundle_first_value(contract: Dict[str, Any], payload: Dict[str, Any], key: str, default: Any = None) -> Any:
+    if isinstance(contract, dict) and key in contract:
+        value = contract.get(key)
+        if value is not None:
+            return value
+    value = (payload or {}).get(key)
+    return default if value is None else value
+
+def _continuous_meaningful_changed_fields(
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    changes: Dict[str, Dict[str, Any]] = {}
+
+    def _add(field: str, previous_value: Any, current_value: Any) -> None:
+        changes[field] = {"previous": previous_value, "current": current_value}
+
+    previous_watch = _transition_watch_payload(previous)
+    current_watch = _transition_watch_payload(current)
+    prev_verdict = str(previous_watch.get("final_verdict") or "").upper()
+    curr_verdict = str(current_watch.get("final_verdict") or "").upper()
+
+    if prev_verdict != curr_verdict:
+        _add("final_verdict", prev_verdict, curr_verdict)
+
+    if previous_watch.get("current_state") != current_watch.get("current_state"):
+        _add("current_state", previous_watch.get("current_state"), current_watch.get("current_state"))
+
+    if previous_watch.get("primary_blocker") != current_watch.get("primary_blocker"):
+        _add("primary_blocker", previous_watch.get("primary_blocker"), current_watch.get("primary_blocker"))
+
+    if previous_watch.get("next_flip_needed") != current_watch.get("next_flip_needed") and curr_verdict == "PENDING":
+        _add("next_flip_needed", previous_watch.get("next_flip_needed"), current_watch.get("next_flip_needed"))
+
+    if previous_watch.get("approval_ready_now") != current_watch.get("approval_ready_now"):
+        _add("approval_ready_now", previous_watch.get("approval_ready_now"), current_watch.get("approval_ready_now"))
+
+    if previous_watch.get("approval_ready_on_completed_candle") != current_watch.get("approval_ready_on_completed_candle"):
+        _add(
+            "approval_ready_on_completed_candle",
+            previous_watch.get("approval_ready_on_completed_candle"),
+            current_watch.get("approval_ready_on_completed_candle"),
+        )
+
+    if previous_watch.get("breakout_hold_pending") != current_watch.get("breakout_hold_pending"):
+        _add("breakout_hold_pending", previous_watch.get("breakout_hold_pending"), current_watch.get("breakout_hold_pending"))
+
+    if previous_watch.get("thesis_gate_pending") != current_watch.get("thesis_gate_pending"):
+        _add("thesis_gate_pending", previous_watch.get("thesis_gate_pending"), current_watch.get("thesis_gate_pending"))
+
+    if previous_watch.get("invalidation_hit") != current_watch.get("invalidation_hit"):
+        _add("invalidation_hit", previous_watch.get("invalidation_hit"), current_watch.get("invalidation_hit"))
+
+    prev_global = _ordered_unique_strings(previous_watch.get("global_gate_failures") or [])
+    curr_global = _ordered_unique_strings(current_watch.get("global_gate_failures") or [])
+    if prev_global != curr_global:
+        _add("global_gate_failures", prev_global, curr_global)
+
+    if previous_watch.get("best_ticker") != current_watch.get("best_ticker") and prev_verdict != curr_verdict:
+        _add("best_ticker", previous_watch.get("best_ticker"), current_watch.get("best_ticker"))
+
+    if (
+        previous_watch.get("open_positions") != current_watch.get("open_positions")
+        or previous_watch.get("weekly_trade_count") != current_watch.get("weekly_trade_count")
+    ):
+        _add(
+            "account_state",
+            {
+                "open_positions": previous_watch.get("open_positions"),
+                "weekly_trade_count": previous_watch.get("weekly_trade_count"),
+            },
+            {
+                "open_positions": current_watch.get("open_positions"),
+                "weekly_trade_count": current_watch.get("weekly_trade_count"),
+            },
+        )
+
+    return changes
+
+
+def _continuous_context_changed_fields(
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    changes: Dict[str, Dict[str, Any]] = {}
+
+    def _add(field: str, previous_value: Any, current_value: Any) -> None:
+        changes[field] = {"previous": previous_value, "current": current_value}
+
+    previous_watch = _transition_watch_payload(previous)
+    current_watch = _transition_watch_payload(current)
+
+    if previous_watch.get("best_ticker") != current_watch.get("best_ticker"):
+        _add("best_ticker", previous_watch.get("best_ticker"), current_watch.get("best_ticker"))
+
+    return changes
+
+
+def _continuous_changed_fields(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return _continuous_meaningful_changed_fields(previous, current)
+
+
+
+def _compare_continuous_snapshots(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not previous:
+        return {
+            "transition_type": "INITIAL_SNAPSHOT",
+            "severity": "info",
+            "meaningful_transition": False,
+            "should_alert_candidate": False,
+            "changed_fields": {},
+            "context_changed_fields": {},
+            "summary": "Initial shadow snapshot created.",
+            "summary_key": None,
+        }
+
+    changed_fields = _continuous_changed_fields(previous, current)
+    context_changed_fields = _continuous_context_changed_fields(previous, current)
+    meaningful_transition = bool(changed_fields)
+    summary_key = None
+
+    if not meaningful_transition:
+        transition_type = "NO_MEANINGFUL_CHANGE"
+        severity = "info"
+        if "best_ticker" in context_changed_fields:
+            prev_ticker = context_changed_fields["best_ticker"]["previous"]
+            curr_ticker = context_changed_fields["best_ticker"]["current"]
+            summary = f"No meaningful state change. Harmless ticker reshuffle: {prev_ticker} -> {curr_ticker}."
+        else:
+            summary = "No meaningful state change."
+    elif "invalidation_hit" in changed_fields and current.get("invalidation_hit"):
+        transition_type = "INVALIDATION_HIT"
+        severity = "high"
+        summary = "Invalidation hit. Exit now."
+    elif "final_verdict" in changed_fields:
+        transition_type = "FINAL_VERDICT_CHANGED"
+        severity = "high" if str(current.get("final_verdict") or "").upper() == "TRADE" else "medium"
+        summary = f"Final verdict changed from {previous.get('final_verdict')} to {current.get('final_verdict')}."
+    elif "primary_blocker" in changed_fields:
+        transition_type = "PRIMARY_BLOCKER_CHANGED"
+        severity = "medium"
+        prev_blocker_key = previous.get("primary_blocker")
+        curr_blocker_key = current.get("primary_blocker")
+        prev_blocker = _humanize_blocker_key(prev_blocker_key)
+        curr_blocker = _humanize_blocker_key(curr_blocker_key)
+        summary = f"Primary blocker changed from {prev_blocker} to {curr_blocker}."
+        summary_key = f"Primary blocker changed from {prev_blocker_key} to {curr_blocker_key}."
+    elif "approval_ready_on_completed_candle" in changed_fields:
+        transition_type = "COMPLETED_CANDLE_APPROVAL_CHANGED"
+        severity = "high" if current.get("approval_ready_on_completed_candle") else "medium"
+        summary = "Completed-candle approval state changed."
+    elif "approval_ready_now" in changed_fields:
+        transition_type = "INTRABAR_APPROVAL_CHANGED"
+        severity = "high" if current.get("approval_ready_now") else "medium"
+        summary = "Intrabar approval state changed."
+    elif "breakout_hold_pending" in changed_fields:
+        transition_type = "BREAKOUT_HOLD_CHANGED"
+        severity = "medium"
+        summary = (
+            "Breakout hold confirmation is still pending."
+            if current.get("breakout_hold_pending")
+            else "Breakout hold confirmation cleared."
+        )
+    elif "global_gate_failures" in changed_fields:
+        transition_type = "FINAL_GATE_CHANGED"
+        severity = "medium"
+        summary = "Final gate blocker state changed."
+    elif "best_ticker" in changed_fields:
+        transition_type = "WINNER_CHANGED_WITH_STATE_CHANGE"
+        severity = "medium"
+        summary = f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')} with a state change."
+    elif "account_state" in changed_fields:
+        transition_type = "ACCOUNT_STATE_CHANGED"
+        severity = "medium"
+        summary = "Account state changed."
+    elif "next_flip_needed" in changed_fields:
+        transition_type = "NEXT_FLIP_CHANGED"
+        severity = "medium"
+        prev_flip_key = previous.get("next_flip_needed")
+        curr_flip_key = current.get("next_flip_needed")
+        prev_flip = _humanize_blocker_key(prev_flip_key)
+        curr_flip = _humanize_blocker_key(curr_flip_key)
+        summary = f"Next flip needed changed from {prev_flip} to {curr_flip}."
+        summary_key = f"Next flip needed changed from {prev_flip_key} to {curr_flip_key}."
+    else:
+        transition_type = "DETAIL_CHANGED"
+        severity = "info"
+        summary = "Tracked shadow fields changed."
+
+    return {
+        "transition_type": transition_type,
+        "severity": severity,
+        "meaningful_transition": meaningful_transition,
+        "should_alert_candidate": meaningful_transition,
+        "changed_fields": changed_fields,
+        "context_changed_fields": context_changed_fields,
+        "summary": summary,
+        "summary_key": summary_key,
+    }
+
+
+
+def _build_alert_contract(
+    *,
+    mode: str,
+    alert_decision_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    ctx = alert_decision_context or {}
+    if mode == "continuous":
+        return {
+            "contract_version": "safe_fast_alert_v1",
+            "contract_marker": "safe_fast_alert_contract_surface_v1",
+            "mode": "continuous",
+            "dispatch_state": ctx.get("dispatch_state"),
+            "alert_stage": ctx.get("alert_stage"),
+            "should_alert": bool(ctx.get("should_alert")),
+            "would_alert_now": bool(ctx.get("would_alert_now")),
+            "current_alert_candidate": bool(ctx.get("current_alert_candidate")),
+            "meaningful_transition": bool(ctx.get("meaningful_transition")),
+            "deduped": bool(ctx.get("deduped")),
+            "suppressed_reasons": ctx.get("suppressed_reasons") or [],
+            "alert_reason": ctx.get("alert_reason"),
+            "alert_reason_key": ctx.get("alert_reason_key"),
+            "alert_severity": ctx.get("alert_severity"),
+        }
+    return {
+        "contract_version": "safe_fast_alert_v1",
+        "contract_marker": "safe_fast_alert_contract_surface_v1",
+        "mode": "on_demand",
+        "dispatch_state": "NOT_APPLICABLE",
+        "alert_stage": "ON_DEMAND_ONLY",
+        "should_alert": False,
+        "would_alert_now": False,
+        "current_alert_candidate": False,
+        "meaningful_transition": False,
+        "deduped": False,
+        "suppressed_reasons": ["on_demand_mode"],
+        "alert_reason": "On-demand evaluations do not dispatch continuous alerts.",
+        "alert_severity": "info",
+    }
+
+def _continuous_transition_fingerprint(
+    *,
+    current_snapshot: Dict[str, Any],
+    transition_summary: Dict[str, Any],
+) -> str:
+    payload = {
+        "transition_type": transition_summary.get("transition_type"),
+        "final_verdict": current_snapshot.get("final_verdict"),
+        "current_state": current_snapshot.get("current_state"),
+        "best_ticker": current_snapshot.get("best_ticker"),
+        "primary_blocker": current_snapshot.get("primary_blocker"),
+        "next_flip_needed": current_snapshot.get("next_flip_needed"),
+        "approval_ready_now": current_snapshot.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": current_snapshot.get("approval_ready_on_completed_candle"),
+        "global_gate_failures": current_snapshot.get("global_gate_failures"),
+        "open_positions": current_snapshot.get("open_positions"),
+        "weekly_trade_count": current_snapshot.get("weekly_trade_count"),
+    }
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+
+def _build_true_transition_context(
+    previous: Optional[Dict[str, Any]],
+    current: Dict[str, Any],
+) -> Dict[str, Any]:
+    watched_fields = [
+        "final_verdict",
+        "best_ticker",
+        "primary_blocker",
+        "next_flip_needed",
+        "approval_ready_now",
+        "approval_ready_on_completed_candle",
+        "breakout_hold_pending",
+        "thesis_gate_pending",
+        "current_state",
+        "global_gate_failures",
+        "invalidation_hit",
+        "open_positions",
+        "weekly_trade_count",
+    ]
+
+    if not previous:
+        return {
+            "ok": True,
+            "transition_type": "INITIAL_SNAPSHOT",
+            "severity": "info",
+            "meaningful_transition": False,
+            "should_alert_candidate": False,
+            "transition_detected": False,
+            "summary": "Initial shadow snapshot created.",
+            "summary_key": None,
+            "primary_event": None,
+            "events": [],
+            "watched_fields": watched_fields,
+            "changed_fields": {},
+            "context_changed_fields": {},
+        }
+
+    events: List[Dict[str, Any]] = []
+    changed_fields = _continuous_meaningful_changed_fields(previous, current)
+    context_changed_fields = _continuous_context_changed_fields(previous, current)
+
+    def _add_event(
+        event: str,
+        previous_value: Any,
+        current_value: Any,
+        severity: str,
+        summary: str,
+        summary_key: Optional[str] = None,
+    ) -> None:
+        events.append(
+            {
+                "event": event,
+                "previous": previous_value,
+                "current": current_value,
+                "severity": severity,
+                "summary": summary,
+                "summary_key": summary_key,
+            }
+        )
+
+    if "invalidation_hit" in changed_fields and current.get("invalidation_hit"):
+        _add_event(
+            "INVALIDATION_HIT",
+            previous.get("invalidation_hit"),
+            current.get("invalidation_hit"),
+            "high",
+            "Invalidation hit. Exit now.",
+            None,
+        )
+
+    if "final_verdict" in changed_fields:
+        curr_verdict = str(current.get("final_verdict") or "").upper()
+        severity = "high" if curr_verdict == "TRADE" else "medium"
+        _add_event(
+            "FINAL_VERDICT_CHANGED",
+            previous.get("final_verdict"),
+            current.get("final_verdict"),
+            severity,
+            f"Final verdict changed from {previous.get('final_verdict')} to {current.get('final_verdict')}.",
+            None,
+        )
+
+    if "primary_blocker" in changed_fields:
+        prev_blocker_key = previous.get("primary_blocker")
+        curr_blocker_key = current.get("primary_blocker")
+        prev_blocker = _humanize_blocker_key(prev_blocker_key)
+        curr_blocker = _humanize_blocker_key(curr_blocker_key)
+        _add_event(
+            "PRIMARY_BLOCKER_CHANGED",
+            previous.get("primary_blocker"),
+            current.get("primary_blocker"),
+            "medium",
+            f"Primary blocker changed from {prev_blocker} to {curr_blocker}.",
+            f"Primary blocker changed from {prev_blocker_key} to {curr_blocker_key}.",
+        )
+
+    if "approval_ready_on_completed_candle" in changed_fields:
+        _add_event(
+            "COMPLETED_CANDLE_APPROVAL_CHANGED",
+            previous.get("approval_ready_on_completed_candle"),
+            current.get("approval_ready_on_completed_candle"),
+            "high" if current.get("approval_ready_on_completed_candle") else "medium",
+            "Completed-candle approval state changed.",
+            None,
+        )
+
+    if "approval_ready_now" in changed_fields:
+        _add_event(
+            "INTRABAR_APPROVAL_CHANGED",
+            previous.get("approval_ready_now"),
+            current.get("approval_ready_now"),
+            "high" if current.get("approval_ready_now") else "medium",
+            "Intrabar approval state changed.",
+            None,
+        )
+
+    if "breakout_hold_pending" in changed_fields:
+        _add_event(
+            "BREAKOUT_HOLD_CHANGED",
+            previous.get("breakout_hold_pending"),
+            current.get("breakout_hold_pending"),
+            "medium",
+            "Breakout hold confirmation state changed.",
+            None,
+        )
+
+    if "global_gate_failures" in changed_fields:
+        _add_event(
+            "FINAL_GATE_CHANGED",
+            changed_fields["global_gate_failures"]["previous"],
+            changed_fields["global_gate_failures"]["current"],
+            "medium",
+            "Final gate blocker state changed.",
+            None,
+        )
+
+    if "best_ticker" in changed_fields:
+        _add_event(
+            "WINNER_CHANGED_WITH_STATE_CHANGE",
+            previous.get("best_ticker"),
+            current.get("best_ticker"),
+            "medium",
+            f"Best ticker changed from {previous.get('best_ticker')} to {current.get('best_ticker')} with a state change.",
+            None,
+        )
+
+    if "account_state" in changed_fields:
+        _add_event(
+            "ACCOUNT_STATE_CHANGED",
+            changed_fields["account_state"]["previous"],
+            changed_fields["account_state"]["current"],
+            "medium",
+            "Account state changed.",
+            None,
+        )
+
+    if "next_flip_needed" in changed_fields:
+        prev_flip_key = previous.get("next_flip_needed")
+        curr_flip_key = current.get("next_flip_needed")
+        prev_flip = _humanize_blocker_key(prev_flip_key)
+        curr_flip = _humanize_blocker_key(curr_flip_key)
+        _add_event(
+            "NEXT_FLIP_CHANGED",
+            previous.get("next_flip_needed"),
+            current.get("next_flip_needed"),
+            "medium",
+            f"Next flip needed changed from {prev_flip} to {curr_flip}.",
+            f"Next flip needed changed from {prev_flip_key} to {curr_flip_key}.",
+        )
+
+    transition_detected = bool(events)
+    summary_key = None
+    if not transition_detected:
+        transition_type = "NO_TRUE_TRANSITION"
+        severity = "info"
+        if "best_ticker" in context_changed_fields:
+            prev_ticker = context_changed_fields["best_ticker"]["previous"]
+            curr_ticker = context_changed_fields["best_ticker"]["current"]
+            summary = f"No true transition. Harmless ticker reshuffle: {prev_ticker} -> {curr_ticker}."
+        else:
+            summary = "No true transition."
+        primary_event = None
+    elif len(events) == 1:
+        transition_type = events[0]["event"]
+        severity = events[0]["severity"]
+        summary = events[0]["summary"]
+        summary_key = events[0].get("summary_key")
+        primary_event = events[0]["event"]
+    else:
+        highest = {"info": 0, "medium": 1, "high": 2}
+        transition_type = "MULTIPLE_TRUE_TRANSITIONS"
+        severity = max((event["severity"] for event in events), key=lambda x: highest.get(x, 0))
+        summary = " | ".join(event["summary"] for event in events)
+        raw_parts = [event.get("summary_key") or event.get("summary") for event in events]
+        summary_key = " | ".join(part for part in raw_parts if part)
+        primary_event = events[0]["event"]
+
+    return {
+        "ok": True,
+        "transition_type": transition_type,
+        "severity": severity,
+        "meaningful_transition": transition_detected,
+        "should_alert_candidate": bool(
+            transition_detected
+            and ((current.get("alert_candidate_context") or {}).get("should_alert_candidate"))
+        ),
+        "transition_detected": transition_detected,
+        "summary": summary,
+        "summary_key": summary_key,
+        "primary_event": primary_event,
+        "events": events,
+        "watched_fields": watched_fields,
+        "changed_fields": changed_fields,
+        "context_changed_fields": context_changed_fields,
+    }
+
+def _build_continuous_alert_decision_context(
+    *,
+    previous_snapshot: Optional[Dict[str, Any]],
+    current_snapshot: Dict[str, Any],
+    transition_summary: Dict[str, Any],
+    deduped: bool,
+    replay_profile_active: bool,
+) -> Dict[str, Any]:
+    alert_candidate_context = current_snapshot.get("alert_candidate_context") or {}
+    current_alert_candidate = bool(alert_candidate_context.get("should_alert_candidate"))
+    meaningful_transition = bool(transition_summary.get("meaningful_transition"))
+    initial_snapshot = previous_snapshot is None
+    eligible_profile = not replay_profile_active
+
+    suppressed_reasons: List[str] = []
+    if replay_profile_active:
+        suppressed_reasons.append("replay_profile")
+    if initial_snapshot:
+        suppressed_reasons.append("initial_snapshot")
+    if deduped:
+        suppressed_reasons.append("duplicate_transition")
+    if current_alert_candidate and not meaningful_transition and not initial_snapshot:
+        suppressed_reasons.append("no_meaningful_transition")
+    if not current_alert_candidate:
+        suppressed_reasons.append("no_alert_candidate")
+
+    would_alert_now = bool(
+        eligible_profile
+        and current_alert_candidate
+        and not deduped
+        and (meaningful_transition or initial_snapshot)
+    )
+    should_alert = bool(
+        eligible_profile
+        and current_alert_candidate
+        and meaningful_transition
+        and not initial_snapshot
+        and not deduped
+    )
+
+    if should_alert:
+        dispatch_state = "ALERT_READY"
+    elif replay_profile_active and current_alert_candidate:
+        dispatch_state = "SUPPRESSED_REPLAY_PROFILE"
+    elif initial_snapshot and current_alert_candidate:
+        dispatch_state = "SUPPRESSED_INITIAL_SNAPSHOT"
+    elif deduped and current_alert_candidate:
+        dispatch_state = "SUPPRESSED_DUPLICATE"
+    elif current_alert_candidate and not meaningful_transition:
+        dispatch_state = "WAITING_FOR_MEANINGFUL_TRANSITION"
+    else:
+        dispatch_state = "TRACK_ONLY"
+
+    raw_alert_reason = alert_candidate_context.get("alert_reason")
+    human_alert_reason = _humanize_surface_text(raw_alert_reason)
+
+    return {
+        "ok": True,
+        "dispatch_state": dispatch_state,
+        "should_alert": should_alert,
+        "would_alert_now": would_alert_now,
+        "current_alert_candidate": current_alert_candidate,
+        "meaningful_transition": meaningful_transition,
+        "initial_snapshot": initial_snapshot,
+        "eligible_profile": eligible_profile,
+        "replay_profile_active": replay_profile_active,
+        "deduped": deduped,
+        "suppressed_reasons": suppressed_reasons,
+        "alert_stage": alert_candidate_context.get("alert_stage"),
+        "alert_reason": human_alert_reason,
+        "alert_reason_key": raw_alert_reason if human_alert_reason and human_alert_reason != raw_alert_reason else None,
+        "alert_severity": alert_candidate_context.get("alert_severity"),
+    }
+
+
+def _build_continuous_alert_payload(
+    *,
+    previous_snapshot: Optional[Dict[str, Any]],
+    current_snapshot: Dict[str, Any],
+    transition_summary: Dict[str, Any],
+    alert_decision_context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    meaningful_transition = bool(transition_summary.get("meaningful_transition"))
+    current_alert_candidate = bool(alert_decision_context.get("current_alert_candidate"))
+    should_alert = bool(alert_decision_context.get("should_alert"))
+
+    if not current_alert_candidate and not meaningful_transition and not should_alert:
+        return None
+
+    summary = current_snapshot.get("summary") or {}
+    primary_blocker_key = current_snapshot.get("primary_blocker")
+    next_flip_needed_key = current_snapshot.get("next_flip_needed")
+    primary_blocker = _humanize_blocker_key(primary_blocker_key) if primary_blocker_key else None
+    next_flip_needed = _humanize_blocker_key(next_flip_needed_key) if next_flip_needed_key else None
+    return {
+        "should_alert": should_alert,
+        "would_alert_now": alert_decision_context.get("would_alert_now"),
+        "dispatch_state": alert_decision_context.get("dispatch_state"),
+        "initial_snapshot": alert_decision_context.get("initial_snapshot"),
+        "eligible_profile": alert_decision_context.get("eligible_profile"),
+        "replay_profile_active": alert_decision_context.get("replay_profile_active"),
+        "deduped": alert_decision_context.get("deduped"),
+        "suppressed_reasons": alert_decision_context.get("suppressed_reasons"),
+        "transition_type": transition_summary.get("transition_type"),
+        "severity": transition_summary.get("severity"),
+        "message": transition_summary.get("summary"),
+        "message_key": transition_summary.get("summary_key"),
+        "ticker": summary.get("ticker"),
+        "state": current_snapshot.get("current_state"),
+        "alert_stage": current_snapshot.get("alert_stage"),
+        "alert_reason": current_snapshot.get("alert_reason"),
+        "alert_severity": current_snapshot.get("alert_severity"),
+        "primary_blocker": primary_blocker,
+        "primary_blocker_key": primary_blocker_key,
+        "next_flip_needed": next_flip_needed,
+        "next_flip_needed_key": next_flip_needed_key,
+        "good_idea_now": summary.get("good_idea_now"),
+        "action": summary.get("action"),
+        "market_open": current_snapshot.get("market_open"),
+        "fresh_entry_allowed": current_snapshot.get("fresh_entry_allowed"),
+        "trigger_present": current_snapshot.get("trigger_present"),
+        "approval_ready_now": current_snapshot.get("approval_ready_now"),
+        "approval_ready_on_completed_candle": current_snapshot.get("approval_ready_on_completed_candle"),
+        "should_alert_candidate": current_alert_candidate,
+    }
+
+
+def _build_continuous_on_demand_excerpt(on_demand_payload: Dict[str, Any]) -> Dict[str, Any]:
+    decision_context = on_demand_payload.get("decision_context") or {}
+    approval_context = on_demand_payload.get("approval_context") or {}
+    trigger_context = on_demand_payload.get("trigger_context") or {}
+    iv_context = on_demand_payload.get("iv_context") or {}
+    market_context = on_demand_payload.get("market_context") or {}
+    time_day_gate = on_demand_payload.get("time_day_gate") or {}
+
+    primary_blocker = decision_context.get("primary_blocker")
+    next_flip_needed = approval_context.get("next_flip_needed")
+    raw_trigger_reason = trigger_context.get("trigger_reason")
+    human_primary_blocker = _humanize_blocker_key(primary_blocker) if primary_blocker else None
+    human_next_flip_needed = _humanize_blocker_key(next_flip_needed) if next_flip_needed else None
+    human_trigger_reason = _humanize_trigger_reason_key(raw_trigger_reason) if raw_trigger_reason else None
+
+    return {
+        "primary_blocker": human_primary_blocker or primary_blocker,
+        "next_flip_needed": human_next_flip_needed or next_flip_needed,
+        "primary_blocker_key": primary_blocker if human_primary_blocker and human_primary_blocker != primary_blocker else None,
+        "next_flip_needed_key": next_flip_needed if human_next_flip_needed and human_next_flip_needed != next_flip_needed else None,
+        "trigger_present": trigger_context.get("trigger_present"),
+        "trigger_reason": raw_trigger_reason,
+        "trigger_reason_human": human_trigger_reason or raw_trigger_reason,
+        "trigger_reason_key": raw_trigger_reason if human_trigger_reason and human_trigger_reason != raw_trigger_reason else None,
+        "structure_ready": trigger_context.get("structure_ready"),
+        "iv_status": iv_context.get("status"),
+        "market_open": market_context.get("is_open"),
+        "fresh_entry_allowed": time_day_gate.get("fresh_entry_allowed"),
+        "time_gate_reason": time_day_gate.get("reason"),
+    }
+
+
+
+def _build_continuous_alert_candidate_excerpt(alert_candidate_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(alert_candidate_context, dict):
+        return alert_candidate_context
+
+    next_flip_needed = alert_candidate_context.get("next_flip_needed")
+    human_next_flip_needed = _humanize_blocker_key(next_flip_needed) if next_flip_needed else None
+
+    return {
+        "alert_stage": alert_candidate_context.get("alert_stage"),
+        "should_alert_candidate": alert_candidate_context.get("should_alert_candidate"),
+        "next_flip_needed": human_next_flip_needed or next_flip_needed,
+        "next_flip_needed_key": next_flip_needed if human_next_flip_needed and human_next_flip_needed != next_flip_needed else None,
+        "final_verdict": alert_candidate_context.get("final_verdict"),
+    }
+
+
+def _build_continuous_market_closed_tester_excerpt(market_closed_tester: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(market_closed_tester, dict):
+        return market_closed_tester
+    return {
+        "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
+        "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
+        "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
+        "testing_takeaway": market_closed_tester.get("testing_takeaway"),
+    }
+
+
+def _build_continuous_replay_test_excerpt(replay_test_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(replay_test_context, dict):
+        return replay_test_context
+    enabled = replay_test_context.get("enabled")
+    status = replay_test_context.get("status")
+    if enabled is False or status == "disabled":
+        return {
+            "enabled": False,
+            "status": status or "disabled",
+        }
+    return {
+        "enabled": enabled,
+        "status": status,
+        "scope": replay_test_context.get("scope"),
+        "why": replay_test_context.get("why"),
+    }
+
+
+def _strip_continuous_response_snapshot(snapshot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(snapshot, dict):
+        return snapshot
+
+    cleaned_snapshot = dict(snapshot)
+    for key in [
+        "profile_name",
+        "profile_key",
+        "base_profile_key",
+        "replay_profile_active",
+        "request_profile",
+        "shadow_request_profile",
+        "build_tag",
+        "session_basis_context",
+        "readable_summary",
+        "alert_candidate_context",
+        "market_closed_tester",
+        "replay_test_context",
+        "compact_ticker_summaries",
+        "summary",
+        "reason_display",
+        "winner_shift_context",
+        "iv_context",
+        "iv_status",
+        "market_context",
+        "market_open",
+        "fresh_entry_allowed",
+        "time_gate_reason",
+        "time_day_gate",
+        "setup_type",
+        "alert_dispatch_state",
+        "would_alert_now",
+        "should_alert_now",
+        "alert_suppressed_reasons",
+        "state_contract",
+        "transition_contract",
+        "alert_contract",
+        "contracts",
+        "response_contract_marker",
+    ]:
+        cleaned_snapshot.pop(key, None)
+    return cleaned_snapshot
+
+
+def _build_continuous_current_snapshot_excerpt(snapshot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    compact_snapshot = _compact_continuous_persistence_snapshot(snapshot)
+    if not isinstance(compact_snapshot, dict) or not compact_snapshot:
+        return compact_snapshot
+
+    for key in [
+        "state_contract",
+        "transition_contract",
+        "alert_contract",
+        "contracts",
+        "response_contract_marker",
+    ]:
+        compact_snapshot.pop(key, None)
+    return compact_snapshot
+
+
+def _build_continuous_previous_snapshot_excerpt(snapshot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    compact_snapshot = _compact_continuous_persistence_snapshot(snapshot)
+    if not isinstance(compact_snapshot, dict) or not compact_snapshot:
+        return compact_snapshot
+
+    for key in [
+        "state_contract",
+        "transition_contract",
+        "alert_contract",
+        "contracts",
+        "response_contract_marker",
+    ]:
+        compact_snapshot.pop(key, None)
+    return compact_snapshot
+
+
+def _build_continuous_readable_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    state_contract, _, alert_contract = _contract_bundle_views(snapshot)
+    current_state = _bundle_first_value(state_contract, snapshot, "current_state")
+    latent_structure_state = snapshot.get("latent_structure_state")
+    primary_blocker = _bundle_first_value(state_contract, snapshot, "primary_blocker")
+    next_flip_needed = _bundle_first_value(state_contract, snapshot, "next_flip_needed")
+    summary = snapshot.get("summary") or {}
+    time_gate_reason = _bundle_first_value(state_contract, snapshot, "time_gate_reason")
+    market_open = _bundle_first_value(state_contract, snapshot, "market_open")
+    decision_blockers = _ordered_unique_strings(
+        _bundle_first_value(state_contract, snapshot, "decision_blockers", []) or []
+    )
+    failed_reasons = _ordered_unique_strings(
+        _bundle_first_value(state_contract, snapshot, "failed_reasons", []) or []
+    )
+    market_closed_tester = snapshot.get("market_closed_tester") or {}
+    replay_test_context = snapshot.get("replay_test_context") or {}
+
+    underlying_state = current_state
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and latent_structure_state:
+        underlying_state = latent_structure_state
+
+    human_primary_blocker = _humanize_blocker_key(primary_blocker) if primary_blocker else None
+    human_next_flip_needed = _humanize_blocker_key(next_flip_needed) if next_flip_needed else None
+
+    filtered_blockers = [
+        blocker for blocker in decision_blockers
+        if not (blocker == "time_day_gate" and underlying_state != current_state)
+    ]
+
+    top_blockers: List[str] = []
+    effective_primary_blocker = primary_blocker
+    if effective_primary_blocker == "time_day_gate" and underlying_state != current_state and filtered_blockers:
+        effective_primary_blocker = filtered_blockers[0]
+    if isinstance(effective_primary_blocker, str) and effective_primary_blocker.strip():
+        top_blockers.append(effective_primary_blocker.strip())
+    for blocker in filtered_blockers:
+        if blocker not in top_blockers:
+            top_blockers.append(blocker)
+        if len(top_blockers) >= 3:
+            break
+
+    human_top_blockers: List[str] = []
+    for blocker in top_blockers:
+        human_blocker = _humanize_blocker_key(blocker)
+        if human_blocker and human_blocker not in human_top_blockers:
+            human_top_blockers.append(human_blocker)
+
+    summary_note = snapshot.get("reason_display") or summary.get("why")
+    if current_state in {"WAIT_MARKET_OPEN", "BLOCKED_TIME_GATE"} and underlying_state != current_state:
+        summary_note = f"{summary_note} Underneath that, structure is still {underlying_state}."
+    elif market_open is False and underlying_state != current_state and underlying_state is not None:
+        summary_note = f"Market is closed right now. Underneath that, structure is still {underlying_state}."
+
+    good_idea_now = summary.get("good_idea_now") or state_contract.get("good_idea_now")
+    ticker = summary.get("ticker") or state_contract.get("ticker")
+    action = _normalize_trade_day_action(
+        summary.get("action") or state_contract.get("action"),
+        summary.get("setup_state") or state_contract.get("setup_state"),
+        good_idea_now,
+    )
+    market_closed_context_only = bool(market_closed_tester.get("market_closed_context_only"))
+    if market_closed_context_only:
+        action = "wait for next session"
+    acceptable_condition = summary.get("what_would_make_it_acceptable")
+    alert_reason = alert_contract.get("alert_reason") or (snapshot.get("alert_candidate_context") or {}).get("alert_reason")
+    human_alert_reason = _humanize_surface_text(alert_reason)
+    alert_stage = alert_contract.get("alert_stage") or (snapshot.get("alert_candidate_context") or {}).get("alert_stage")
+
+    if good_idea_now == "YES":
+        next_step_text = _bundle_first_value(state_contract, snapshot, "invalidation") or "Protect the setup against a 1H close beyond the 50 EMA."
+    elif acceptable_condition:
+        next_step_text = acceptable_condition
+    elif next_flip_needed:
+        next_step_text = _humanize_next_step(next_flip_needed)
+    elif effective_primary_blocker:
+        next_step_text = _humanize_next_step(effective_primary_blocker)
+    else:
+        next_step_text = _bundle_first_value(state_contract, snapshot, "invalidation") or "Wait for a cleaner SAFE-FAST state."
+
+    also_failing = _derive_also_failing_line(
+        failed_reasons,
+        summary_note,
+    )
+    trap_line = _derive_trap_line(snapshot.get("trap_check_context"))
+
+    surface = _build_decisive_response_surface(
+        ticker=ticker,
+        action=action,
+        good_idea_now=good_idea_now,
+        reason=summary_note,
+        next_step=next_step_text,
+        invalidation=_bundle_first_value(state_contract, snapshot, "invalidation"),
+        market_closed_context_only=market_closed_context_only,
+        also_failing=also_failing,
+        trap_line=trap_line,
+    )
+
+    return {
+        "ticker": ticker,
+        "good_idea_now": good_idea_now,
+        "action": action,
+        "setup_state": summary.get("setup_state") or state_contract.get("setup_state"),
+        "now_state": current_state,
+        "underlying_state": underlying_state,
+        "primary_blocker": human_primary_blocker,
+        "next_flip_needed": human_next_flip_needed,
+        "top_blockers": human_top_blockers,
+        "primary_blocker_key": primary_blocker,
+        "next_flip_needed_key": next_flip_needed,
+        "top_blocker_keys": top_blockers,
+        "trigger_present": _bundle_first_value(state_contract, snapshot, "trigger_present"),
+        "trigger_reason": _bundle_first_value(state_contract, snapshot, "trigger_reason"),
+        "structure_ready": _bundle_first_value(state_contract, snapshot, "structure_ready"),
+        "market_open": market_open,
+        "time_gate_reason": time_gate_reason,
+        "market_closed_context_only": market_closed_tester.get("market_closed_context_only"),
+        "underlying_structural_verdict": market_closed_tester.get("underlying_structural_verdict"),
+        "would_be_trade_if_open": market_closed_tester.get("would_be_trade_if_open"),
+        "replay_test_enabled": replay_test_context.get("enabled"),
+        "replay_trade_allowed": replay_test_context.get("replay_trade_allowed"),
+        "replay_timestamp_et": replay_test_context.get("resolved_replay_timestamp_et"),
+        "alert_stage": alert_stage,
+        "alert_reason": human_alert_reason,
+        "alert_reason_key": alert_reason if human_alert_reason and human_alert_reason != alert_reason else None,
+        "alert_dispatch_state": alert_contract.get("dispatch_state") or snapshot.get("alert_dispatch_state"),
+        "would_alert_now": alert_contract.get("would_alert_now") if "would_alert_now" in alert_contract else snapshot.get("would_alert_now"),
+        "should_alert_now": alert_contract.get("should_alert") if "should_alert" in alert_contract else snapshot.get("should_alert_now"),
+        "alert_suppressed_reasons": alert_contract.get("suppressed_reasons") or snapshot.get("alert_suppressed_reasons"),
+        "headline": surface.get("headline"),
+        "watchouts": surface.get("watchouts"),
+        "next_step": surface.get("next_step") or next_step_text,
+        "response_lines": surface.get("response_lines") or [],
+        "response_text": surface.get("response_text") or "",
+        "macro_brief": snapshot.get("macro_brief"),
+        "first_failed_reason": failed_reasons[0] if failed_reasons else None,
+        "breakout_hold_pending": _bundle_first_value(state_contract, snapshot, "breakout_hold_pending"),
+        "thesis_gate_pending": _bundle_first_value(state_contract, snapshot, "thesis_gate_pending"),
+        "invalidation": _bundle_first_value(state_contract, snapshot, "invalidation"),
+    }
+
+
+async def _build_continuous_shadow_payload(request: ContinuousShadowRequest) -> Dict[str, Any]:
+    profile_name = _sanitize_continuous_profile_name(request.profile_name)
+    on_demand_request = _continuous_shadow_to_on_demand_request(request)
+    base_profile_key = _continuous_profile_key(profile_name, on_demand_request)
+    replay_profile_active = bool(request.replay_timestamp_et or request.replay_label)
+    profile_key = f"{base_profile_key}__replay" if replay_profile_active else base_profile_key
+
+    stored_state = _load_continuous_state(profile_key) if request.persist_state else {}
+    previous_snapshot = _resolve_previous_continuous_snapshot(stored_state)
+
+    on_demand_payload = await _build_on_demand_payload(on_demand_request)
+    current_snapshot = _build_continuous_snapshot(
+        on_demand_payload=on_demand_payload,
+        request=on_demand_request,
+        profile_name=profile_name,
+        profile_key=profile_key,
+        shadow_request=request,
+    )
+    transition_summary = _compare_continuous_snapshots(previous_snapshot, current_snapshot)
+    true_transition_context = _build_true_transition_context(previous_snapshot, current_snapshot)
+    transition_fingerprint = _continuous_transition_fingerprint(
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+    )
+
+    last_alert_fingerprint = stored_state.get("last_alert_fingerprint")
+    deduped = bool(
+        previous_snapshot
+        and true_transition_context.get("should_alert_candidate")
+        and transition_fingerprint == last_alert_fingerprint
+    )
+    alert_decision_context = _build_continuous_alert_decision_context(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+        deduped=deduped,
+        replay_profile_active=replay_profile_active,
+    )
+    should_alert = bool(alert_decision_context.get("should_alert"))
+
+    current_snapshot["alert_dispatch_state"] = alert_decision_context.get("dispatch_state")
+    current_snapshot["would_alert_now"] = alert_decision_context.get("would_alert_now")
+    current_snapshot["should_alert_now"] = should_alert
+    current_snapshot["alert_suppressed_reasons"] = alert_decision_context.get("suppressed_reasons") or []
+    current_snapshot["readable_summary"] = _build_continuous_readable_summary(current_snapshot)
+    transition_contract = _build_transition_contract(
+        previous_snapshot,
+        current_snapshot,
+        true_transition_context,
+    )
+    alert_contract = _build_alert_contract(
+        mode="continuous",
+        alert_decision_context=alert_decision_context,
+    )
+    current_snapshot["transition_contract"] = transition_contract
+    current_snapshot["alert_contract"] = alert_contract
+    current_snapshot["contracts"] = _build_contracts_bundle(
+        state_contract=current_snapshot.get("state_contract"),
+        transition_contract=transition_contract,
+        alert_contract=alert_contract,
+    )
+    current_snapshot = _canonicalize_continuous_snapshot_contracts(current_snapshot)
+    previous_snapshot = _canonicalize_continuous_snapshot_contracts(previous_snapshot)
+
+    alert_payload = _build_continuous_alert_payload(
+        previous_snapshot=previous_snapshot,
+        current_snapshot=current_snapshot,
+        transition_summary=true_transition_context,
+        alert_decision_context=alert_decision_context,
+    )
+
+    persisted = False
+    state_file = None
+    compact_previous_snapshot = _compact_continuous_persistence_snapshot(previous_snapshot)
+    compact_current_snapshot = _compact_continuous_persistence_snapshot(current_snapshot)
+    if request.persist_state:
+        persisted = True
+        state_file_path = _continuous_state_path(profile_key)
+        state_file = str(state_file_path)
+        _save_continuous_state(
+            profile_key,
+            {
+                "profile_name": profile_name,
+                "profile_key": profile_key,
+                "updated_at": current_snapshot.get("timestamp_et"),
+                "latest_snapshot": current_snapshot,
+                "latest_snapshot_compact": compact_current_snapshot,
+                "previous_snapshot": previous_snapshot,
+                "previous_snapshot_compact": compact_previous_snapshot,
+                "contracts": compact_current_snapshot.get("contracts") or current_snapshot.get("contracts") or {},
+                "last_transition": transition_summary,
+                "last_true_transition": true_transition_context,
+                "last_transition_fingerprint": transition_fingerprint,
+                "last_alert_fingerprint": transition_fingerprint if should_alert else last_alert_fingerprint,
+                "last_alert_timestamp": current_snapshot.get("timestamp_et") if should_alert else stored_state.get("last_alert_timestamp"),
+            },
+        )
+
+    response_payload = {
+        "ok": bool(on_demand_payload.get("ok")),
+        "mode": "continuous_shadow",
+        "shadow_mode": "snapshot_compare_only",
+        "build_tag": on_demand_payload.get("build_tag"),
+        "session_basis_context": on_demand_payload.get("session_basis_context") or _build_session_basis_context(),
+        "source_of_truth": "frozen_on_demand_baseline",
+        "profile_name": profile_name,
+        "profile_key": profile_key,
+        "base_profile_key": base_profile_key,
+        "replay_profile_active": replay_profile_active,
+        "current_snapshot": _build_continuous_current_snapshot_excerpt(current_snapshot),
+        "previous_snapshot": _build_continuous_previous_snapshot_excerpt(previous_snapshot),
+        "transition_summary": {
+            **transition_summary,
+            "should_alert": should_alert,
+            "deduped": deduped,
+            "transition_fingerprint": transition_fingerprint,
+        },
+        "true_transition_context": {
+            **true_transition_context,
+            "should_alert": should_alert,
+            "deduped": deduped,
+            "transition_fingerprint": transition_fingerprint,
+        },
+        "alert_decision_context": alert_decision_context,
+        "alert_payload": alert_payload,
+        "persistence": {
+            "enabled": request.persist_state,
+            "persisted": persisted,
+            "state_file": state_file,
+            "previous_snapshot_found": bool(previous_snapshot),
+        },
+        "read_this_first": "readable_summary",
+        "api_surface": {
+            "canonical_continuous_post": "/safe-fast/continuous",
+            "canonical_on_demand_post": "/safe-fast/on-demand",
+        },
+        "readable_summary": current_snapshot.get("readable_summary"),
+        "state_contract": current_snapshot.get("state_contract"),
+        "transition_contract": transition_contract,
+        "alert_contract": alert_contract,
+        "contracts": current_snapshot.get("contracts") or _build_contracts_bundle(
+            state_contract=current_snapshot.get("state_contract"),
+            transition_contract=transition_contract,
+            alert_contract=alert_contract,
+        ),
+        "response_contract_marker": current_snapshot.get("response_contract_marker") or "safe_fast_state_contract_surface_v2",
+        "alert_candidate_context": _build_continuous_alert_candidate_excerpt(
+            current_snapshot.get("alert_candidate_context")
+        ),
+        "market_closed_tester": _build_continuous_market_closed_tester_excerpt(
+            current_snapshot.get("market_closed_tester")
+        ),
+        "replay_test_context": _build_continuous_replay_test_excerpt(
+            current_snapshot.get("replay_test_context")
+        ),
+        "compact_ticker_summaries": current_snapshot.get("compact_ticker_summaries") or [],
+        "on_demand_excerpt": _build_continuous_on_demand_excerpt(on_demand_payload),
+    }
+    response_payload = _humanize_continuous_helper_surfaces(response_payload)
+    response_payload["trader_chat_payload"] = _build_trader_chat_payload(
+        mode="continuous",
+        summary=response_payload.get("readable_summary") or {},
+        state_contract=response_payload.get("state_contract") or {},
+    )
+    return _json_safe_for_response(response_payload)
+
+
+def _build_trader_chat_payload(
+    *,
+    mode: str,
+    summary: Optional[Dict[str, Any]],
+    state_contract: Optional[Dict[str, Any]],
+    targets: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    summary = summary if isinstance(summary, dict) else {}
+    state_contract = state_contract if isinstance(state_contract, dict) else {}
+    targets = targets if isinstance(targets, dict) else {}
+
+    primary_blocker = (
+        summary.get("primary_blocker")
+        or state_contract.get("state_reason_human")
+        or _humanize_blocker_key(state_contract.get("primary_blocker"))
+        or state_contract.get("primary_blocker")
+    )
+    blockers = summary.get("top_blockers") or state_contract.get("decision_blockers_human") or []
+    raw_trigger_reason = (
+        summary.get("trigger_reason")
+        or state_contract.get("trigger_reason")
+    )
+    trigger_reason = (
+        state_contract.get("trigger_reason_human")
+        or _humanize_trigger_reason_key(raw_trigger_reason)
+        or raw_trigger_reason
+    )
+    reason = (
+        summary.get("first_failed_reason")
+        or summary.get("why")
+        or summary.get("reason")
+        or summary.get("headline")
+    )
+
+    payload: Dict[str, Any] = {
+        "mode": mode,
+        "ticker": summary.get("ticker") or state_contract.get("ticker"),
+        "verdict": state_contract.get("final_verdict"),
+        "action": summary.get("action") or state_contract.get("action"),
+        "setup_state": summary.get("setup_state") or state_contract.get("setup_state"),
+        "headline": summary.get("headline"),
+        "reason": reason,
+        "primary_blocker": primary_blocker,
+        "blockers": blockers,
+        "next_step": summary.get("next_step"),
+        "invalidation": summary.get("invalidation") or state_contract.get("invalidation"),
+        "trigger_present": summary.get("trigger_present") if "trigger_present" in summary else state_contract.get("trigger_present"),
+        "trigger_reason": trigger_reason,
+        "trigger_reason_key": raw_trigger_reason if trigger_reason and raw_trigger_reason and trigger_reason != raw_trigger_reason else None,
+        "market_open": summary.get("market_open") if "market_open" in summary else state_contract.get("market_open"),
+        "context_only": summary.get("market_closed_context_only"),
+        "watchouts": summary.get("watchouts"),
+    }
+
+    target_40 = targets.get("target_40_pct_value")
+    target_50 = targets.get("target_50_pct_value")
+    target_60 = targets.get("target_60_pct_value")
+    if target_40 is not None and target_50 is not None and target_60 is not None:
+        payload["targets"] = {
+            "40%": target_40,
+            "50%": target_50,
+            "60%": target_60,
+        }
+
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _humanize_continuous_helper_surfaces(response_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(response_payload, dict):
+        return response_payload
+
+    def _humanize_value(value: Any) -> Any:
+        if isinstance(value, str):
+            return _humanize_surface_text(value) or value
+        if isinstance(value, list):
+            out: List[Any] = []
+            for item in value:
+                if isinstance(item, str):
+                    out.append(_humanize_surface_text(item) or item)
+                else:
+                    out.append(item)
+            return out
+        return value
+
+    def _apply_fields(container: Any, fields: List[str]) -> None:
+        if not isinstance(container, dict):
+            return
+        for field in fields:
+            raw_value = container.get(field)
+            human_value = _humanize_value(raw_value)
+            if human_value != raw_value:
+                container[field] = human_value
+                key_field = f"{field}_key"
+                if key_field not in container:
+                    container[key_field] = raw_value
+
+    _apply_fields(
+        response_payload.get("on_demand_excerpt"),
+        ["primary_blocker", "next_flip_needed", "top_blockers"],
+    )
+    _apply_fields(
+        response_payload.get("alert_candidate_context"),
+        ["next_flip_needed", "primary_blocker", "top_blockers", "message", "summary"],
+    )
+    _apply_fields(
+        response_payload.get("alert_payload"),
+        ["primary_blocker", "next_flip_needed", "message", "alert_reason", "summary"],
+    )
+    _apply_fields(
+        response_payload.get("transition_summary"),
+        ["summary"],
+    )
+    _apply_fields(
+        response_payload.get("true_transition_context"),
+        ["summary"],
+    )
+    return response_payload
+
+
+
+@app.post(
+    "/safe-fast/continuous",
+    tags=["SAFE-FAST"],
+    summary="SAFE-FAST Continuous",
+    description="Canonical production continuous endpoint. Use this route for continuous SAFE-FAST monitoring.",
+    operation_id="safe_fast_continuous",
+)
+async def safe_fast_continuous(
+    request: ContinuousShadowRequest = Body(
+        ...,
+        openapi_examples={
+            "default": {
+                "summary": "Default SAFE-FAST continuous request",
+                "value": {
+                    "option_type": "C",
+                    "open_positions": 0,
+                    "weekly_trade_count": 0,
+                },
+            }
+        },
+    )
+) -> Any:
+    try:
+        payload = await _build_continuous_shadow_payload(request)
+        return _ensure_contracts_surface(payload)
+    except Exception as e:
+        return _json_safe_for_response(
+            {
+                "ok": False,
+                "mode": "continuous_shadow",
+                "shadow_mode": "snapshot_compare_only",
+                "error_type": "continuous_shadow_runtime_error",
+                "reason": str(e),
+                "profile_name": _sanitize_continuous_profile_name(request.profile_name),
+                "request_profile": _model_dump(request),
+                "api_surface": {
+                    "canonical_continuous_post": "/safe-fast/continuous",
+                    "canonical_on_demand_post": "/safe-fast/on-demand",
+                },
+            }
+        )
+
+
+
+
+
+def _default_on_demand_request() -> OnDemandRequest:
+    return OnDemandRequest(
+        option_type="C",
+        open_positions=0,
+        weekly_trade_count=0,
+    )
+
+
+@app.get("/safe-fast/on-demand/default", include_in_schema=False, deprecated=True)
+async def safe_fast_on_demand_default() -> Any:
+    return await _build_on_demand_payload(_default_on_demand_request())
+
+
+@app.get("/safe-fast/on-demand/default/simple", include_in_schema=False, deprecated=True)
+async def safe_fast_on_demand_default_simple() -> Any:
+    payload = await _build_on_demand_payload(_default_on_demand_request())
+    return {
+        "ok": payload.get("ok"),
+        "build_tag": payload.get("build_tag"),
+        "read_this_first": payload.get("read_this_first"),
+        "simple_output": payload.get("simple_output"),
+        "screened_best_context": payload.get("screened_best_context"),
+        "failed_reasons": payload.get("failed_reasons"),
+    }
+
+
+@app.post(
+    "/safe-fast/on-demand",
+    tags=["SAFE-FAST"],
+    summary="SAFE-FAST On Demand",
+    description="Canonical on-demand SAFE-FAST read. Use this route for direct setup decisions.",
+    operation_id="safe_fast_on_demand",
+)
+async def safe_fast_on_demand(
+    request: OnDemandRequest = Body(
+        ...,
+        openapi_examples={
+            "default": {
+                "summary": "Default SAFE-FAST on-demand request",
+                "value": {
+                    "option_type": "C",
+                    "open_positions": 0,
+                    "weekly_trade_count": 0,
+                },
+            }
+        },
+    )
+) -> Any:
+    payload = await _build_on_demand_payload(request)
+    return _ensure_contracts_surface(payload)
+
+# repackaged deploy artifact to force a distinct commit handle
