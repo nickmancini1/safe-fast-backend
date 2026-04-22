@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_pending_window_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_pending_window_patch2"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -3989,7 +3989,12 @@ def _build_continuation_window_snapshot(
         and break_completed
         and (
             too_far_from_shelf
-            or too_far_from_ema
+            or (
+                too_far_from_ema
+                and not inside_half_atr_from_shelf
+                and current_distance_to_shelf_break is not None
+                and current_distance_to_shelf_break > 0
+            )
         )
     )
 
