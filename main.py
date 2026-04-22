@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_reclaim_shelf_patch2"
+BUILD_TAG = "macro_surface_v26_2026_04_21_reclaim_shelf_patch3"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -3944,6 +3944,11 @@ def _build_continuation_window_snapshot(
         and current_distance_to_shelf_break is not None
         and 0 <= current_distance_to_shelf_break <= (fallback_atr * 0.50)
     )
+    inside_one_atr_from_shelf = bool(
+        fallback_atr is not None
+        and current_distance_to_shelf_break is not None
+        and 0 <= current_distance_to_shelf_break <= (fallback_atr * 1.00)
+    )
     within_two_atr_of_ema = bool(
         fallback_atr is not None
         and current_distance_to_ema is not None
@@ -3952,15 +3957,22 @@ def _build_continuation_window_snapshot(
     too_far_from_shelf = bool(
         fallback_atr is not None
         and current_distance_to_shelf_break is not None
-        and current_distance_to_shelf_break > (fallback_atr * 0.50)
+        and current_distance_to_shelf_break > (fallback_atr * 1.00)
     )
     too_far_from_ema = bool(
         fallback_atr is not None
         and current_distance_to_ema is not None
-        and current_distance_to_ema > (fallback_atr * 2.0)
+        and current_distance_to_ema > (fallback_atr * 3.0)
     )
 
-    inside_tradeable_window = bool(
+    tradeable_window_open = bool(
+        reclaim_hold_proven
+        and break_completed
+        and break_above_ema
+        and room_pass is not False
+        and inside_one_atr_from_shelf
+    )
+    strict_tradeable_window = bool(
         shelf_proven
         and break_completed
         and break_above_ema
@@ -3970,18 +3982,20 @@ def _build_continuation_window_snapshot(
         and not extension_blocks_now
     )
 
+    inside_tradeable_window = bool(strict_tradeable_window or tradeable_window_open)
+
     too_late = bool(
-        shelf_proven
+        reclaim_hold_proven
+        and break_completed
         and (
-            (break_completed and too_far_from_shelf)
-            or (breakout_live_without_completed and too_far_from_shelf)
+            too_far_from_shelf
             or too_far_from_ema
         )
     )
 
     if inside_tradeable_window:
         exact_reason = "tradeable"
-        status_message = "Tradeable now: hold is proven and first break is in range."
+        status_message = "Tradeable now: reclaim hold is proven and the shelf break is in range."
         main_blocker = None
     elif too_late:
         exact_reason = "late"
