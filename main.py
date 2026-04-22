@@ -1578,6 +1578,23 @@ def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        text_value = str(value).strip()
+        if not text_value:
+            return None
+        text_value = text_value.replace(",", "")
+        return float(text_value)
+    except (TypeError, ValueError):
+        return None
+
 def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not candidate:
         return {
