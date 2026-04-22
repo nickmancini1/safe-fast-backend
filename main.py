@@ -1101,12 +1101,18 @@ def _build_execution_quality_context(
     elif has_major_event_tomorrow:
         execution_quality_status = "caution"
         why = "A major macro event is in play tomorrow, so execution quality needs extra caution."
+    elif iv_context.get("hard_block") is True:
+        execution_quality_status = "fail"
+        why = iv_context.get("why") or "IV / pricing proxy is too elevated for a clean debit spread entry."
+    elif iv_status == "caution":
+        execution_quality_status = "caution"
+        why = iv_context.get("why") or "IV / pricing proxy is elevated, so execution quality needs extra caution."
     elif iv_status == "unconfirmed":
         execution_quality_status = "caution"
         why = "IV is still unconfirmed in this build, even though time window and liquidity are acceptable."
     elif liquidity_pass is True:
         execution_quality_status = "pass"
-        why = "Time window and liquidity are acceptable for execution."
+        why = iv_context.get("why") or "Time window and liquidity are acceptable for execution."
     else:
         execution_quality_status = "unconfirmed"
         why = "Execution quality is still unconfirmed from the available inputs."
@@ -1572,11 +1578,102 @@ def _build_liquidity_block(candidate: Optional[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
-def _build_iv_context() -> Dict[str, Any]:
+def _build_iv_context(candidate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not candidate:
+        return {
+            "ok": False,
+            "status": "unconfirmed",
+            "hard_block": False,
+            "source": "pricing_proxy",
+            "proxy_only": True,
+            "why": "No candidate available, so IV proxy cannot be evaluated.",
+        }
+
+    est_debit = _safe_float(candidate.get("est_debit"))
+    spread_market_width = _safe_float(candidate.get("spread_market_width"))
+    entry_slippage_vs_mid = _safe_float(candidate.get("entry_slippage_vs_mid"))
+    long_leg_width_pct = _safe_float(candidate.get("long_leg_width_pct_of_mid"))
+    short_leg_width_pct = _safe_float(candidate.get("short_leg_width_pct_of_mid"))
+
+    if (
+        est_debit in (None, 0)
+        or spread_market_width is None
+        or entry_slippage_vs_mid is None
+        or long_leg_width_pct is None
+        or short_leg_width_pct is None
+    ):
+        return {
+            "ok": False,
+            "status": "unconfirmed",
+            "hard_block": False,
+            "source": "pricing_proxy",
+            "proxy_only": True,
+            "why": "IV proxy is still unconfirmed because spread-width or slippage detail is missing.",
+        }
+
+    spread_width_pct_of_debit = round((spread_market_width / est_debit) * 100, 3)
+    slippage_pct_of_debit = round((entry_slippage_vs_mid / est_debit) * 100, 3)
+
+    caution_flags: List[str] = []
+    fail_flags: List[str] = []
+
+    if spread_width_pct_of_debit > 15:
+        fail_flags.append("spread_market_too_wide")
+    elif spread_width_pct_of_debit > 10:
+        caution_flags.append("spread_market_wide")
+
+    if slippage_pct_of_debit > 10:
+        fail_flags.append("entry_slippage_too_large")
+    elif slippage_pct_of_debit > 6:
+        caution_flags.append("entry_slippage_elevated")
+
+    if long_leg_width_pct > 18 or short_leg_width_pct > 18:
+        fail_flags.append("leg_widths_too_wide")
+    elif long_leg_width_pct > 12 or short_leg_width_pct > 12:
+        caution_flags.append("leg_widths_elevated")
+
+    if fail_flags:
+        return {
+            "ok": False,
+            "status": "elevated",
+            "hard_block": True,
+            "source": "pricing_proxy",
+            "proxy_only": True,
+            "spread_width_pct_of_debit": spread_width_pct_of_debit,
+            "slippage_pct_of_debit": slippage_pct_of_debit,
+            "long_leg_width_pct_of_mid": long_leg_width_pct,
+            "short_leg_width_pct_of_mid": short_leg_width_pct,
+            "flags": fail_flags,
+            "why": "IV / pricing proxy looks elevated for a debit spread. Treat as NO TRADE unless you explicitly accept stressed pricing.",
+        }
+
+    if caution_flags:
+        return {
+            "ok": True,
+            "status": "caution",
+            "hard_block": False,
+            "source": "pricing_proxy",
+            "proxy_only": True,
+            "spread_width_pct_of_debit": spread_width_pct_of_debit,
+            "slippage_pct_of_debit": slippage_pct_of_debit,
+            "long_leg_width_pct_of_mid": long_leg_width_pct,
+            "short_leg_width_pct_of_mid": short_leg_width_pct,
+            "flags": caution_flags,
+            "why": "IV / pricing proxy is workable but elevated. Debit spread is still possible, but expect less forgiving execution.",
+        }
+
     return {
-        "ok": False,
-        "status": "unconfirmed",
-        "why": "IV source is not wired into this build yet.",
+        "ok": True,
+        "status": "acceptable",
+        "hard_block": False,
+        "source": "pricing_proxy",
+        "proxy_only": True,
+        "spread_width_pct_of_debit": spread_width_pct_of_debit,
+        "slippage_pct_of_debit": slippage_pct_of_debit,
+        "long_leg_width_pct_of_mid": long_leg_width_pct,
+        "short_leg_width_pct_of_mid": short_leg_width_pct,
+        "flags": [],
+        "why": "IV / pricing proxy looks acceptable for a defined-risk debit spread.",
     }
 
 
@@ -4451,7 +4548,7 @@ def _build_structure_context(
         "continuation_window_late": continuation_ctx.get("exact_reason") == "late",
         "continuation_hold_proven": continuation_ctx.get("shelf_proven"),
         "continuation_trigger_level": continuation_ctx.get("trigger_level"),
-        "iv_state": "unconfirmed",
+        "iv_state": iv_context.get("status"),
         "setup_type": setup_ctx.get("setup_type"),
         "trend_label": setup_ctx.get("trend_label"),
         "allowed_setup": setup_ctx.get("allowed_setup"),
@@ -4488,6 +4585,7 @@ def _final_verdict(
     structure_context: Dict[str, Any],
     time_day_gate: Dict[str, Any],
     liquidity_context: Dict[str, Any],
+    iv_context: Optional[Dict[str, Any]],
     trigger_state: Dict[str, Any],
     wall_thesis_fit_context: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -4500,6 +4598,8 @@ def _final_verdict(
     ):
         return "NO_TRADE"
     if liquidity_context.get("liquidity_pass") is False:
+        return "NO_TRADE"
+    if (iv_context or {}).get("hard_block") is True:
         return "NO_TRADE"
     if (wall_thesis_fit_context or {}).get("wall_thesis_fit_status") == "fail":
         return "NO_TRADE"
@@ -4569,7 +4669,10 @@ def _build_chart_confirmation_block(
             "room_ratio": _status_field(structure_context.get("room_ratio"), structure_confirmed),
             "wall_thesis": _status_field(structure_context.get("wall_thesis"), structure_confirmed),
             "extension_state": _status_field(structure_context.get("extension_state"), structure_confirmed),
-            "iv_state": _status_field(structure_context.get("iv_state"), False),
+            "iv_state": _status_field(
+                structure_context.get("iv_state"),
+                structure_context.get("iv_state") not in {None, "unconfirmed"},
+            ),
             "setup_type": _status_field(structure_context.get("setup_type"), structure_confirmed),
             "trend_label": _status_field(structure_context.get("trend_label"), structure_confirmed),
             "open_positions_state": _status_field(request.open_positions, True),
@@ -6899,6 +7002,8 @@ async def _screen_ticker_candidate(
     ) if symbol else {"ok": False, "why": "no symbol"}
 
     liquidity_context = _build_liquidity_block(primary_candidate)
+    iv_context = _build_iv_context(primary_candidate)
+    structure_context["iv_state"] = iv_context.get("status")
     wall_thesis_fit = _build_wall_thesis_fit_context(
         option_type=option_type,
         structure_context=structure_context,
@@ -6922,6 +7027,7 @@ async def _screen_ticker_candidate(
         structure_context=structure_context,
         time_day_gate=time_day_gate,
         liquidity_context=liquidity_context,
+        iv_context=iv_context,
         trigger_state=trigger_state,
         wall_thesis_fit_context=wall_thesis_fit,
     )
@@ -8428,7 +8534,6 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         chart_check=chart_check,
     )
     targets_block = _build_targets_block(primary_candidate)
-    iv_context = _build_iv_context()
     python_validation_block = _build_python_validation(
         request=request,
         best_ticker=best_ticker,
