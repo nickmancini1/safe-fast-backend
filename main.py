@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_pending_window_patch2"
+BUILD_TAG = "macro_surface_v26_2026_04_21_pending_window_patch3"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -5963,10 +5963,18 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
     verdict_rank = {"TRADE": 0, "PENDING": 1, "NO_TRADE": 2}.get(final_verdict, 3)
     setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
 
+    continuation_main_blocker = str(continuation_context.get("main_blocker") or "").strip().lower()
+    continuation_waiting_for_first_break_close = (
+        continuation_main_blocker == "no_valid_trigger"
+        and continuation_context.get("reclaim_hold_proven") is True
+        and continuation_context.get("breakout_completed") is True
+        and structure.get("room_pass") is True
+    )
     continuation_progress_rank = (
-        0 if _continuation_one_more_hold_needed(continuation_context)
-        else 1 if str(continuation_context.get("main_blocker") or "").strip().lower() == "no_proven_hold"
-        else 2
+        0 if continuation_waiting_for_first_break_close
+        else 1 if _continuation_one_more_hold_needed(continuation_context)
+        else 2 if continuation_main_blocker == "no_proven_hold"
+        else 3
     )
 
     room_quality = structure.get("room_quality")
@@ -6131,12 +6139,9 @@ def _should_freeze_winner_to_raw_engine(
     if not raw_best_ticker:
         return False
 
-    if market_context.get("is_open") is False:
-        return True
-
-    if time_day_gate.get("fresh_entry_allowed") is False:
-        return True
-
+    # Do not blindly freeze to the raw engine winner after screening.
+    # Closed-session reads still need the screened winner to reflect the
+    # cleanest remaining SAFE-FAST structure rather than the raw options ranking.
     return False
 
 
