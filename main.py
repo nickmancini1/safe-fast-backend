@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_continuation_window_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_continuation_window_patch3"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4778,18 +4778,6 @@ def _build_user_facing_block(
                 "setup_state": "NO TRADE",
                 "why": reason,
             }
-        if structure_context.get("chop_risk") is True:
-            reason = "1H structure around the 50 EMA is not clean."
-            if market_closed_context:
-                reason = f"After-hours structural read: {reason}"
-            return {
-                "good_idea_now": "NO",
-                "ticker": ticker,
-                "action": action_when_blocked,
-                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                "setup_state": "NO TRADE",
-                "why": reason,
-            }
         if structure_context.get("room_hard_fail") is True or structure_context.get("room_pass") is False:
             reason = "Room to first wall is too tight for SAFE-FAST."
             if market_closed_context:
@@ -4840,6 +4828,33 @@ def _build_user_facing_block(
             }
         if structure_context.get("extension_state") == "extended":
             reason = "Move is extended versus the RTH 1H 50 EMA or too late relative to the first wall."
+            if market_closed_context:
+                reason = f"After-hours structural read: {reason}"
+            return {
+                "good_idea_now": "NO",
+                "ticker": ticker,
+                "action": action_when_blocked,
+                "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                "setup_state": "NO TRADE",
+                "why": reason,
+            }
+        if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message:
+            continuation_exact_reason = str(continuation_context.get("exact_reason") or "").strip().lower()
+            continuation_main_blocker = str(continuation_context.get("main_blocker") or "").strip().lower()
+            if continuation_exact_reason in {"early", "late"} or continuation_main_blocker in {"no_proven_hold", "no_valid_trigger", "move_too_extended"}:
+                reason = continuation_message
+                if market_closed_context:
+                    reason = f"After-hours structural read: {reason}"
+                return {
+                    "good_idea_now": "NO",
+                    "ticker": ticker,
+                    "action": action_when_blocked,
+                    "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                    "setup_state": "NO TRADE",
+                    "why": reason,
+                }
+        if structure_context.get("chop_risk") is True:
+            reason = "1H structure around the 50 EMA is not clean."
             if market_closed_context:
                 reason = f"After-hours structural read: {reason}"
             return {
@@ -5360,7 +5375,7 @@ def _build_checklist_block(
     continuation_blocker_overrides: List[str] = []
     continuation_override_allowed = bool(
         continuation_mode
-        and not any(item in failed_items for item in {"allowed_setup_type", "twentyfour_hour_supportive", "one_hour_clean_around_ema", "clear_room"})
+        and not any(item in failed_items for item in {"allowed_setup_type", "twentyfour_hour_supportive", "clear_room"})
     )
     if continuation_override_allowed:
         if continuation_context.get("exact_reason") == "late":
@@ -5781,8 +5796,8 @@ def _humanize_blocker_key(blocker: Any) -> str:
         "failed_breakout_hold": "a confirmed breakout hold",
         "next_bar_hold_failed": "a confirmed breakout hold",
         "ath_open_air": "rebuilt 1H structure near all-time highs",
-        "no_proven_hold": "a proven hold",
-        "no_valid_trigger": "the first clean break",
+        "no_proven_hold": "proven hold / base",
+        "no_valid_trigger": "the first clean break from the hold",
         "move_too_extended": "move too extended from the hold",
     }
     return mapping.get(key, key.replace("_", " "))
@@ -5801,7 +5816,7 @@ def _humanize_next_step(blocker: Any) -> str:
         "failed_breakout_hold": "Rebuild the breakout hold.",
         "next_bar_hold_failed": "Rebuild the breakout hold.",
         "ath_open_air": "Rebuild 1H structure near the highs.",
-        "no_proven_hold": "Let the hold/base prove itself.",
+        "no_proven_hold": "Wait for the hold/base to prove itself.",
         "no_valid_trigger": "Wait for the first completed break from the hold.",
         "move_too_extended": "Wait for a new hold to form before looking for another continuation entry.",
     }
@@ -7216,6 +7231,9 @@ def _build_two_path_block(
             "allowed_setup_type": "allowed setup type",
             "twentyfour_hour_supportive": "24H support",
             "one_hour_clean_around_ema": "clean 1H structure",
+            "no_proven_hold": "proven hold / base",
+            "no_valid_trigger": "first clean break from the hold",
+            "move_too_extended": "move too extended from the hold",
             "clear_room": "room pass",
             "early_enough": "early enough / not overextended",
             "clear_trigger": "live trigger",
@@ -7227,6 +7245,9 @@ def _build_two_path_block(
             "allowed_setup_type",
             "twentyfour_hour_supportive",
             "one_hour_clean_around_ema",
+            "no_proven_hold",
+            "no_valid_trigger",
+            "move_too_extended",
             "clear_room",
             "early_enough",
             "clear_trigger",
