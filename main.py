@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_shelf_chop_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_winner_hold_patch2"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -5020,6 +5020,22 @@ def _build_user_facing_block(
                 "setup_state": "NO TRADE",
                 "why": reason,
             }
+        hold_progress_message = _continuation_hold_progress_message(continuation_context)
+        if _continuation_family_detected(structure_context.get("continuation_context")) and (hold_progress_message or continuation_message):
+            continuation_exact_reason = str(continuation_context.get("exact_reason") or "").strip().lower()
+            continuation_main_blocker = str(continuation_context.get("main_blocker") or "").strip().lower()
+            if hold_progress_message or continuation_exact_reason in {"early", "late"} or continuation_main_blocker in {"no_proven_hold", "no_valid_trigger", "move_too_extended"}:
+                reason = hold_progress_message or continuation_message
+                if market_closed_context:
+                    reason = f"After-hours structural read: {reason}"
+                return {
+                    "good_idea_now": "NO",
+                    "ticker": ticker,
+                    "action": action_when_blocked,
+                    "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
+                    "setup_state": "NO TRADE",
+                    "why": reason,
+                }
         if structure_context.get("extension_state") == "extended":
             reason = "Move is extended versus the RTH 1H 50 EMA or too late relative to the first wall."
             if market_closed_context:
@@ -5032,21 +5048,6 @@ def _build_user_facing_block(
                 "setup_state": "NO TRADE",
                 "why": reason,
             }
-        if _continuation_family_detected(structure_context.get("continuation_context")) and continuation_message:
-            continuation_exact_reason = str(continuation_context.get("exact_reason") or "").strip().lower()
-            continuation_main_blocker = str(continuation_context.get("main_blocker") or "").strip().lower()
-            if continuation_exact_reason in {"early", "late"} or continuation_main_blocker in {"no_proven_hold", "no_valid_trigger", "move_too_extended"}:
-                reason = continuation_message
-                if market_closed_context:
-                    reason = f"After-hours structural read: {reason}"
-                return {
-                    "good_idea_now": "NO",
-                    "ticker": ticker,
-                    "action": action_when_blocked,
-                    "invalidation": f"1H close beyond EMA50 against thesis. Current EMA50_1h anchor: {ema_text}.",
-                    "setup_state": "NO TRADE",
-                    "why": reason,
-                }
         if structure_context.get("chop_risk") is True:
             reason = "1H structure around the 50 EMA is not clean."
             if market_closed_context:
@@ -5631,6 +5632,29 @@ def _build_checklist_block(
 
 
 
+
+def _continuation_one_more_hold_needed(continuation_context: Optional[Dict[str, Any]]) -> bool:
+    continuation_context = continuation_context or {}
+    if str(continuation_context.get("main_blocker") or "").strip().lower() != "no_proven_hold":
+        return False
+    if str(continuation_context.get("exact_reason") or "").strip().lower() != "early":
+        return False
+    if continuation_context.get("shelf_proven") is True:
+        return False
+    if continuation_context.get("breakout_completed") is not True:
+        return False
+    return True
+
+
+def _continuation_hold_progress_message(continuation_context: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not _continuation_one_more_hold_needed(continuation_context):
+        return None
+    return (
+        "One completed 1H candle has held above the break area. "
+        "SAFE-FAST still needs 1 more completed 1H candle to prove the hold."
+    )
+
+
 def _failed_reason_messages(
     checklist: Dict[str, Any],
     time_day_gate: Dict[str, Any],
@@ -5673,7 +5697,10 @@ def _failed_reason_messages(
         if msg:
             reasons.append(msg)
 
-    if continuation_family and continuation_context.get("status_message"):
+    hold_progress_message = _continuation_hold_progress_message(continuation_context)
+    if continuation_family and hold_progress_message:
+        reasons.insert(0, hold_progress_message)
+    elif continuation_family and continuation_context.get("status_message"):
         reasons.insert(0, continuation_context.get("status_message"))
     if structure_context.get("extension_state") == "extended":
         reasons.append("move is extended versus the 1H 50 EMA")
@@ -5695,10 +5722,17 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
     liquidity = item.get("liquidity_context") or {}
     trigger_state = item.get("trigger_state") or {}
     checklist = item.get("checklist") or {}
+    continuation_context = structure.get("continuation_context") or {}
     final_verdict = item.get("final_verdict", "NO_TRADE")
 
     verdict_rank = {"TRADE": 0, "PENDING": 1, "NO_TRADE": 2}.get(final_verdict, 3)
     setup_rank = 0 if structure.get("allowed_setup") is True else 1 if structure.get("allowed_setup") is None else 2
+
+    continuation_progress_rank = (
+        0 if _continuation_one_more_hold_needed(continuation_context)
+        else 1 if str(continuation_context.get("main_blocker") or "").strip().lower() == "no_proven_hold"
+        else 2
+    )
 
     room_quality = structure.get("room_quality")
     room_rank_map = {"pass": 0, "caution": 1, "fail": 2}
@@ -5721,6 +5755,7 @@ def _screened_sort_key(item: Dict[str, Any]) -> Any:
     return (
         verdict_rank,
         setup_rank,
+        continuation_progress_rank,
         room_rank,
         wall_rank,
         ext_rank,
@@ -5884,26 +5919,18 @@ def _select_screened_best_candidate(
             if item.get("symbol") == raw_engine_best_ticker:
                 return item
 
-    any_screened_live_candidate = any(
-        item.get("final_verdict") in {"TRADE", "PENDING"}
-        for item in screened_candidates
-    )
+    ranked_pool = [item for item in screened_candidates if item.get("primary_candidate")]
+    if not ranked_pool:
+        ranked_pool = list(screened_candidates)
 
-    if not any_screened_live_candidate and raw_engine_best_ticker:
-        for item in screened_candidates:
-            if item.get("symbol") == raw_engine_best_ticker:
-                return item
+    live_pool = [
+        item for item in ranked_pool
+        if item.get("final_verdict") in {"TRADE", "PENDING"}
+    ]
+    if live_pool:
+        return live_pool[0]
 
-    with_primary = [item for item in screened_candidates if item.get("primary_candidate")]
-    if with_primary:
-        return with_primary[0]
-
-    if raw_engine_best_ticker:
-        for item in screened_candidates:
-            if item.get("symbol") == raw_engine_best_ticker:
-                return item
-
-    return None
+    return ranked_pool[0] if ranked_pool else None
 
 
 
