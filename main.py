@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_room_ath_patch4"
+BUILD_TAG = "macro_surface_v26_2026_04_21_room_ath_patch5"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -5514,7 +5514,17 @@ def _build_checklist_block(
         {"item": "allowed_setup_type", "yes": bool(_is_allowed_setup_type_name(structure_context.get("setup_type")) or continuation_mode)},
         {"item": "twentyfour_hour_supportive", "yes": bool(structure_context.get("twentyfour_hour_supportive") is not False)},
         {"item": "one_hour_clean_around_ema", "yes": bool(price_side in {"above", "below"} and structure_context.get("chop_risk") is False and structure_context.get("noisy_chop_explicit") is not True)},
-        {"item": "clear_room", "yes": bool(structure_context.get("room_hard_fail") is not True and structure_context.get("room_pass") is not False and structure_context.get("ath_open_air_blocks_now") is not True)},
+        {"item": "clear_room", "yes": bool(
+            structure_context.get("room_hard_fail") is not True
+            and structure_context.get("ath_open_air_blocks_now") is not True
+            and (
+                structure_context.get("room_pass") is not False
+                or (
+                    structure_context.get("first_wall") is None
+                    and structure_context.get("price_vs_ema50_1h", price_side) == "above"
+                )
+            )
+        )},
         {"item": "early_enough", "yes": early_enough_yes},
         {"item": "clear_trigger", "yes": clear_trigger_yes},
         {"item": "liquidity_ok", "yes": bool(liquidity_context.get("liquidity_pass") is True)},
