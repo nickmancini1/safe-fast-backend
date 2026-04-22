@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_iv_gate_patch5"
+BUILD_TAG = "macro_surface_v26_2026_04_21_room_ath_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -3054,6 +3054,22 @@ def _find_wall_levels(
         levels = _condense_levels(candidate_levels, tolerance, descending=False)
         first_wall = levels[0] if levels else None
         next_pocket = levels[1] if len(levels) > 1 else None
+
+        if levels:
+            cluster_span = levels[-1] - levels[0]
+            nearest_gap = levels[0] - latest_close if levels[0] is not None else None
+            farthest_gap = levels[-1] - latest_close if levels[-1] is not None else None
+            stale_top_cluster_cleared = bool(
+                len(levels) <= 3
+                and cluster_span <= max(tolerance * 1.25, latest_close * 0.0012, 0.20)
+                and nearest_gap is not None
+                and farthest_gap is not None
+                and nearest_gap <= max(latest_close * 0.0018, 0.35)
+                and farthest_gap <= max(latest_close * 0.0030, 0.60)
+            )
+            if stale_top_cluster_cleared:
+                first_wall = None
+                next_pocket = None
     else:
         candidate_levels = [
             round(c["low"], 2)
