@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_pending_next_session_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_open_state_propagation_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -10894,12 +10894,171 @@ def apply_morning_open_classifier_patch(result: Dict[str, Any]) -> Dict[str, Any
             "actionable_now": bool(state == "VALID_ON_OPEN"),
         }
 
+
+
+def apply_open_state_propagation_patch(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Propagates the next-session open carry-forward state across the user-facing
+    and approval-facing surfaces so stale NO_TRIGGER language does not survive
+    once a completed trigger is already locked after hours.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("result must be a dict")
+
+    classification = _nested_get(result, "next_session_open_decision")
+    if not isinstance(classification, dict):
+        classification = {}
+
+    pending_next_session = bool(
+        _nested_get(result, "approval_context", "pending_next_session") is True
+        or _nested_get(result, "entry_context", "pending_next_session") is True
+        or _nested_get(result, "intrabar_signal_context", "pending_next_session") is True
+        or _nested_get(result, "decision_context", "setup_state") == "PENDING NEXT SESSION"
+        or _nested_get(result, "simple_output", "setup_state") == "PENDING NEXT SESSION"
+    )
+
+    if not pending_next_session and not classification:
+        return result
+
+    state = classification.get("state") or _nested_get(result, "approval_context", "next_session_open_state_if_unchanged") or _nested_get(result, "simple_output", "next_session_open_state_if_unchanged")
+    note = classification.get("note") or _nested_get(result, "approval_context", "next_session_open_note") or _nested_get(result, "simple_output", "what_matters_next_session")
+    trigger_level = classification.get("trigger_level")
+    if trigger_level is None:
+        trigger_level = (
+            _nested_get(result, "trigger_context", "trigger_level")
+            or _nested_get(result, "live_map", "continuation", "trigger_level")
+            or _nested_get(result, "live_map", "continuation", "shelf_trigger_level")
+        )
+
+    market_open = bool(classification.get("market_open")) if classification else bool(_nested_get(result, "market_context", "is_open"))
+    fresh_entry_allowed = bool(
+        classification.get("fresh_entry_allowed") if classification else False
+    ) or bool(_nested_get(result, "time_day_gate", "fresh_entry_allowed") is True)
+
+    action_by_state = {
+        "VALID_ON_OPEN": "entry valid on open",
+        "VALID_ON_RETEST_ONLY": "valid on retest only",
+        "INVALID_GAP_TOO_EXTENDED": "stand down",
+        None: "recheck next session open",
+    }
+    reason_by_state = {
+        "VALID_ON_OPEN": f"Completed 1H trigger is already locked above {trigger_level}; carry-forward stays controlled enough for an open entry." if trigger_level is not None else "Completed 1H trigger is already locked; carry-forward stays controlled enough for an open entry.",
+        "VALID_ON_RETEST_ONLY": f"Completed 1H trigger is already locked above {trigger_level}; only a controlled retest keeps the carry-forward valid." if trigger_level is not None else "Completed 1H trigger is already locked; only a controlled retest keeps the carry-forward valid.",
+        "INVALID_GAP_TOO_EXTENDED": f"Completed 1H trigger was locked above {trigger_level}, but any open continuation is now too extended." if trigger_level is not None else "Completed 1H trigger was locked, but any open continuation is now too extended.",
+        None: f"Completed 1H trigger is already locked above {trigger_level}, but the market is closed. Re-check next session open before entry." if trigger_level is not None else "Completed 1H trigger is already locked, but the market is closed. Re-check next session open before entry.",
+    }
+
+    top_state = state if market_open else "PENDING_NEXT_SESSION"
+    top_action = action_by_state.get(state, "recheck next session open") if market_open else "recheck next session open"
+    top_reason = reason_by_state.get(state) if market_open else reason_by_state.get(None)
+
+    result["next_session_open_decision"] = {
+        **classification,
+        "state": top_state,
+        "action": top_action,
+        "reason": top_reason,
+        "locked_trigger_level": trigger_level,
+        "market_open": market_open,
+        "fresh_entry_allowed": fresh_entry_allowed,
+    }
+
+    simple = _ensure_dict(result, "simple_output")
+    if not market_open:
+        simple["headline"] = "Completed trigger locked after hours."
+        simple["action"] = "recheck next session open"
+        simple["setup_state"] = "PENDING NEXT SESSION"
+        simple["why"] = top_reason
+        simple["primary_blocker"] = "market closed after completed trigger"
+        simple["primary_blocker_key"] = "completed_candle_trigger_market_closed"
+        simple["next_flip_needed"] = "market open"
+        simple["next_flip_needed_key"] = "market_open"
+        simple["signal_present"] = True
+        if state:
+            simple["next_session_open_state_if_unchanged"] = state
+        if note:
+            simple["what_matters_next_session"] = note
+
+    decision_ctx = _ensure_dict(result, "decision_context")
+    decision_ctx["action"] = top_action
+    decision_ctx["setup_state"] = "PENDING NEXT SESSION" if not market_open else decision_ctx.get("setup_state", top_state)
+    decision_ctx["primary_blocker"] = "market_closed_after_completed_trigger" if not market_open else decision_ctx.get("primary_blocker", top_state.lower() if isinstance(top_state, str) else "state_pending")
+    decision_ctx["next_session_open_state_if_unchanged"] = state
+    decision_ctx["next_session_open_decision"] = result["next_session_open_decision"]
+
+    blocker_ctx = _ensure_dict(result, "blocker_context")
+    blocker_ctx["primary_blocker"] = "market_closed_after_completed_trigger" if not market_open else blocker_ctx.get("primary_blocker")
+    blocker_ctx["trigger_reason"] = "completed_candle_trigger_market_closed" if not market_open else blocker_ctx.get("trigger_reason")
+    blocker_ctx["structure_ready"] = True
+    blocker_ctx["next_session_open_state_if_unchanged"] = state
+
+    entry_ctx = _ensure_dict(result, "entry_context")
+    entry_ctx["pending_next_session"] = True if not market_open else entry_ctx.get("pending_next_session")
+    entry_ctx["mid_candle_entry_state"] = "PENDING_NEXT_SESSION" if not market_open else (state or entry_ctx.get("mid_candle_entry_state"))
+    entry_ctx["completed_candle_entry_state"] = "PENDING_NEXT_SESSION" if not market_open else (state or entry_ctx.get("completed_candle_entry_state"))
+    entry_ctx["action"] = "wait for next session" if not market_open else top_action
+    entry_ctx["setup_state"] = "NO TRADE" if not market_open else entry_ctx.get("setup_state")
+    entry_ctx["next_session_open_state_if_unchanged"] = state
+
+    intrabar_ctx = _ensure_dict(result, "intrabar_signal_context")
+    intrabar_ctx["pending_next_session"] = True if not market_open else intrabar_ctx.get("pending_next_session")
+    intrabar_ctx["primary_blocker"] = "market_closed_after_completed_trigger" if not market_open else intrabar_ctx.get("primary_blocker")
+    intrabar_ctx["signal_note"] = "Completed trigger locked after hours. Re-check next session open before entry." if not market_open else intrabar_ctx.get("signal_note")
+    intrabar_ctx["next_session_open_state_if_unchanged"] = state
+
+    approval_ctx = _ensure_dict(result, "approval_context")
+    approval_ctx["approval_status"] = "PENDING_NEXT_SESSION" if not market_open else approval_ctx.get("approval_status", state)
+    approval_ctx["next_flip_needed"] = "market_open" if not market_open else approval_ctx.get("next_flip_needed", "market_open")
+    approval_ctx["primary_blocker"] = "market_closed_after_completed_trigger" if not market_open else approval_ctx.get("primary_blocker")
+    approval_ctx["pending_next_session"] = True if not market_open else approval_ctx.get("pending_next_session")
+    approval_ctx["next_session_open_state_if_unchanged"] = state
+    approval_ctx["next_session_open_note"] = note
+
+    approval_req_ctx = _ensure_dict(result, "approval_requirements_context")
+    approval_req_ctx["approval_path_status"] = "PENDING_NEXT_SESSION" if not market_open else approval_req_ctx.get("approval_path_status", state)
+    approval_req_ctx["next_flip_needed"] = "market_open" if not market_open else approval_req_ctx.get("next_flip_needed")
+    approval_req_ctx["next_session_open_state_if_unchanged"] = state
+    approval_req_ctx["next_session_open_note"] = note
+
+    approval_flip_ctx = _ensure_dict(result, "approval_flip_context")
+    approval_flip_ctx["next_flip_needed"] = "market_open" if not market_open else approval_flip_ctx.get("next_flip_needed")
+    approval_flip_ctx["primary_blocker"] = "market_closed_after_completed_trigger" if not market_open else approval_flip_ctx.get("primary_blocker")
+    approval_flip_ctx["approval_status"] = "PENDING_NEXT_SESSION" if not market_open else approval_flip_ctx.get("approval_status")
+    approval_flip_ctx["next_session_open_state_if_unchanged"] = state
+
+    final_reason_ctx = _ensure_dict(result, "final_reason_context")
+    final_reason_ctx["final_reason"] = top_reason
+    final_reason_ctx["primary_blocker"] = "market_closed_after_completed_trigger" if not market_open else final_reason_ctx.get("primary_blocker")
+    final_reason_ctx["next_session_open_state_if_unchanged"] = state
+
+    reason_stack_ctx = _ensure_dict(result, "reason_stack_context")
+    reason_stack_ctx["top_line_reason"] = top_reason
+    reason_stack_ctx["primary_blocker"] = "market_closed_after_completed_trigger" if not market_open else reason_stack_ctx.get("primary_blocker")
+    reason_stack_ctx["next_session_open_state_if_unchanged"] = state
+
+    screened_best_ctx = _ensure_dict(result, "screened_best_context")
+    screened_best_ctx["screened_primary_blocker"] = "market_closed_after_completed_trigger" if not market_open else screened_best_ctx.get("screened_primary_blocker")
+    screened_best_ctx["next_session_open_state_if_unchanged"] = state
+
+    compact = result.get("compact_ticker_summaries")
+    best_ticker = result.get("best_ticker")
+    if isinstance(compact, list) and best_ticker:
+        for item in compact:
+            if isinstance(item, dict) and item.get("ticker") == best_ticker:
+                item["primary_blocker"] = "market closed after completed trigger" if not market_open else item.get("primary_blocker")
+                item["primary_blocker_key"] = "completed_candle_trigger_market_closed" if not market_open else item.get("primary_blocker_key")
+                item["trigger_reason"] = "completed candle trigger market closed" if not market_open else item.get("trigger_reason")
+                item["trigger_reason_key"] = "completed_candle_trigger_market_closed" if not market_open else item.get("trigger_reason_key")
+                item["next_session_open_state_if_unchanged"] = state
+                break
+
     return result
 
 def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
+
     payload = payload or {}
     payload = apply_pending_next_session_patch(payload)
     payload = apply_morning_open_classifier_patch(payload)
+    payload = apply_open_state_propagation_patch(payload)
     contracts = _contracts_bundle_from_payload(payload)
     if contracts.get("state") or contracts.get("transition") or contracts.get("alert"):
         payload["contracts"] = contracts
