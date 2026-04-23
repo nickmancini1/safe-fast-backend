@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_preserve_locked_trigger_patch7"
+BUILD_TAG = "macro_surface_v26_2026_04_21_preserve_locked_trigger_patch8"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4418,6 +4418,117 @@ def _build_continuation_window_context(
             selected["main_blocker"] = "move_too_extended"
         elif later_completed_break_seen:
             selected["status_message"] = "The first completed 1H shelf break already happened. SAFE-FAST is tracking the trigger as already earned."
+    except Exception:
+        pass
+
+    # Patch8: broader label-only fix.
+    # Even if the currently selected snapshot has rerolled to a newer shelf, do not keep saying
+    # "waiting for the first completed break" when an older preserved/carry-forward shelf already
+    # got its first completed break. In that case there is no *fresh* continuation trigger now.
+    try:
+        if (
+            selected.get("main_blocker") == "no_valid_trigger"
+            and "waiting for the first completed" in str(selected.get("status_message") or "").lower()
+            and completed_candles
+        ):
+            def _candle_et_date_local(candle):
+                raw_time = (candle or {}).get("time_iso")
+                if not raw_time:
+                    return None
+                try:
+                    parsed = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=NY_TZ)
+                    return parsed.astimezone(NY_TZ).date()
+                except Exception:
+                    return None
+
+            latest_completed_et_date_local = _candle_et_date_local(completed_candles[-1])
+            prior_break_seen = False
+            prior_break_trigger_level = None
+            prior_break_time_iso = None
+            prior_break_close = None
+
+            if latest_completed_et_date_local is not None:
+                recent_for_label = completed_candles[-24:] if len(completed_candles) > 24 else list(completed_candles)
+                recent_len_local = len(recent_for_label)
+                for shelf_candle_count_local in (2, 3, 4):
+                    if recent_len_local < shelf_candle_count_local + 1:
+                        continue
+                    for break_idx_local in range(shelf_candle_count_local, recent_len_local):
+                        shelf_start_local = break_idx_local - shelf_candle_count_local
+                        shelf_candles_local = recent_for_label[shelf_start_local:break_idx_local]
+                        pre_shelf_candles_local = recent_for_label[:shelf_start_local]
+                        break_candle_local = recent_for_label[break_idx_local]
+                        break_et_date_local = _candle_et_date_local(break_candle_local)
+                        if break_et_date_local is None:
+                            continue
+                        if break_et_date_local == latest_completed_et_date_local:
+                            continue
+                        if (latest_completed_et_date_local - break_et_date_local).days != 1:
+                            continue
+
+                        snap_local = _build_continuation_window_snapshot(
+                            option_type=option_type,
+                            shelf_candles=shelf_candles_local,
+                            pre_shelf_candles=pre_shelf_candles_local,
+                            atr14=atr14,
+                            ema50_1h=ema50_1h,
+                            current_price=latest_close,
+                            break_candle=break_candle_local,
+                            room_pass=room_pass,
+                            extension_blocks_now=extension_blocks_now,
+                        )
+                        trig_local = _to_float(snap_local.get("trigger_level"))
+                        if trig_local is None:
+                            continue
+                        if not bool(snap_local.get("breakout_completed")):
+                            continue
+                        if not bool(snap_local.get("reclaim_hold_proven")):
+                            continue
+
+                        for later_candle_local in recent_for_label:
+                            later_time_local = later_candle_local.get("time_iso")
+                            later_close_local = _to_float(later_candle_local.get("close"))
+                            if later_time_local is None or later_close_local is None:
+                                continue
+                            if later_time_local <= (break_candle_local.get("time_iso") or ""):
+                                continue
+                            crossed_local = later_close_local > trig_local if option_type == "C" else later_close_local < trig_local
+                            if crossed_local:
+                                prior_break_seen = True
+                                prior_break_trigger_level = trig_local
+                                prior_break_time_iso = later_time_local
+                                prior_break_close = later_close_local
+                                break
+                        if prior_break_seen:
+                            break
+                    if prior_break_seen:
+                        break
+
+            if prior_break_seen:
+                selected["prior_completed_shelf_break_seen"] = True
+                selected["prior_completed_shelf_break_trigger_level"] = _round_or_none(prior_break_trigger_level, 4)
+                selected["prior_completed_shelf_break_time_iso"] = prior_break_time_iso
+                selected["prior_completed_shelf_break_close"] = _round_or_none(prior_break_close, 4)
+
+                if latest_close is not None and prior_break_trigger_level is not None:
+                    if option_type == "C" and latest_close < prior_break_trigger_level:
+                        selected["status_message"] = "A prior completed 1H shelf break already happened. Price is now back below that earlier trigger, so there is no fresh continuation trigger now."
+                        selected["exact_reason"] = "spent"
+                        selected["main_blocker"] = "no_valid_trigger"
+                    elif option_type == "P" and latest_close > prior_break_trigger_level:
+                        selected["status_message"] = "A prior completed 1H shelf break already happened. Price is now back above that earlier trigger, so there is no fresh continuation trigger now."
+                        selected["exact_reason"] = "spent"
+                        selected["main_blocker"] = "no_valid_trigger"
+                    elif extension_blocks_now:
+                        selected["status_message"] = "The first completed 1H shelf break already happened and the move is now extended."
+                        selected["exact_reason"] = "late"
+                        selected["main_blocker"] = "move_too_extended"
+                    else:
+                        selected["status_message"] = "The first completed 1H shelf break already happened. SAFE-FAST is not waiting for a first break anymore."
+                        selected["exact_reason"] = "spent"
+                        selected["main_blocker"] = "no_valid_trigger"
     except Exception:
         pass
 
