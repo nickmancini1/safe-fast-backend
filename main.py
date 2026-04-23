@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_stale_reason_cleanup_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_remaining_reason_tail_cleanup_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -8853,6 +8853,113 @@ def _build_on_demand_unavailable_payload(
 
 
 
+def _format_locked_trigger_reason(trigger_level: Any) -> str:
+    level = _to_float(trigger_level)
+    level_text = f"{level:.2f}" if level is not None else "the trigger level"
+    return f"Completed 1H trigger is already locked above {level_text}, but the market is closed. Re-check next session open before entry."
+
+
+def _format_locked_trigger_retest_reason(trigger_level: Any) -> str:
+    return _format_locked_trigger_reason(trigger_level) + " If unchanged, carry-forward is retest-only."
+
+
+def _apply_remaining_reason_tail_cleanup(response_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(response_payload, dict):
+        return response_payload
+
+    decision_context = response_payload.get("decision_context") or {}
+    trigger_context = response_payload.get("trigger_context") or {}
+    simple_output = response_payload.get("simple_output") or {}
+    live_map = response_payload.get("live_map") or {}
+
+    locked_after_hours = (
+        decision_context.get("primary_blocker") == "market_closed_after_completed_trigger"
+        or trigger_context.get("trigger_reason") == "completed_candle_trigger_market_closed"
+        or simple_output.get("primary_blocker_key") == "completed_candle_trigger_market_closed"
+    )
+    if not locked_after_hours:
+        return response_payload
+
+    trigger_level = (
+        (((live_map.get("continuation") or {}).get("trigger_level")))
+        or trigger_context.get("trigger_level")
+        or simple_output.get("locked_trigger_level")
+    )
+    locked_reason = _format_locked_trigger_reason(trigger_level)
+    retest_reason = _format_locked_trigger_retest_reason(trigger_level)
+
+    # top-level / handoff surfaces
+    winner_context = response_payload.get("winner_context") or {}
+    if winner_context.get("changed_after_screening"):
+        winner_context["why_changed_after_screening"] = locked_reason
+
+    engine_context = response_payload.get("engine_context") or {}
+    if engine_context.get("normalized_best_ticker") or engine_context.get("normalized_status"):
+        engine_context["normalized_reason"] = locked_reason
+
+    if isinstance(decision_context.get("normalized_engine"), dict):
+        decision_context["normalized_engine"]["reason"] = locked_reason
+    if isinstance(decision_context.get("screened"), dict):
+        decision_context["screened"]["reason"] = locked_reason
+
+    # live map tail surfaces
+    continuation = live_map.get("continuation") or {}
+    if continuation:
+        continuation["status_message"] = retest_reason
+        continuation["main_blocker"] = "market_closed_after_completed_trigger"
+
+    setup_route = live_map.get("setup_route") or {}
+    if setup_route:
+        setup_route["why_setup_route_passes_or_fails"] = retest_reason
+
+    trigger_scan = live_map.get("trigger_scan") or {}
+    if trigger_scan:
+        trigger_scan["why_trigger_scan_passes_or_fails"] = locked_reason
+
+    extension_quality = live_map.get("extension_quality") or {}
+    if extension_quality:
+        extension_quality["continuation_status_message"] = retest_reason
+
+    # remaining stale tails identified from the last stable response
+    if isinstance(trigger_context, dict):
+        trigger_context["why_trigger_scan_passes_or_fails"] = locked_reason
+
+    trigger_state = response_payload.get("trigger_state") or {}
+    if trigger_state:
+        trigger_state["continuation_status_message"] = retest_reason
+
+    structure_context = response_payload.get("structure_context") or {}
+    if structure_context:
+        structure_context["continuation_reason_text"] = retest_reason
+
+    final_reason_context = response_payload.get("final_reason_context") or {}
+    if final_reason_context:
+        final_reason_context["screened_reason"] = locked_reason
+
+    reason_stack_context = response_payload.get("reason_stack_context") or {}
+    if reason_stack_context:
+        reason_stack_context["screened_reason"] = locked_reason
+
+    winner_shift_context = response_payload.get("winner_shift_context") or {}
+    if winner_shift_context:
+        winner_shift_context["screened_reason"] = locked_reason
+
+    screened_best_context = response_payload.get("screened_best_context") or {}
+    if screened_best_context:
+        screened_best_context["screened_reason"] = locked_reason
+
+    setup_eligibility_context = response_payload.get("setup_eligibility_context") or {}
+    if setup_eligibility_context:
+        setup_eligibility_context["setup_route_reason"] = retest_reason
+
+    # compact summaries
+    for item in response_payload.get("compact_ticker_summaries") or []:
+        if isinstance(item, dict) and item.get("ticker") == response_payload.get("best_ticker"):
+            item["reason"] = locked_reason
+
+    return response_payload
+
+
 async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
 
     clean_option_type = _clean_option_type(request.option_type)
@@ -9367,6 +9474,7 @@ async def _build_on_demand_payload(request: OnDemandRequest) -> Dict[str, Any]:
         state_contract=response_payload.get("state_contract") or {},
         targets=response_payload.get("targets") or {},
     )
+    response_payload = _apply_remaining_reason_tail_cleanup(response_payload)
     return response_payload
 
 
@@ -12875,7 +12983,7 @@ async def safe_fast_on_demand_default_simple() -> Any:
         "screened_best_context": payload.get("screened_best_context"),
         "failed_reasons": payload.get("failed_reasons"),
     }
-    
+
 
 @app.post(
     "/safe-fast/on-demand",
