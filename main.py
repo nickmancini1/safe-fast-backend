@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_retest_classifier_restore_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_locked_trigger_consistency_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -10582,9 +10582,6 @@ def apply_pending_next_session_patch(
         result["final_verdict"] = "PENDING_NEXT_SESSION"
 
     # Decision / simple output should stop saying generic NO TRADE.
-    next_open_decision = _ensure_dict(result, "next_session_open_decision")
-    next_open_decision["next_session_open_state_if_unchanged"] = state
-
     decision_ctx = _ensure_dict(result, "decision_context")
     decision_ctx["setup_state"] = "PENDING NEXT SESSION"
     decision_ctx["action"] = "recheck next session open"
@@ -11148,20 +11145,10 @@ def apply_locked_trigger_consistency_patch(result: Dict[str, Any]) -> Dict[str, 
     )
 
     state = (
-        approval_ctx.get("next_session_open_state_if_unchanged")
+        _nested_get(result, "next_session_open_decision", "state")
+        or approval_ctx.get("next_session_open_state_if_unchanged")
         or simple.get("next_session_open_state_if_unchanged")
-        or _nested_get(result, "decision_context", "next_session_open_state_if_unchanged")
-        or (
-            _nested_get(result, "next_session_open_decision", "state")
-            if _nested_get(result, "next_session_open_decision", "state") in {"VALID_ON_OPEN", "VALID_ON_RETEST_ONLY", "INVALID_GAP_TOO_EXTENDED"}
-            else None
-        )
     )
-
-    if state is None:
-        # Closed-session carry-forward keeps its descriptive action state separate
-        # from the top-level PENDING_NEXT_SESSION status.
-        state = "VALID_ON_RETEST_ONLY"
 
     # Trigger surfaces should agree that the completed trigger is locked.
     trigger_ctx["structural_trigger_present"] = True
