@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_locked_trigger_consistency_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_retest_hint_restore_patch2"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -11320,6 +11320,77 @@ def apply_locked_trigger_consistency_patch(result: Dict[str, Any]) -> Dict[str, 
 
     return result
 
+
+
+def apply_retest_hint_restore_patch(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Safe descriptive restore: keep the stable PENDING_NEXT_SESSION state model,
+    but surface the more useful morning hint without mutating approval enums or
+    other live gating fields that downstream code may depend on.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("result must be a dict")
+
+    approval_ctx = _ensure_dict(result, "approval_context")
+    trigger_ctx = _ensure_dict(result, "trigger_context")
+    simple = _ensure_dict(result, "simple_output")
+    market_ctx = _ensure_dict(result, "market_context")
+
+    market_open = bool(market_ctx.get("is_open"))
+    locked_trigger = bool(
+        trigger_ctx.get("completed_candle_trigger_present") is True
+        or trigger_ctx.get("structural_trigger_present") is True
+        or approval_ctx.get("approval_status") == "PENDING_NEXT_SESSION"
+        or simple.get("setup_state") == "PENDING NEXT SESSION"
+    )
+    if market_open or not locked_trigger:
+        return result
+
+    hint = "VALID_ON_RETEST_ONLY"
+    hint_note = "Carry-forward can stay valid, but only on a controlled hold/retest near the locked trigger."
+
+    simple["next_session_open_hint_if_unchanged"] = hint
+    simple["what_matters_next_session"] = hint_note
+
+    decision_ctx = _ensure_dict(result, "decision_context")
+    blocker_ctx = _ensure_dict(result, "blocker_context")
+    entry_ctx = _ensure_dict(result, "entry_context")
+    intrabar_ctx = _ensure_dict(result, "intrabar_signal_context")
+    approval_req_ctx = _ensure_dict(result, "approval_requirements_context")
+    approval_flip_ctx = _ensure_dict(result, "approval_flip_context")
+    final_reason_ctx = _ensure_dict(result, "final_reason_context")
+    reason_stack_ctx = _ensure_dict(result, "reason_stack_context")
+    screened_best_ctx = _ensure_dict(result, "screened_best_context")
+
+    for ctx in [
+        decision_ctx,
+        blocker_ctx,
+        entry_ctx,
+        intrabar_ctx,
+        approval_ctx,
+        approval_req_ctx,
+        approval_flip_ctx,
+        final_reason_ctx,
+        reason_stack_ctx,
+        screened_best_ctx,
+    ]:
+        ctx["next_session_open_hint_if_unchanged"] = hint
+
+    next_open_decision = decision_ctx.get("next_session_open_decision")
+    if isinstance(next_open_decision, dict):
+        next_open_decision["hint_if_unchanged"] = hint
+        next_open_decision["hint_note"] = hint_note
+
+    compact = result.get("compact_ticker_summaries")
+    best_ticker = result.get("best_ticker")
+    if isinstance(compact, list) and best_ticker:
+        for item in compact:
+            if isinstance(item, dict) and item.get("ticker") == best_ticker:
+                item["next_session_open_hint_if_unchanged"] = hint
+                break
+
+    return result
+
 def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     payload = payload or {}
@@ -11327,6 +11398,7 @@ def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = apply_morning_open_classifier_patch(payload)
     payload = apply_open_state_propagation_patch(payload)
     payload = apply_locked_trigger_consistency_patch(payload)
+    payload = apply_retest_hint_restore_patch(payload)
     contracts = _contracts_bundle_from_payload(payload)
     if contracts.get("state") or contracts.get("transition") or contracts.get("alert"):
         payload["contracts"] = contracts
