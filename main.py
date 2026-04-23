@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_preserve_locked_trigger_patch4"
+BUILD_TAG = "macro_surface_v26_2026_04_21_preserve_locked_trigger_patch5"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -6381,26 +6381,26 @@ def _select_screened_best_candidate(
     if not ranked_pool:
         ranked_pool = list(screened_candidates)
 
-    if raw_engine_pick and raw_engine_pick in ranked_pool:
-        raw_structure = raw_engine_pick.get("structure_context") or {}
-        raw_trigger = raw_engine_pick.get("trigger_state") or {}
-        raw_checklist = raw_engine_pick.get("checklist") or {}
-        raw_reason = raw_engine_pick.get("reason")
-        raw_effective_failed = _effective_blockers(
-            raw_checklist,
-            screened_reason=raw_reason,
-        )
-        raw_only_clean_ema_blocker = (
-            bool(raw_effective_failed)
-            and set(raw_effective_failed) <= {"one_hour_clean_around_ema"}
-        )
-        if (
-            raw_trigger.get("trigger_present") is True
-            and raw_structure.get("room_pass") is True
-            and raw_structure.get("extension_blocks_now") is False
-            and raw_only_clean_ema_blocker
-        ):
-            return raw_engine_pick
+    try:
+        if raw_engine_pick and raw_engine_pick in ranked_pool:
+            raw_structure = raw_engine_pick.get("structure_context") or {}
+            raw_trigger = raw_engine_pick.get("trigger_state") or {}
+            raw_checklist = raw_engine_pick.get("checklist") or {}
+            raw_reason = raw_engine_pick.get("reason")
+            raw_effective_failed = _effective_blockers(
+                raw_checklist,
+                screened_reason=raw_reason,
+            )
+            if (
+                raw_trigger.get("trigger_present") is True
+                and raw_structure.get("room_pass") is True
+                and raw_structure.get("extension_blocks_now") is False
+                and bool(raw_effective_failed)
+                and set(raw_effective_failed) <= {"one_hour_clean_around_ema"}
+            ):
+                return raw_engine_pick
+    except Exception:
+        pass
 
     live_pool = [
         item for item in ranked_pool
