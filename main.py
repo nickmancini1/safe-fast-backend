@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_retest_hint_restore_patch2"
+BUILD_TAG = "macro_surface_v26_2026_04_21_stale_reason_cleanup_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -11391,6 +11391,101 @@ def apply_retest_hint_restore_patch(result: Dict[str, Any]) -> Dict[str, Any]:
 
     return result
 
+
+def apply_stale_reason_cleanup_patch(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Message-only cleanup for after-hours locked-trigger carry-forward states.
+    This patch does not change approval enums, gates, trigger math, or trade
+    eligibility. It only removes stale "waiting for first completed close" /
+    "no_valid_trigger" language from user-facing reason surfaces once the
+    completed trigger is already locked and the real blocker is the closed
+    market.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("result must be a dict")
+
+    approval_ctx = _ensure_dict(result, "approval_context")
+    trigger_ctx = _ensure_dict(result, "trigger_context")
+    simple = _ensure_dict(result, "simple_output")
+    market_ctx = _ensure_dict(result, "market_context")
+
+    market_open = bool(market_ctx.get("is_open"))
+    locked_trigger = bool(
+        trigger_ctx.get("completed_candle_trigger_present") is True
+        or trigger_ctx.get("structural_trigger_present") is True
+        or approval_ctx.get("approval_status") == "PENDING_NEXT_SESSION"
+        or simple.get("setup_state") == "PENDING NEXT SESSION"
+    )
+    if market_open or not locked_trigger:
+        return result
+
+    trigger_level = (
+        trigger_ctx.get("trigger_level")
+        or _nested_get(result, "trigger_state", "trigger_level")
+        or _nested_get(result, "live_map", "continuation", "trigger_level")
+        or _nested_get(result, "live_map", "continuation", "shelf_trigger_level")
+    )
+
+    if trigger_level is not None:
+        base_reason = (
+            f"Completed 1H trigger is already locked above {trigger_level}, "
+            "but the market is closed. Re-check next session open before entry."
+        )
+    else:
+        base_reason = (
+            "Completed 1H trigger is already locked, but the market is closed. "
+            "Re-check next session open before entry."
+        )
+
+    hint = (
+        simple.get("next_session_open_hint_if_unchanged")
+        or _nested_get(result, "decision_context", "next_session_open_hint_if_unchanged")
+        or _nested_get(result, "approval_context", "next_session_open_hint_if_unchanged")
+    )
+    if hint == "VALID_ON_RETEST_ONLY":
+        route_reason = base_reason + " If unchanged, carry-forward is retest-only."
+    else:
+        route_reason = base_reason
+
+    winner_ctx = _ensure_dict(result, "winner_context")
+    winner_ctx["why_changed_after_screening"] = base_reason
+
+    engine_ctx = _ensure_dict(result, "engine_context")
+    engine_ctx["normalized_reason"] = base_reason
+
+    decision_ctx = _ensure_dict(result, "decision_context")
+    normalized_engine = _ensure_dict(decision_ctx, "normalized_engine")
+    screened = _ensure_dict(decision_ctx, "screened")
+    normalized_engine["reason"] = base_reason
+    screened["reason"] = base_reason
+
+    live_map = _ensure_dict(result, "live_map")
+    continuation = _ensure_dict(live_map, "continuation")
+    continuation["status_message"] = route_reason
+    continuation["main_blocker"] = "market_closed_after_completed_trigger"
+
+    setup_route = _ensure_dict(live_map, "setup_route")
+    setup_route["why_setup_route_passes_or_fails"] = route_reason
+
+    trigger_scan = _ensure_dict(live_map, "trigger_scan")
+    trigger_scan["why_trigger_scan_passes_or_fails"] = base_reason
+
+    setup_eligibility_ctx = _ensure_dict(result, "setup_eligibility_context")
+    setup_eligibility_ctx["setup_route_reason"] = route_reason
+
+    screened_best_ctx = _ensure_dict(result, "screened_best_context")
+    screened_best_ctx["screened_reason"] = base_reason
+
+    compact = result.get("compact_ticker_summaries")
+    best_ticker = result.get("best_ticker")
+    if isinstance(compact, list) and best_ticker:
+        for item in compact:
+            if isinstance(item, dict) and item.get("ticker") == best_ticker:
+                item["reason"] = base_reason
+                break
+
+    return result
+
 def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     payload = payload or {}
@@ -11399,6 +11494,7 @@ def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload = apply_open_state_propagation_patch(payload)
     payload = apply_locked_trigger_consistency_patch(payload)
     payload = apply_retest_hint_restore_patch(payload)
+    payload = apply_stale_reason_cleanup_patch(payload)
     contracts = _contracts_bundle_from_payload(payload)
     if contracts.get("state") or contracts.get("transition") or contracts.get("alert"):
         payload["contracts"] = contracts
