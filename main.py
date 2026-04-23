@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_open_state_propagation_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_locked_trigger_consistency_patch1"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -11053,12 +11053,280 @@ def apply_open_state_propagation_patch(result: Dict[str, Any]) -> Dict[str, Any]
 
     return result
 
+
+def _dedupe_preserve_strings(values: List[Any]) -> List[Any]:
+    seen = set()
+    out: List[Any] = []
+    for value in values or []:
+        key = json.dumps(value, sort_keys=True, default=str) if not isinstance(value, str) else value
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def _rewrite_blocker_list_for_locked_trigger(blockers: List[Any]) -> List[Any]:
+    if not isinstance(blockers, list):
+        return blockers
+    rewritten: List[Any] = []
+    for item in blockers:
+        if item == "no_valid_trigger":
+            rewritten.append("market_open")
+            continue
+        if item == "clear_trigger":
+            continue
+        rewritten.append(item)
+    return _dedupe_preserve_strings(rewritten)
+
+
+def _rewrite_failed_reasons_for_locked_trigger(
+    reasons: List[Any],
+    top_reason: str,
+) -> List[Any]:
+    if not isinstance(reasons, list):
+        return reasons
+    rewritten: List[Any] = [top_reason]
+    for item in reasons:
+        if not isinstance(item, str):
+            rewritten.append(item)
+            continue
+        lower = item.lower()
+        if "waiting for the first completed 1h close above the shelf high" in lower:
+            continue
+        if "no valid trigger" in lower:
+            continue
+        if "no valid live trigger is present" in lower:
+            continue
+        rewritten.append(item)
+    return _dedupe_preserve_strings(rewritten)
+
+
+def apply_locked_trigger_consistency_patch(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Final consistency sweep for after-hours carry-forward states with a locked
+    completed trigger. Replaces stale NO_TRIGGER language with MARKET_CLOSED /
+    MARKET_OPEN carry-forward language and aligns trigger surfaces.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("result must be a dict")
+
+    approval_ctx = _ensure_dict(result, "approval_context")
+    trigger_ctx = _ensure_dict(result, "trigger_context")
+    trigger_state = _ensure_dict(result, "trigger_state")
+    simple = _ensure_dict(result, "simple_output")
+    market_ctx = _ensure_dict(result, "market_context")
+
+    locked_trigger = bool(
+        trigger_ctx.get("completed_candle_trigger_present") is True
+        or trigger_ctx.get("structural_trigger_present") is True
+        or approval_ctx.get("approval_status") == "PENDING_NEXT_SESSION"
+        or simple.get("setup_state") == "PENDING NEXT SESSION"
+    )
+    market_open = bool(market_ctx.get("is_open"))
+    if not locked_trigger or market_open:
+        return result
+
+    trigger_level = (
+        trigger_ctx.get("trigger_level")
+        or trigger_state.get("trigger_level")
+        or _nested_get(result, "live_map", "continuation", "trigger_level")
+        or _nested_get(result, "live_map", "continuation", "shelf_trigger_level")
+    )
+
+    top_reason = (
+        _nested_get(result, "final_reason_context", "final_reason")
+        or simple.get("why")
+        or (
+            f"Completed 1H trigger is already locked above {trigger_level}, but the market is closed. Re-check next session open before entry."
+            if trigger_level is not None
+            else "Completed 1H trigger is already locked, but the market is closed. Re-check next session open before entry."
+        )
+    )
+
+    state = (
+        _nested_get(result, "next_session_open_decision", "state")
+        or approval_ctx.get("next_session_open_state_if_unchanged")
+        or simple.get("next_session_open_state_if_unchanged")
+    )
+
+    # Trigger surfaces should agree that the completed trigger is locked.
+    trigger_ctx["structural_trigger_present"] = True
+    trigger_ctx["completed_candle_trigger_present"] = True
+    trigger_ctx["trigger_present"] = False
+    trigger_ctx["trigger_reason"] = "completed_candle_trigger_market_closed"
+    trigger_ctx["live_entry_waiting_on"] = "market_open"
+
+    trigger_state["structural_trigger_present"] = True
+    trigger_state["completed_candle_trigger_present"] = True
+    trigger_state["trigger_present"] = False
+    trigger_state["why"] = "completed_candle_trigger_market_closed"
+    trigger_state["live_entry_waiting_on"] = "market_open"
+
+    # Top-level decision / simple surfaces.
+    simple["headline"] = "Completed trigger locked after hours."
+    simple["action"] = "recheck next session open"
+    simple["setup_state"] = "PENDING NEXT SESSION"
+    simple["why"] = top_reason
+    simple["primary_blocker"] = "market closed after completed trigger"
+    simple["primary_blocker_key"] = "completed_candle_trigger_market_closed"
+    simple["next_flip_needed"] = "market open"
+    simple["next_flip_needed_key"] = "market_open"
+    simple["signal_present"] = True
+    if state:
+        simple["next_session_open_state_if_unchanged"] = state
+
+    decision_ctx = _ensure_dict(result, "decision_context")
+    decision_ctx["action"] = "recheck next session open"
+    decision_ctx["setup_state"] = "PENDING NEXT SESSION"
+    decision_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+    decision_ctx["failed_reasons"] = _rewrite_failed_reasons_for_locked_trigger(
+        decision_ctx.get("failed_reasons") or [], top_reason
+    )
+    if state:
+        decision_ctx["next_session_open_state_if_unchanged"] = state
+
+    blocker_ctx = _ensure_dict(result, "blocker_context")
+    blocker_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+    blocker_ctx["trigger_reason"] = "completed_candle_trigger_market_closed"
+    blocker_ctx["failed_reasons"] = _rewrite_failed_reasons_for_locked_trigger(
+        blocker_ctx.get("failed_reasons") or [], top_reason
+    )
+    blocker_ctx["blockers"] = _rewrite_blocker_list_for_locked_trigger(blocker_ctx.get("blockers") or [])
+    if state:
+        blocker_ctx["next_session_open_state_if_unchanged"] = state
+
+    entry_ctx = _ensure_dict(result, "entry_context")
+    entry_ctx["pending_next_session"] = True
+    entry_ctx["action"] = "wait for next session"
+    entry_ctx["setup_state"] = "PENDING NEXT SESSION"
+    entry_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+    entry_ctx["blockers"] = _rewrite_blocker_list_for_locked_trigger(entry_ctx.get("blockers") or [])
+    if state:
+        entry_ctx["next_session_open_state_if_unchanged"] = state
+
+    intrabar_ctx = _ensure_dict(result, "intrabar_signal_context")
+    intrabar_ctx["pending_next_session"] = True
+    intrabar_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+    intrabar_ctx["setup_state"] = "PENDING NEXT SESSION"
+    intrabar_ctx["signal_note"] = "Completed trigger locked after hours. Re-check next session open before entry."
+    intrabar_ctx["blockers"] = _rewrite_blocker_list_for_locked_trigger(intrabar_ctx.get("blockers") or [])
+    if state:
+        intrabar_ctx["next_session_open_state_if_unchanged"] = state
+
+    approval_ctx["approval_status"] = "PENDING_NEXT_SESSION"
+    approval_ctx["next_flip_needed"] = "market_open"
+    approval_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+    approval_ctx["pending_next_session"] = True
+    approval_ctx["approval_note"] = (
+        f"Completed Continuation trigger is already locked above {trigger_level}, but the market is closed. Re-check next session open before entry."
+        if trigger_level is not None
+        else "Completed Continuation trigger is already locked, but the market is closed. Re-check next session open before entry."
+    )
+    approval_ctx["blockers"] = _rewrite_blocker_list_for_locked_trigger(approval_ctx.get("blockers") or [])
+    if state:
+        approval_ctx["next_session_open_state_if_unchanged"] = state
+
+    approval_req_ctx = _ensure_dict(result, "approval_requirements_context")
+    approval_req_ctx["approval_path_status"] = "PENDING_NEXT_SESSION"
+    approval_req_ctx["next_flip_needed"] = "market_open"
+    approval_req_ctx["blockers"] = _rewrite_blocker_list_for_locked_trigger(approval_req_ctx.get("blockers") or [])
+    approval_req_ctx["missing_gates"] = _dedupe_preserve_strings(
+        ["market_open"] + [g for g in (approval_req_ctx.get("missing_gates") or []) if g not in {"trigger_present", "clear_trigger"}]
+    )
+    if state:
+        approval_req_ctx["next_session_open_state_if_unchanged"] = state
+
+    approval_flip_ctx = _ensure_dict(result, "approval_flip_context")
+    approval_flip_ctx["approval_status"] = "PENDING_NEXT_SESSION"
+    approval_flip_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+    approval_flip_ctx["next_flip_needed"] = "market_open"
+    approval_flip_ctx["blockers"] = _rewrite_blocker_list_for_locked_trigger(approval_flip_ctx.get("blockers") or [])
+    approval_flip_ctx["missing_gates"] = _dedupe_preserve_strings(
+        ["market_open"] + [g for g in (approval_flip_ctx.get("missing_gates") or []) if g not in {"trigger_present", "clear_trigger"}]
+    )
+    if state:
+        approval_flip_ctx["next_session_open_state_if_unchanged"] = state
+
+    final_reason_ctx = _ensure_dict(result, "final_reason_context")
+    final_reason_ctx["final_reason"] = top_reason
+    final_reason_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+    final_reason_ctx["blockers"] = _rewrite_blocker_list_for_locked_trigger(final_reason_ctx.get("blockers") or [])
+    if state:
+        final_reason_ctx["next_session_open_state_if_unchanged"] = state
+
+    reason_stack_ctx = _ensure_dict(result, "reason_stack_context")
+    reason_stack_ctx["top_line_reason"] = top_reason
+    reason_stack_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+    reason_stack_ctx["blockers"] = _rewrite_blocker_list_for_locked_trigger(reason_stack_ctx.get("blockers") or [])
+    reason_stack_ctx["failed_reasons"] = _rewrite_failed_reasons_for_locked_trigger(
+        reason_stack_ctx.get("failed_reasons") or [], top_reason
+    )
+    if state:
+        reason_stack_ctx["next_session_open_state_if_unchanged"] = state
+
+    screened_best_ctx = _ensure_dict(result, "screened_best_context")
+    screened_best_ctx["screened_primary_blocker"] = "market_closed_after_completed_trigger"
+    if state:
+        screened_best_ctx["next_session_open_state_if_unchanged"] = state
+
+    setup_eligibility_ctx = _ensure_dict(result, "setup_eligibility_context")
+    setup_eligibility_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+    setup_eligibility_ctx["next_flip_needed"] = "market_open"
+    setup_eligibility_ctx["approval_path_status"] = "PENDING_NEXT_SESSION"
+
+    setup_check_ctx = _ensure_dict(result, "setup_check_context")
+    setup_check_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+
+    time_gate_ctx = _ensure_dict(result, "time_gate_check_context")
+    time_gate_ctx["primary_blocker"] = "market_closed_after_completed_trigger"
+
+    # Checklist / failed reasons should stop pretending the trigger is missing.
+    checklist = _ensure_dict(result, "checklist")
+    checklist["decision_blockers_priority"] = _rewrite_blocker_list_for_locked_trigger(checklist.get("decision_blockers_priority") or [])
+    checklist["effective_decision_blockers_priority"] = _rewrite_blocker_list_for_locked_trigger(checklist.get("effective_decision_blockers_priority") or [])
+    checklist["effective_failed_items"] = _rewrite_blocker_list_for_locked_trigger(checklist.get("effective_failed_items") or [])
+    checklist["global_gate_failures"] = ["market_open"]
+
+    ten_sec = _ensure_dict(result, "ten_second_checklist")
+    ten_sec["failed_items"] = [item for item in (ten_sec.get("failed_items") or []) if item != "clear_trigger"]
+    ten_sec["effective_failed_items"] = [item for item in (ten_sec.get("effective_failed_items") or []) if item != "clear_trigger"]
+
+    result["failed_reasons"] = _rewrite_failed_reasons_for_locked_trigger(result.get("failed_reasons") or [], top_reason)
+
+    compact = result.get("compact_ticker_summaries")
+    best_ticker = result.get("best_ticker")
+    if isinstance(compact, list) and best_ticker:
+        for item in compact:
+            if isinstance(item, dict) and item.get("ticker") == best_ticker:
+                item["primary_blocker"] = "market closed after completed trigger"
+                item["primary_blocker_key"] = "completed_candle_trigger_market_closed"
+                item["blockers"] = [
+                    "market open",
+                    "clean 1H structure around the 50 EMA",
+                    "early entry quality",
+                ]
+                item["blocker_keys"] = [
+                    "market_open",
+                    "one_hour_clean_around_ema",
+                    "early_enough",
+                ]
+                item["reason"] = top_reason
+                item["trigger_reason"] = "completed candle trigger market closed"
+                item["trigger_reason_key"] = "completed_candle_trigger_market_closed"
+                if state:
+                    item["next_session_open_state_if_unchanged"] = state
+                break
+
+    return result
+
 def _ensure_contracts_surface(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     payload = payload or {}
     payload = apply_pending_next_session_patch(payload)
     payload = apply_morning_open_classifier_patch(payload)
     payload = apply_open_state_propagation_patch(payload)
+    payload = apply_locked_trigger_consistency_patch(payload)
     contracts = _contracts_bundle_from_payload(payload)
     if contracts.get("state") or contracts.get("transition") or contracts.get("alert"):
         payload["contracts"] = contracts
