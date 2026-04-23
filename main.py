@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_remaining_reason_tail_cleanup_patch1"
+BUILD_TAG = "macro_surface_v26_2026_04_21_preserve_locked_trigger_patch2"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4173,19 +4173,11 @@ def _build_continuation_window_context(
     atr14 = _calc_atr(candles, 14)
     snapshots: List[Dict[str, Any]] = []
 
-    # PATCH: search historical shelf->break candidates across a recent rolling window
-    # instead of only recalculating from the latest 2/3/4 candles. Once a completed
-    # breakout shelf is earned, do not let a later rolling shelf ratchet the trigger
-    # upward and erase the already-earned break.
-    recent_completed = completed_candles[-24:] if len(completed_candles) > 24 else list(completed_candles)
-
+    # Default latest-window evaluation stays intact.
     for shelf_candle_count in (2, 3, 4):
-        # historical shelf windows followed by a completed break candle
-        for break_idx in range(shelf_candle_count, len(recent_completed)):
-            shelf_start = break_idx - shelf_candle_count
-            shelf_candles = recent_completed[shelf_start:break_idx]
-            pre_shelf_candles = recent_completed[:shelf_start]
-            break_candle = recent_completed[break_idx]
+        if len(completed_candles) >= shelf_candle_count + 1:
+            shelf_candles = completed_candles[-(shelf_candle_count + 1):-1]
+            pre_shelf_candles = completed_candles[:-(shelf_candle_count + 1)]
             snapshot = _build_continuation_window_snapshot(
                 option_type=option_type,
                 shelf_candles=shelf_candles,
@@ -4193,18 +4185,16 @@ def _build_continuation_window_context(
                 atr14=atr14,
                 ema50_1h=ema50_1h,
                 current_price=latest_close,
-                break_candle=break_candle,
+                break_candle=completed_candles[-1],
                 room_pass=room_pass,
                 extension_blocks_now=extension_blocks_now,
             )
-            snapshot["_historical_break_index"] = break_idx
-            snapshot["_historical_break_time_iso"] = break_candle.get("time_iso")
+            snapshot["_preserved_locked_break_candidate"] = False
+            snapshot["_break_recency_rank"] = 999
             snapshots.append(snapshot)
-
-        # latest hold-only shelf window for current context if no completed break route wins
-        if len(recent_completed) >= shelf_candle_count:
-            shelf_candles = recent_completed[-shelf_candle_count:]
-            pre_shelf_candles = recent_completed[:-shelf_candle_count]
+        if len(completed_candles) >= shelf_candle_count:
+            shelf_candles = completed_candles[-shelf_candle_count:]
+            pre_shelf_candles = completed_candles[:-shelf_candle_count]
             snapshot = _build_continuation_window_snapshot(
                 option_type=option_type,
                 shelf_candles=shelf_candles,
@@ -4216,9 +4206,53 @@ def _build_continuation_window_context(
                 room_pass=room_pass,
                 extension_blocks_now=extension_blocks_now,
             )
-            snapshot["_historical_break_index"] = None
-            snapshot["_historical_break_time_iso"] = None
+            snapshot["_preserved_locked_break_candidate"] = False
+            snapshot["_break_recency_rank"] = 999
             snapshots.append(snapshot)
+
+    # Narrow preserve-locked-trigger patch:
+    # look only at very recent historical breakout shelves so a completed breakout from the
+    # prior session is not re-anchored upward by a fresh rolling window. Do not scan deep history.
+    recent_completed = completed_candles[-10:] if len(completed_candles) > 10 else list(completed_candles)
+    recent_len = len(recent_completed)
+    if recent_len >= 3:
+        for shelf_candle_count in (2, 3, 4):
+            if recent_len < shelf_candle_count + 1:
+                continue
+            for break_idx in range(shelf_candle_count, recent_len):
+                recency_rank = recent_len - 1 - break_idx
+                if recency_rank > 5:
+                    continue
+                shelf_start = break_idx - shelf_candle_count
+                shelf_candles = recent_completed[shelf_start:break_idx]
+                pre_shelf_candles = recent_completed[:shelf_start]
+                break_candle = recent_completed[break_idx]
+                snapshot = _build_continuation_window_snapshot(
+                    option_type=option_type,
+                    shelf_candles=shelf_candles,
+                    pre_shelf_candles=pre_shelf_candles,
+                    atr14=atr14,
+                    ema50_1h=ema50_1h,
+                    current_price=latest_close,
+                    break_candle=break_candle,
+                    room_pass=room_pass,
+                    extension_blocks_now=extension_blocks_now,
+                )
+                trigger_level = _to_float(snapshot.get("trigger_level"))
+                dist_atr = _to_float(snapshot.get("distance_current_to_shelf_high_atr"))
+                if trigger_level is None:
+                    continue
+                if option_type == "C" and latest_close < trigger_level:
+                    continue
+                if option_type == "P" and latest_close > trigger_level:
+                    continue
+                if dist_atr is None or dist_atr > 0.80:
+                    continue
+                if not bool(snapshot.get("breakout_completed")):
+                    continue
+                snapshot["_preserved_locked_break_candidate"] = True
+                snapshot["_break_recency_rank"] = recency_rank
+                snapshots.append(snapshot)
 
     if not snapshots:
         return {
@@ -4237,34 +4271,21 @@ def _build_continuation_window_context(
     priority_rank = {"tradeable": 0, "late": 1, "early": 2}
 
     def _snapshot_sort_key(snapshot: Dict[str, Any]) -> Any:
-        trigger_level = _to_float(snapshot.get("trigger_level"))
-        break_time = str(snapshot.get("_historical_break_time_iso") or "9999-99-99T99:99:99+00:00")
-
-        # Preserve already-earned completed breakout shelves before allowing a newer
-        # rolling shelf to redefine the trigger upward. For calls, prefer the lower
-        # completed trigger when other quality features are similar; for puts, prefer
-        # the higher completed trigger.
-        if option_type == "C":
-            trigger_sort = trigger_level if trigger_level is not None else 999999
-        else:
-            trigger_sort = -(trigger_level if trigger_level is not None else -999999)
-
         return (
             priority_rank.get(snapshot.get("exact_reason"), 9),
+            0 if snapshot.get("_preserved_locked_break_candidate") else 1,
+            snapshot.get("_break_recency_rank") if snapshot.get("_preserved_locked_break_candidate") else 999,
             0 if snapshot.get("reclaim_hold_proven") else 1,
-            0 if snapshot.get("breakout_completed") else 1,
             0 if snapshot.get("shelf_proven") else 1,
-            0 if snapshot.get("current_break_is_first_completed_break") else 1,
-            trigger_sort,
-            break_time,
-            abs(snapshot.get("distance_current_to_shelf_high") or 999999),
             -(snapshot.get("hold_closes_above_reclaim_count") or 0),
+            0 if snapshot.get("breakout_completed") else 1,
+            abs(snapshot.get("distance_current_to_shelf_high") or 999999),
             -(snapshot.get("shelf_candle_count") or 0),
         )
 
     selected = sorted(snapshots, key=_snapshot_sort_key)[0]
-    selected.pop("_historical_break_index", None)
-    selected.pop("_historical_break_time_iso", None)
+    selected.pop("_preserved_locked_break_candidate", None)
+    selected.pop("_break_recency_rank", None)
     selected = {
         **selected,
         "ok": True,
