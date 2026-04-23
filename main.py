@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_preserve_locked_trigger_patch2"
+BUILD_TAG = "macro_surface_v26_2026_04_21_preserve_locked_trigger_patch3"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4254,6 +4254,84 @@ def _build_continuation_window_context(
                 snapshot["_break_recency_rank"] = recency_rank
                 snapshots.append(snapshot)
 
+
+    # Patch3: explicit next-session carry-forward for already-earned continuation breakouts.
+    # If yesterday's breakout/hold was already earned, do not let the next session reroll a higher shelf.
+    def _candle_et_date(candle: Optional[Dict[str, Any]]) -> Optional[datetime.date]:
+        raw_time = (candle or {}).get("time_iso")
+        if not raw_time:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+        except Exception:
+            return None
+        try:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=NY_TZ)
+            return parsed.astimezone(NY_TZ).date()
+        except Exception:
+            return None
+
+    latest_completed_et_date = _candle_et_date(completed_candles[-1]) if completed_candles else None
+    carryforward_completed = completed_candles[-24:] if len(completed_candles) > 24 else list(completed_candles)
+    carryforward_len = len(carryforward_completed)
+    if latest_completed_et_date is not None and carryforward_len >= 4:
+        for shelf_candle_count in (2, 3, 4):
+            if carryforward_len < shelf_candle_count + 1:
+                continue
+            for break_idx in range(shelf_candle_count, carryforward_len):
+                shelf_start = break_idx - shelf_candle_count
+                shelf_candles = carryforward_completed[shelf_start:break_idx]
+                pre_shelf_candles = carryforward_completed[:shelf_start]
+                break_candle = carryforward_completed[break_idx]
+                break_et_date = _candle_et_date(break_candle)
+                if break_et_date is None:
+                    continue
+                # Only preserve an already-earned breakout from the immediately prior regular session.
+                if break_et_date == latest_completed_et_date:
+                    continue
+                if (latest_completed_et_date - break_et_date).days != 1:
+                    continue
+
+                snapshot = _build_continuation_window_snapshot(
+                    option_type=option_type,
+                    shelf_candles=shelf_candles,
+                    pre_shelf_candles=pre_shelf_candles,
+                    atr14=atr14,
+                    ema50_1h=ema50_1h,
+                    current_price=latest_close,
+                    break_candle=break_candle,
+                    room_pass=room_pass,
+                    extension_blocks_now=extension_blocks_now,
+                )
+                trigger_level = _to_float(snapshot.get("trigger_level"))
+                reclaim_break_line = _to_float(snapshot.get("reclaim_break_line"))
+                dist_atr = _to_float(snapshot.get("distance_current_to_shelf_high_atr"))
+
+                if trigger_level is None:
+                    continue
+                if option_type == "C" and latest_close < trigger_level:
+                    continue
+                if option_type == "P" and latest_close > trigger_level:
+                    continue
+                if dist_atr is None or dist_atr > 1.00:
+                    continue
+                if not bool(snapshot.get("breakout_completed")):
+                    continue
+                if not bool(snapshot.get("reclaim_hold_proven")):
+                    continue
+
+                reference_level = reclaim_break_line if reclaim_break_line is not None else trigger_level
+                if option_type == "C" and latest_close <= reference_level:
+                    continue
+                if option_type == "P" and latest_close >= reference_level:
+                    continue
+
+                snapshot["_carryforward_locked_break_candidate"] = True
+                snapshot["_preserved_locked_break_candidate"] = True
+                snapshot["_break_recency_rank"] = -1
+                snapshots.append(snapshot)
+
     if not snapshots:
         return {
             "ok": False,
@@ -4273,6 +4351,7 @@ def _build_continuation_window_context(
     def _snapshot_sort_key(snapshot: Dict[str, Any]) -> Any:
         return (
             priority_rank.get(snapshot.get("exact_reason"), 9),
+            0 if snapshot.get("_carryforward_locked_break_candidate") else 1,
             0 if snapshot.get("_preserved_locked_break_candidate") else 1,
             snapshot.get("_break_recency_rank") if snapshot.get("_preserved_locked_break_candidate") else 999,
             0 if snapshot.get("reclaim_hold_proven") else 1,
@@ -4284,6 +4363,7 @@ def _build_continuation_window_context(
         )
 
     selected = sorted(snapshots, key=_snapshot_sort_key)[0]
+    selected.pop("_carryforward_locked_break_candidate", None)
     selected.pop("_preserved_locked_break_candidate", None)
     selected.pop("_break_recency_rank", None)
     selected = {
