@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from dxlink_candles import get_1h_ema50_snapshot
 
 
-BUILD_TAG = "macro_surface_v26_2026_04_21_preserve_locked_trigger_patch6"
+BUILD_TAG = "macro_surface_v26_2026_04_21_preserve_locked_trigger_patch7"
 
 app = FastAPI(title="SAFE-FAST Backend", version="1.8.6")
 
@@ -4375,18 +4375,20 @@ def _build_continuation_window_context(
         "extension_blocks_now": extension_blocks_now,
     }
 
-    # Patch6: if the preserved shelf/hold is already proven and a later completed candle
-    # has already closed through the shelf trigger, do not keep saying we are "waiting for
-    # the first completed 1H close above the shelf high". At that point the trigger happened;
-    # if the setup is no longer usable, classify it as late rather than still waiting.
+    # Patch7: fix the carry-forward mislabel only.
+    # If the preserved hold is already proven, and a later completed candle has already
+    # closed through the preserved shelf trigger, do not keep saying we are still waiting
+    # for the *first* completed break. In that case, if extension is already blocking,
+    # classify the setup as late instead of still waiting.
     try:
         selected_trigger_level = _to_float(selected.get("trigger_level"))
         selected_break_time_iso = selected.get("breakout_candle_time_iso")
-        historical_completed_shelf_break_seen = False
-        first_completed_shelf_break_time_iso = None
-        first_completed_shelf_break_close = None
+        later_completed_break_seen = False
+        later_completed_break_time_iso = None
+        later_completed_break_close = None
         if (
             selected.get("reclaim_hold_proven") is True
+            and selected.get("main_blocker") == "no_valid_trigger"
             and selected_trigger_level is not None
             and selected_break_time_iso
             and completed_candles
@@ -4399,32 +4401,23 @@ def _build_continuation_window_context(
                 if candle_time_iso <= selected_break_time_iso:
                     continue
                 if option_type == "C":
-                    candle_side_ok = ema50_1h is None or candle_close > ema50_1h
                     crossed = candle_close > selected_trigger_level
                 else:
-                    candle_side_ok = ema50_1h is None or candle_close < ema50_1h
                     crossed = candle_close < selected_trigger_level
-                if candle_side_ok and crossed:
-                    historical_completed_shelf_break_seen = True
-                    first_completed_shelf_break_time_iso = candle_time_iso
-                    first_completed_shelf_break_close = candle_close
+                if crossed:
+                    later_completed_break_seen = True
+                    later_completed_break_time_iso = candle_time_iso
+                    later_completed_break_close = candle_close
                     break
-
-        selected["historical_completed_shelf_break_seen"] = historical_completed_shelf_break_seen
-        selected["first_completed_shelf_break_time_iso"] = first_completed_shelf_break_time_iso
-        selected["first_completed_shelf_break_close"] = _round_or_none(first_completed_shelf_break_close, 4)
-
-        if (
-            historical_completed_shelf_break_seen
-            and selected.get("exact_reason") == "early"
-            and selected.get("main_blocker") == "no_valid_trigger"
-        ):
-            if extension_blocks_now:
-                selected["exact_reason"] = "late"
-                selected["status_message"] = "Too late: the first completed 1H shelf break already happened and the move is now extended."
-                selected["main_blocker"] = "move_too_extended"
-            else:
-                selected["status_message"] = "The first completed 1H shelf break already happened. SAFE-FAST is tracking that the trigger was earned."
+        selected["later_completed_shelf_break_seen"] = later_completed_break_seen
+        selected["later_completed_shelf_break_time_iso"] = later_completed_break_time_iso
+        selected["later_completed_shelf_break_close"] = _round_or_none(later_completed_break_close, 4)
+        if later_completed_break_seen and extension_blocks_now:
+            selected["exact_reason"] = "late"
+            selected["status_message"] = "Too late: the first completed 1H shelf break already happened and the move is now extended."
+            selected["main_blocker"] = "move_too_extended"
+        elif later_completed_break_seen:
+            selected["status_message"] = "The first completed 1H shelf break already happened. SAFE-FAST is tracking the trigger as already earned."
     except Exception:
         pass
 
